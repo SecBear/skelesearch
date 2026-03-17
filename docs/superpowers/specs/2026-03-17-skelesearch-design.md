@@ -35,6 +35,17 @@ skelesearch/
     embed-fastembed/          skelesearch-embed-fastembed  (library, optional)
     mcp/                      skelesearch-mcp  (binary)
     cli/                      skelesearch-cli  (binary)
+  plugin/                     Claude Code plugin (hooks + skills + scout agent)
+    plugin.json
+    hooks/
+      session-start.sh
+      post-edit-reindex.sh
+    skills/
+      search-code/
+        SKILL.md
+    agents/
+      skelesearch-scout.md
+    CLAUDE.md.template
 ```
 
 ### Crate responsibilities
@@ -430,6 +441,192 @@ pub struct IndexStats {
     pub last_indexed: Option<chrono::DateTime<chrono::Utc>>,
 }
 ```
+
+---
+
+## Claude Code Plugin Layer
+
+The plugin layer gives skelesearch zero-friction UX inside Claude Code. The agent never
+needs to decide "should I index this?" or "should I search before editing?" — both happen
+automatically through two complementary mechanisms: **hooks** (guaranteed injection at session
+boundaries) and **PROACTIVELY descriptions** (in-session auto-dispatch when context is relevant).
+
+### Plugin directory layout
+
+```
+plugin/
+  plugin.json                    # Plugin manifest (name, description, version)
+  hooks/
+    session-start.sh             # SessionStart hook: auto-index + inject context
+    post-edit-reindex.sh         # PostToolUse hook: incremental reindex after Write/Edit
+  skills/
+    search-code/
+      SKILL.md                   # Natural language code search (PROACTIVELY framed)
+  agents/
+    skelesearch-scout.md         # Haiku scout agent for codebase exploration
+  CLAUDE.md.template             # CLAUDE.md snippet for project-level agent guidance
+```
+
+### SessionStart hook
+
+`hooks/session-start.sh` runs when Claude Code starts a session. It calls
+`skelesearch status --json` on the current directory, then emits a JSON
+`additionalContext` payload to stdout. Claude receives this as implicit system
+context before any user message — the agent never has to think "should I check the index?"
+
+Behavior:
+
+1. **If indexed**: emits `additionalContext` with live stats:
+   ```json
+   {
+     "type": "additionalContext",
+     "content": "skelesearch: 1,247 files indexed across 8,432 chunks (last indexed: 2h ago). Use search_code for semantic queries before modifying existing code."
+   }
+   ```
+
+2. **If not indexed**: spawns `skelesearch index . &` asynchronously, emits:
+   ```json
+   {
+     "type": "additionalContext",
+     "content": "skelesearch: indexing this codebase in the background (first run). search_code will be available once complete — use grep for now."
+   }
+   ```
+
+3. **If skelesearch not installed / MCP unconfigured**: emits nothing. Hook exit code 0.
+   This is a graceful no-op — the hook must never error on systems without skelesearch.
+
+### PostToolUse hook
+
+`hooks/post-edit-reindex.sh` fires after every `Write` or `Edit` tool completion.
+It runs `skelesearch index . --incremental` as a fire-and-forget background process.
+The manifest's mtime+size pre-filter means unchanged files are skipped in microseconds;
+only genuinely modified files trigger re-embedding.
+
+Hook wiring in `plugin.json`:
+```json
+{
+  "PostToolUse": [{
+    "matcher": "Write|Edit",
+    "hooks": [{
+      "type": "command",
+      "command": "bash ${PLUGIN_DIR}/hooks/post-edit-reindex.sh"
+    }]
+  }]
+}
+```
+
+### search-code skill
+
+`skills/search-code/SKILL.md` frontmatter:
+
+```yaml
+---
+name: search-code
+description: >
+  Search the indexed codebase with natural language. Use this PROACTIVELY:
+  - BEFORE modifying existing code — understand what's already there
+  - When you need to find code by intent rather than by exact symbol name
+  - When grep would require knowing the exact identifier in advance
+  - When starting work in an unfamiliar part of the codebase
+  - When you need to understand how a file fits into the broader system
+  Prefer grep/Bash for: finding all occurrences of an exact known symbol,
+  file existence checks, line-count operations.
+allowed-tools: mcp__skelesearch__search_code, mcp__skelesearch__get_file_context
+---
+```
+
+The `description` field is what Claude reads when deciding whether to invoke this skill.
+The "BEFORE modifying" framing is the trigger that makes agents reach for semantic search
+proactively, not reactively. This mirrors the technique used in `claude-context`.
+
+### skelesearch-scout subagent
+
+`agents/skelesearch-scout.md`:
+
+```yaml
+---
+name: skelesearch-scout
+description: >
+  Use this agent PROACTIVELY when the user wants to understand how existing code
+  works, find where something is implemented, or before making changes to existing
+  features. Uses semantic search over the indexed codebase and returns a concise
+  summary with file locations and line numbers.
+tools: mcp__skelesearch__search_code, mcp__skelesearch__get_file_context, Read
+model: haiku
+color: blue
+maxTurns: 5
+---
+
+You are a code navigation agent. Given a topic or question, search the indexed
+codebase and return a concise summary of relevant chunks with file paths and
+line numbers. Never modify files — read and report only.
+```
+
+The scout uses `haiku` for speed and cost. The `PROACTIVELY` keyword in `description`
+causes the parent agent to dispatch it automatically when working in unfamiliar code.
+It complements the SessionStart hook: the hook fires once per session to establish
+index context; the scout fires per-task when semantic search is relevant.
+
+### MCP tool description (search_code)
+
+The `search_code` tool's description, in `crates/mcp/src/main.rs`, must include the
+proactive framing — this is what non-plugin consumers (Cursor, Windsurf, any MCP client)
+see:
+
+```
+Search the indexed codebase with natural language.
+
+Use this BEFORE making changes to any existing code — understand what's already there.
+Use this when you don't know what a feature is called (intent search).
+Use this when grep would require knowing the exact symbol name in advance.
+
+Returns: file path, line range, code chunk, relevance score.
+Prefer grep/Bash for: all occurrences of an exact known symbol, file existence checks.
+```
+
+### CLAUDE.md template
+
+`CLAUDE.md.template` — projects can append this snippet to their own CLAUDE.md:
+
+```markdown
+## Code Search
+
+This project is indexed with skelesearch. Before modifying existing code, use
+`search_code` (or `/search-code` skill) to understand what's already there.
+This finds code by intent — complementary to grep, not a replacement.
+
+Prefer `search_code` when: exploring unfamiliar code, finding where a concept is
+implemented, understanding how files relate to each other.
+Prefer grep when: finding all occurrences of a symbol name you already know exactly.
+```
+
+Keep this under 10 lines. Project CLAUDE.md should stay under 200 lines total for
+reliable adherence — Claude Code truncates context beyond that.
+
+### Installation
+
+```bash
+# Install plugin globally (available in all Claude Code sessions)
+claude plugin install path/to/skelesearch/plugin/
+
+# Or install from the published repo:
+claude plugin install github:you/skelesearch
+
+# Configure MCP server per-project (.mcp.json at repo root):
+{
+  "mcpServers": {
+    "skelesearch": {
+      "command": "skelesearch-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+After plugin install: the SessionStart hook fires on every `claude` invocation in any
+directory, checks the index, and injects context automatically. The MCP server config
+in `.mcp.json` gives the agent the actual search tools. Both are needed; either alone
+is incomplete.
 
 ---
 
