@@ -1,0 +1,20 @@
+[package]
+name = "skelesearch-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server for skelesearch — exposes semantic code search as MCP tools"
+
+[[bin]]
+name = "skelesearch-mcp"
+path = "src/main.rs"
+
+[dependencies]
+skelesearch-core = { path = "../core" }
+skelesearch-embed-fastembed = { path = "../embed-fastembed" }
+rmcp = { workspace = true }
+schemars = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

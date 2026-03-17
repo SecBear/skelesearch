@@ -1,0 +1,14 @@
+[package]
+name = "skelesearch-embed-fastembed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fastembed-rs EmbedProvider for skelesearch (jina-v2-base-code default)"
+
+[dependencies]
+skelesearch-core = { path = "../core" }
+fastembed = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

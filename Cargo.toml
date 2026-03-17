@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/embed-fastembed",
+    "crates/mcp",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Storage
+cozo = { version = "0.7.6", default-features = false, features = ["storage-sqlite"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Tree-sitter
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-nix = "0.3"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-go = "0.23"
+
+# Chunking
+text-splitter = { version = "0.17", features = ["code"] }
+
+# Hashing & walking
+twox-hash = "2"
+ignore = "0.4"
+
+# Embedding
+fastembed = { version = "4", optional = true }
+
+# MCP server
+rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
+schemars = "0.8"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# File watching (optional)
+notify = { version = "6", optional = true }
+notify-debouncer-full = { version = "0.3", optional = true }

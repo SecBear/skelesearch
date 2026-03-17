@@ -1,0 +1,21 @@
+[package]
+name = "skelesearch-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for skelesearch — index, search, context, status, clear"
+
+[[bin]]
+name = "skelesearch"
+path = "src/main.rs"
+
+[features]
+watch = ["skelesearch-core/watch"]
+
+[dependencies]
+skelesearch-core = { path = "../core" }
+skelesearch-embed-fastembed = { path = "../embed-fastembed" }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
