@@ -116,6 +116,58 @@ outputs would give better hybrid search quality with only one ONNX inference pas
 
 ---
 
+## Diff-aware retrieval mode (v2)
+
+**What:** A query mode that restricts the search corpus to files modified in the current
+git branch (`git diff main --name-only`). When an agent is working on a branch, "what
+changed" is a stronger locality signal than full-corpus semantic similarity.
+
+**Why deferred:** Branch-scoped retrieval requires integrating with `git` at query time
+and maintaining a per-branch filtered view of the index. v1 full-corpus search is the
+right default.
+
+**Evidence:** gstack's `/qa` mode uses `git diff main` as its primary context scoping
+mechanism and is the most-used retrieval pattern in that tool. Retrieval adds the most
+value when the relevant code is scattered with no obvious locality — diff-scoped queries
+reduce the search space to the region where an agent is already working.
+
+**Approach:** Add `branch_scope: bool` parameter to `search_code`. When true, run
+`git diff --name-only HEAD...$(git merge-base HEAD main)` to get the changed file set,
+then add a `file_path IN (...)` filter to the HNSW and FTS queries before RRF fusion.
+
+---
+
+## Closed-loop retrieval self-verification (v2)
+
+**What:** After `search_code` returns results, automatically re-query with broadened
+terms if the top result's `match_quality` is "low" (no high-confidence hits). Return
+results from both queries merged with provenance.
+
+**Why deferred:** Requires defining quality thresholds and fallback query strategies.
+v1 returns all results with `match_quality` labels and lets the agent decide.
+
+**Evidence:** Cherny and Steinberger (Jan 2026) both emphasize that tools must give
+agents a way to self-verify. Sycophantic agents will use a "low" match result without
+questioning it unless the tool provides an explicit signal and a next step.
+
+**Approach:** If top result score < threshold: retry with query decomposed into keywords,
+merge results, add `source: "broadened_query"` annotation to distinguish. Return combined
+ranked results with per-result provenance.
+
+---
+
+## Retrieval feedback loop (v2)
+
+**What:** A lightweight mechanism for recording "this result was irrelevant" per-query,
+stored in `~/.local/share/skelesearch/<hash>/feedback.db`. Use accumulated feedback to
+adjust RRF weights (vector vs FTS leg) per-repo over time.
+
+**Evidence:** gstack persists Greptile false positives to `~/.gstack/greptile-history.md`
+to filter future runs — a cheap feedback-loop without retraining. Same principle applies
+to retrieval weight tuning.
+
+---
+
 ## Call graph edges (v2)
 
 **What:** Extract function call edges in addition to import edges. Store as `edge_type: "calls"`

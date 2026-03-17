@@ -35,17 +35,18 @@ skelesearch/
     embed-fastembed/          skelesearch-embed-fastembed  (library, optional)
     mcp/                      skelesearch-mcp  (binary)
     cli/                      skelesearch-cli  (binary)
-  plugin/                     Claude Code plugin (hooks + skills + scout agent)
-    plugin.json
-    hooks/
-      session-start.sh
-      post-edit-reindex.sh
-    skills/
-      search-code/
-        SKILL.md
-    agents/
-      skelesearch-scout.md
-    CLAUDE.md.template
+  .claude-plugin/             Claude Code plugin manifest
+    plugin.json               (pure metadata: name, version, description, author)
+  hooks/                      Hook scripts + wiring (repo root, not plugin/ subdir)
+    hooks.json                Hook event wiring (SessionStart, PostToolUse)
+    session-start             SessionStart script (no .sh — prevents Windows bash prepend)
+    post-edit-reindex         PostToolUse script (no .sh)
+  skills/                     Claude Code skills (auto-discovered from this directory)
+    search-code/
+      SKILL.md
+  agents/                     Claude Code agent definitions
+    skelesearch-scout.md
+  CLAUDE.md.template          CLAUDE.md snippet for project-level guidance
 ```
 
 ### Crate responsibilities
@@ -198,6 +199,10 @@ Tier 1 languages at v1 (all have stable tree-sitter grammars):
 | JavaScript | `.js`, `.jsx` | `function_declaration`, `class_declaration` | `import_declaration` |
 | Go | `.go` | `function_declaration`, `method_declaration` | `import_declaration` |
 
+**Target chunk size:** 1,500 non-whitespace characters for Tier 1 AST-aware chunking
+(≈ 500 tokens; large enough for a coherent function body, small enough for focused retrieval).
+The CodeSplitter will split oversized AST nodes and merge small siblings to stay near this budget.
+
 Tier 2 fallback: `SlidingWindowChunker` (512 non-whitespace chars, 64 overlap) for all other extensions.
 
 Adding a new Tier 1 language = implement `LanguageConfig` for that language. Register in a
@@ -265,7 +270,7 @@ When `include_graph: true`, a second Datalog query fetches callers/importers of 
 
 ```datalog
 ?[file_path, chunk_idx, content] :=
-    *code_edges[file_path, chunk_idx, $target_file, 'imports'],
+    *code_edges[file_path, chunk_idx, $target_file, 'imports', _],
     *chunks[file_path, chunk_idx, content, _, _, _, _, _]
 ```
 
@@ -280,9 +285,9 @@ Exposed via `rmcp` 0.16 over stdio. Schema auto-generated from `schemars::JsonSc
 | Tool | Input | Output |
 |---|---|---|
 | `index_codebase` | `path: String`, `provider?: String` | `{status: String, indexed: u32, chunks: u32}` |
-| `search_code` | `query: String`, `top_k?: u32`, `include_graph?: bool` | JSON array of `{file, start_line, end_line, content, score, why}` |
+| `search_code` | `query: String`, `top_k?: u32`, `include_graph?: bool` | JSON array of `{file_path, start_line, end_line, content, score, match_quality, why}` |
 | `get_file_context` | `file_path: String` | `{chunks: [...], imports: [...], imported_by: [...]}`. Returns empty arrays (not an error) if the file has not been indexed. |
-| `index_status` | `path?: String` | `{indexed_files: u32, total_chunks: u32, last_indexed: String (ISO8601), estimated_stale: u32}` |
+| `index_status` | `path?: String` | `{indexed_files: u32, total_chunks: u32, last_indexed: String (ISO8601), estimated_stale: u32, watching: bool}` |
 
 `estimated_stale` in `index_status` is computed by comparing mtime+size from the manifest
 against current filesystem state — it is a fast estimate (no full walk, no re-hashing)
@@ -432,13 +437,19 @@ pub struct SearchResult {
     pub end_line: usize,
     pub chunk_type: String,
     pub score: f32,
-    pub why: String,  // "vector", "fts", or "both"
+    pub match_quality: String, // "high" | "moderate" | "low" derived from RRF score thresholds
+    pub why: String,           // "vector" | "fts" | "both"
 }
+// match_quality thresholds (to be calibrated during implementation):
+// "high"     — score >= 0.8 × top result's score (clearly relevant)
+// "moderate" — score >= 0.5 × top result's score (probably relevant)
+// "low"      — score < 0.5 × top result's score (marginal — agent should treat skeptically)
 
 pub struct IndexStats {
     pub indexed_files: u32,
     pub total_chunks: u32,
     pub last_indexed: Option<chrono::DateTime<chrono::Utc>>,
+    pub watching: bool,   // true if a watch process is active for this directory
 }
 ```
 
@@ -451,106 +462,158 @@ needs to decide "should I index this?" or "should I search before editing?" — 
 automatically through two complementary mechanisms: **hooks** (guaranteed injection at session
 boundaries) and **PROACTIVELY descriptions** (in-session auto-dispatch when context is relevant).
 
-### Plugin directory layout
+The plugin root is the **skelesearch repo root itself**. Claude Code discovers
+`.claude-plugin/plugin.json` at the repo root on `claude plugin install github:you/skelesearch`.
 
-```
-plugin/
-  plugin.json                    # Plugin manifest (name, description, version)
-  hooks/
-    session-start.sh             # SessionStart hook: auto-index + inject context
-    post-edit-reindex.sh         # PostToolUse hook: incremental reindex after Write/Edit
-  skills/
-    search-code/
-      SKILL.md                   # Natural language code search (PROACTIVELY framed)
-  agents/
-    skelesearch-scout.md         # Haiku scout agent for codebase exploration
-  CLAUDE.md.template             # CLAUDE.md snippet for project-level agent guidance
-```
+### `.claude-plugin/plugin.json`
 
-### SessionStart hook
+Pure metadata only. Hooks, skills, and agents are NOT declared here — they are
+auto-discovered from their directories by Claude Code.
 
-`hooks/session-start.sh` runs when Claude Code starts a session. It calls
-`skelesearch status --json` on the current directory, then emits a JSON
-`additionalContext` payload to stdout. Claude receives this as implicit system
-context before any user message — the agent never has to think "should I check the index?"
-
-Behavior:
-
-1. **If indexed**: emits `additionalContext` with live stats:
-   ```json
-   {
-     "type": "additionalContext",
-     "content": "skelesearch: 1,247 files indexed across 8,432 chunks (last indexed: 2h ago). Use search_code for semantic queries before modifying existing code."
-   }
-   ```
-
-2. **If not indexed**: spawns `skelesearch index . &` asynchronously, emits:
-   ```json
-   {
-     "type": "additionalContext",
-     "content": "skelesearch: indexing this codebase in the background (first run). search_code will be available once complete — use grep for now."
-   }
-   ```
-
-3. **If skelesearch not installed / MCP unconfigured**: emits nothing. Hook exit code 0.
-   This is a graceful no-op — the hook must never error on systems without skelesearch.
-
-### PostToolUse hook
-
-`hooks/post-edit-reindex.sh` fires after every `Write` or `Edit` tool completion.
-It runs `skelesearch index . --incremental` as a fire-and-forget background process.
-The manifest's mtime+size pre-filter means unchanged files are skipped in microseconds;
-only genuinely modified files trigger re-embedding.
-
-Hook wiring in `plugin.json`:
 ```json
 {
-  "PostToolUse": [{
-    "matcher": "Write|Edit",
-    "hooks": [{
-      "type": "command",
-      "command": "bash ${PLUGIN_DIR}/hooks/post-edit-reindex.sh"
-    }]
-  }]
+  "name": "skelesearch",
+  "description": "Semantic code search for AI coding agents — AST chunking, hybrid BM25+HNSW retrieval",
+  "version": "0.1.0",
+  "author": { "name": "you", "email": "you@example.com" },
+  "homepage": "https://github.com/you/skelesearch",
+  "repository": "https://github.com/you/skelesearch",
+  "license": "MIT",
+  "keywords": ["code-search", "semantic", "mcp", "claude-code"]
 }
 ```
 
-### search-code skill
+### `hooks/hooks.json`
 
-`skills/search-code/SKILL.md` frontmatter:
+Hooks are declared here, NOT in `plugin.json`. Format confirmed from official Anthropic
+plugins (ralph-wiggum, superpowers v5):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/session-start\"",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/post-edit-reindex\"",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Key notes:
+- `async: false` on SessionStart — must block until context is injected before Claude responds
+- `async: true` on PostToolUse — fire-and-forget; indexing must not block the agent's next turn
+- `matcher` is a regex — `startup|clear|compact` limits SessionStart to session-open events,
+  not every prompt. Without `matcher`, the hook would fire on every tool call.
+- `${CLAUDE_PLUGIN_ROOT}` is the env var Claude Code injects pointing to the installed plugin root
+- Script filenames are extensionless (`session-start` not `session-start.sh`) to prevent
+  Windows from auto-prepending `bash` to `.sh` filenames
+
+### `hooks/session-start`
+
+Runs at session start (`async: false` — blocks). Calls `skelesearch status --json`,
+emits `hookSpecificOutput` JSON to stdout.
+
+**Output format** (confirmed from Anthropic's official plugins):
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": "<compact status string, under 100 words>"
+  }
+}
+```
+
+Use `printf` (not `cat <<EOF` heredoc) to produce this JSON — bash 5.3+ hangs on
+heredoc expansion when content exceeds ~512 bytes. Self-derive plugin root before
+trusting the env var (needed during install/testing):
+
+```bash
+PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}"
+```
+
+**Behavior:**
+
+1. **If indexed**: emits `additionalContext` with live stats:
+   > "skelesearch: 1,247 files indexed, 8,432 chunks (last: 2h ago). search_code
+   > available. Use before modifying existing code — results are candidates to verify."
+
+2. **If not indexed**: spawns `skelesearch index . &` asynchronously, emits:
+   > "skelesearch: indexing in background (first run). Use grep for now — search_code
+   > will be available when indexing completes."
+
+3. **If skelesearch not installed or no code files in cwd**: exit 0, no output.
+   Never error — graceful no-op when unconfigured.
+
+**Context size discipline**: keep `additionalContext` under 100 words. Injecting too much
+at session start degrades response quality (40-60% context utilization target per
+ACE/FCA research). Status + one-line instruction is sufficient; CLAUDE.md handles conventions.
+
+### `hooks/post-edit-reindex`
+
+Fires after Write or Edit tool calls (`async: true` — does not block). Runs
+`skelesearch index .` as a fire-and-forget background process. Indexing is always
+incremental by design — unchanged files are skipped in microseconds.
+
+Before spawning, checks `skelesearch status --json | jq -r '.watching'` — if `true`,
+the watch daemon is already handling changes and the hook exits 0 immediately.
+
+### `skills/search-code/SKILL.md`
 
 ```yaml
 ---
 name: search-code
 description: >
-  Search the indexed codebase with natural language. Use this PROACTIVELY:
-  - BEFORE modifying existing code — understand what's already there
-  - When you need to find code by intent rather than by exact symbol name
-  - When grep would require knowing the exact identifier in advance
-  - When starting work in an unfamiliar part of the codebase
-  - When you need to understand how a file fits into the broader system
-  Prefer grep/Bash for: finding all occurrences of an exact known symbol,
-  file existence checks, line-count operations.
+  Use when the task requires finding code by intent rather than by exact symbol name,
+  or before modifying existing code to understand what's already there. Use when the
+  relevant code is not known in advance (no exact identifier to grep for), when
+  exploring an unfamiliar module, or when understanding how a file relates to the
+  broader system.
 allowed-tools: mcp__skelesearch__search_code, mcp__skelesearch__get_file_context
 ---
+
+Invoke `search_code` to locate code by intent. Results are CANDIDATES to verify —
+not ground truth to act on directly. Confirm the result is the right symbol/file
+before modifying.
+
+Use `get_file_context` to understand a file's imports and importers (graph context).
+Prefer grep/Bash for: finding all occurrences of an exact known symbol, file existence.
 ```
 
-The `description` field is what Claude reads when deciding whether to invoke this skill.
-The "BEFORE modifying" framing is the trigger that makes agents reach for semantic search
-proactively, not reactively. This mirrors the technique used in `claude-context`.
+**Description discipline** (from superpowers writing-skills): the `description` field
+MUST describe ONLY triggering conditions — not the workflow or what the skill does.
+Summarizing the workflow in the description causes Claude to shortcut and skip the body.
+This is a documented failure mode. The current description above lists conditions only.
 
-### skelesearch-scout subagent
-
-`agents/skelesearch-scout.md`:
+### `agents/skelesearch-scout.md`
 
 ```yaml
 ---
 name: skelesearch-scout
-description: >
+description: |
   Use this agent PROACTIVELY when the user wants to understand how existing code
   works, find where something is implemented, or before making changes to existing
-  features. Uses semantic search over the indexed codebase and returns a concise
-  summary with file locations and line numbers.
+  features. Uses semantic search over the indexed codebase.
 tools: mcp__skelesearch__search_code, mcp__skelesearch__get_file_context, Read
 model: haiku
 color: blue
@@ -562,71 +625,133 @@ codebase and return a concise summary of relevant chunks with file paths and
 line numbers. Never modify files — read and report only.
 ```
 
-The scout uses `haiku` for speed and cost. The `PROACTIVELY` keyword in `description`
-causes the parent agent to dispatch it automatically when working in unfamiliar code.
-It complements the SessionStart hook: the hook fires once per session to establish
-index context; the scout fires per-task when semantic search is relevant.
+### MCP tool description (`search_code`)
 
-### MCP tool description (search_code)
-
-The `search_code` tool's description, in `crates/mcp/src/main.rs`, must include the
-proactive framing — this is what non-plugin consumers (Cursor, Windsurf, any MCP client)
-see:
+Framed as success criteria (not imperative) — agents respond better to goals than
+instructions (Karpathy Jan 2026, Cherny Jan 2026). The `CANDIDATES` framing
+counteracts agents' tendency to silently run with wrong assumptions:
 
 ```
-Search the indexed codebase with natural language.
+Locate code by semantic intent. Returns candidate locations so you can verify
+them, then read precisely.
 
-Use this BEFORE making changes to any existing code — understand what's already there.
-Use this when you don't know what a feature is called (intent search).
-Use this when grep would require knowing the exact symbol name in advance.
+Use BEFORE modifying existing code — confirm what's already there.
+Use when you don't know the exact symbol name (intent search).
+Use when grep would require knowing the identifier in advance.
 
-Returns: file path, line range, code chunk, relevance score.
-Prefer grep/Bash for: all occurrences of an exact known symbol, file existence checks.
+Results include: file_path, line range, content, score, match_quality, why.
+Treat results as CANDIDATES to verify — not ground truth to act on directly.
+Confirm the right file/symbol before modifying.
+Prefer grep/Bash for: all occurrences of a known exact symbol, file existence.
 ```
 
 ### CLAUDE.md template
-
-`CLAUDE.md.template` — projects can append this snippet to their own CLAUDE.md:
 
 ```markdown
 ## Code Search
 
 This project is indexed with skelesearch. Before modifying existing code, use
-`search_code` (or `/search-code` skill) to understand what's already there.
-This finds code by intent — complementary to grep, not a replacement.
+`search_code` to understand what's already there. Results are candidates — verify
+before acting. Use `get_file_context` to see a file's imports and importers.
 
-Prefer `search_code` when: exploring unfamiliar code, finding where a concept is
-implemented, understanding how files relate to each other.
-Prefer grep when: finding all occurrences of a symbol name you already know exactly.
+Prefer `search_code` when: exploring unfamiliar code, finding where a concept
+is implemented. Prefer grep when: finding all occurrences of a known exact symbol.
 ```
 
-Keep this under 10 lines. Project CLAUDE.md should stay under 200 lines total for
-reliable adherence — Claude Code truncates context beyond that.
+Keep under 10 lines. Project CLAUDE.md should stay under 200 lines total for reliable
+adherence. Coding conventions belong in a separate `standards/` directory injected
+per task, not loaded into CLAUDE.md on every session.
 
 ### Installation
 
 ```bash
-# Install plugin globally (available in all Claude Code sessions)
-claude plugin install path/to/skelesearch/plugin/
-
-# Or install from the published repo:
+# Install plugin globally
+claude plugin install path/to/skelesearch/
+# Or from published repo:
 claude plugin install github:you/skelesearch
 
 # Configure MCP server per-project (.mcp.json at repo root):
 {
   "mcpServers": {
-    "skelesearch": {
-      "command": "skelesearch-mcp",
-      "args": []
-    }
+    "skelesearch": { "command": "skelesearch-mcp", "args": [] }
   }
 }
 ```
 
-After plugin install: the SessionStart hook fires on every `claude` invocation in any
-directory, checks the index, and injects context automatically. The MCP server config
-in `.mcp.json` gives the agent the actual search tools. Both are needed; either alone
-is incomplete.
+The SessionStart hook fires on every `claude` session start, checks the index, and
+injects context automatically. The `.mcp.json` config gives the agent the actual search
+tools. Both are needed; either alone is incomplete.
+
+---
+
+## Functional Requirements
+
+v1 = in scope for first release; v2 = planned future; out-of-scope = explicitly excluded.
+
+| ID | Requirement | Scope |
+|---|---|---|
+| FR-001 | Index a directory with tree-sitter AST-aware chunking (Tier 1 languages) | v1 |
+| FR-002 | Store chunks in CozoDB with HNSW vector index + BM25 FTS index | v1 |
+| FR-003 | Embed chunks in-process with fastembed-rs (jina-v2-base-code, 768-dim) | v1 |
+| FR-004 | Pluggable EmbedProvider trait (Ollama, OpenAI/Voyage swappable) | v1 |
+| FR-005 | Hybrid BM25 + HNSW retrieval fused with RRF in a single Datalog query | v1 |
+| FR-006 | Incremental indexing: skip unchanged files via mtime+size+xxHash3 manifest | v1 |
+| FR-007 | Handle file renames and deletions via manifest reconciliation | v1 |
+| FR-008 | Expose 4 MCP tools via rmcp 0.16 (index_codebase, search_code, get_file_context, index_status) | v1 |
+| FR-009 | CLI: index, search, context, status, clear, watch subcommands | v1 |
+| FR-010 | Claude Code plugin: SessionStart hook (auto-index + context injection) | v1 |
+| FR-011 | Claude Code plugin: PostToolUse hook (incremental reindex after Write/Edit) | v1 |
+| FR-012 | Import edge storage (code_edges) and one-hop graph-augmented retrieval | v1 |
+| FR-013 | Nix flake packaging for CLI and MCP server binaries | v1 |
+| FR-014 | SPLADE sparse retrieval via Seismic (pending code-domain benchmarks) | v2 |
+| FR-015 | Diff-aware retrieval mode (restrict search to files modified in current branch) | v2 |
+| FR-016 | Call graph edges via stack-graphs | v2 |
+| FR-017 | Closed-loop self-verification (re-query with broadened terms when results < threshold) | v2 |
+| FR-018 | "This result was irrelevant" feedback signal for RRF weight tuning | v2 |
+
+**Out of scope (v1):** Docker/daemon deployment; model fine-tuning; web UI or IDE extension;
+multi-user shared indices; Windows native support.
+
+### Acceptance Scenarios
+
+**Given** a Git repo with 500 Rust files,
+**when** `skelesearch index .` is run for the first time,
+**then** all `.rs` files are chunked, embedded, and stored; `index_status` reports
+≥ 490 indexed files; the process completes in < 10 minutes (fastembed, SQLite backend).
+
+**Given** a session where Claude Code has the skelesearch plugin installed,
+**when** a new Claude session opens in an indexed directory,
+**then** the SessionStart hook fires within 100ms and `additionalContext` includes
+the file count and a directive to use `search_code` before modifying code.
+
+**Given** a `search_code` call with `query: "how are import edges extracted"`,
+**when** the index contains the skelesearch codebase itself,
+**then** at least one result in the top 3 has `match_quality: "high"` and references
+the `LanguageConfig::import_query` function.
+
+**Given** a file is edited via the Edit tool while the plugin is active,
+**when** the PostToolUse hook fires,
+**then** `skelesearch index .` runs asynchronously; `index_status` reports the
+changed file as updated within 60 seconds (fastembed, SQLite).
+
+---
+
+## Success Criteria
+
+All latency targets are wall-clock on aarch64 macOS (M-series) with fastembed-rs
+(CPU only) and SQLite backend unless noted.
+
+| ID | Criterion | Target |
+|---|---|---|
+| SC-001 | `search_code` latency, top-5, hybrid retrieval, warm index | < 200ms |
+| SC-002 | `get_file_context` latency | < 50ms |
+| SC-003 | `index_status` latency | < 10ms |
+| SC-004 | SessionStart hook end-to-end (spawn + status check + printf) | < 100ms |
+| SC-005 | Incremental index, 10 modified files in a 100k-file repo | < 30s |
+| SC-006 | First-run full index throughput (fastembed batch 64) | ≥ 5 chunks/sec |
+| SC-007 | MCP server cold-start to first `search_code` response | < 500ms |
+| SC-008 | Plugin install + `.mcp.json` config to first successful `search_code` | ≤ 5 minutes |
+| SC-009 | Manual relevance eval: 10-query test suite on skelesearch's own codebase | ≥ 70% top-3 relevant |
 
 ---
 
@@ -638,3 +763,7 @@ is incomplete.
 | RocksDB compile time (~10 min cold) | Use SQLite backend for dev builds. CI uses incremental caching. |
 | Embedding bottleneck (5-50 chunks/sec) | Async batch embedding with configurable batch size. fastembed in-process eliminates HTTP overhead. |
 | jina-v2-base-code 768-dim vs 1536-dim providers | Dim is configured at index creation from `EmbedProvider::dim()`. Re-index required if provider changes. |
+| Plugin hook env var (`$CLAUDE_PLUGIN_ROOT`) may not be set in all execution contexts | Hook self-derives root: `PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"` as fallback before trusting env var. |
+| `hooks.json` format may differ across Claude Code versions | Hook wiring confirmed from official Anthropic plugins (ralph-wiggum, superpowers v5). Pin to the confirmed format; validate during installation. |
+| Agent sycophancy: agents act on plausibly-right results without verifying | `match_quality` field in `SearchResult` + "CANDIDATES" framing in tool description creates natural verification step. |
+| Over-injection at SessionStart degrading context quality | `additionalContext` capped at 100 words. Status + one-line directive only. |
