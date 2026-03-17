@@ -143,18 +143,26 @@ One directory per indexed project, derived from the absolute path. No configurat
 ```
 index_codebase(path)
   1. Walk with `ignore` crate (WalkParallel) — respects all gitignore tiers
-  2. For each file:
+     Collect the full set of visited paths into a HashSet<String>.
+  2. For each visited file:
        a. Check mtime+size against manifest → skip if unchanged
        b. Compute xxHash3 → skip if hash matches
-       c. Detect language from extension
-       d. Parse with tree-sitter via LanguageConfig
-       e. Chunk using text-splitter CodeSplitter (recursive merge, non-whitespace char budget)
-       f. Normalize content (snake_case → spaces, camelCase → camel case)
-       g. Extract import edges via per-language Query patterns
-  3. Batch-embed new chunks via EmbedProvider (configurable batch size)
+       c. For modified files: delete chunks + edges by file_path before re-indexing
+       d. Detect language from extension
+       e. Parse with tree-sitter via LanguageConfig
+       f. Chunk using text-splitter CodeSplitter (recursive merge, non-whitespace char budget)
+       g. Normalize content (snake_case → spaces, camelCase → camel case)
+       h. Extract import edges via per-language Query patterns
+  2.5 Reconcile against manifest (handles renames and deletes):
+       - Query manifest for all known file_paths
+       - Diff: known_paths - visited_paths = stale paths
+       - For each stale path: delete chunks, delete edges, delete manifest row, delete files row
+       (A rename is a delete of the old path + add of the new path; the walk naturally
+        visits the new path and never visits the old path, so reconciliation handles it.)
+  3. Batch-embed new/modified chunks via EmbedProvider (configurable batch size)
   4. Upsert chunk rows + embedding vectors to CozoDB
   5. Write import edges to code_edges relation
-  6. Update file row + manifest hash
+  6. Update file row + manifest hash for all added/modified files
 ```
 
 ### LanguageConfig trait
@@ -205,32 +213,40 @@ Built-in providers:
 
 ### Hybrid search (BM25 + HNSW → RRF)
 
+CozoDB's disjunctive `or` semantics differ from SQL FULL OUTER JOIN — variables in one
+branch are not in scope in the other. RRF fusion is implemented with two separate scored
+rules that are unioned, then aggregated by doc id:
+
 ```datalog
-# Vector retrieval leg
-vec_hits[rank, file_path, chunk_idx] :=
+# Vector retrieval leg — assigns rank 1..k by ascending distance
+vec_scored[file_path, chunk_idx, score] :=
     ~chunks:semantic{ file_path, chunk_idx |
         query: $query_vec, k: 50, ef: 50, bind_distance: dist },
-    rank = rank_of(dist)  # ascending distance = better rank
+    score = 1.0 / (60.0 + dist * 50.0)  # approximate rank via distance
 
-# BM25 retrieval leg
-fts_hits[rank, file_path, chunk_idx] :=
+# BM25 retrieval leg — assigns score by BM25 rank
+fts_scored[file_path, chunk_idx, score] :=
     ~chunks:text{ file_path, chunk_idx |
-        query: $query_str, k: 50, bind_score: score },
-    rank = rank_of(score)  # descending score = better rank
+        query: $query_str, k: 50, bind_score: bm25 },
+    score = 1.0 / (60.0 + 1.0 / (bm25 + 0.001))  # rank approximated from score
 
-# RRF fusion (k=60)
-rrf_score[file_path, chunk_idx, score] :=
-    vec_hits[vr, file_path, chunk_idx] or fts_hits[fr, file_path, chunk_idx],
-    score = ifelse(is_bound(vr), 1.0/(60+vr), 0.0)
-           + ifelse(is_bound(fr), 1.0/(60+fr), 0.0)
+# Union both legs, aggregate RRF contributions per doc
+rrf[file_path, chunk_idx, sum(score)] :=
+    vec_scored[file_path, chunk_idx, score]
+rrf[file_path, chunk_idx, sum(score)] :=
+    fts_scored[file_path, chunk_idx, score]
 
 # Final results with content
-?[score, file_path, chunk_idx, content, start_line, end_line, chunk_type] :=
-    rrf_score[file_path, chunk_idx, score],
+?[rrf_score, file_path, chunk_idx, content, start_line, end_line, chunk_type] :=
+    rrf[file_path, chunk_idx, rrf_score],
     *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _],
-    :order -score
+    :order -rrf_score
     :limit $top_k
 ```
+
+Note: The exact rank-to-score mapping will be validated against CozoDB 0.7.6 query
+semantics during implementation. The key invariant is: chunks appearing in both legs
+receive a higher combined score than chunks appearing in only one.
 
 ### Graph-augmented retrieval
 
@@ -252,10 +268,14 @@ Exposed via `rmcp` 0.16 over stdio. Schema auto-generated from `schemars::JsonSc
 
 | Tool | Input | Output |
 |---|---|---|
-| `index_codebase` | `path: String`, `provider?: String` | Status string, chunk count |
+| `index_codebase` | `path: String`, `provider?: String` | `{status: String, indexed: u32, chunks: u32}` |
 | `search_code` | `query: String`, `top_k?: u32`, `include_graph?: bool` | JSON array of `{file, start_line, end_line, content, score, why}` |
-| `get_file_context` | `file_path: String` | All chunks for file + its imports + importers |
-| `index_status` | `path?: String` | `{indexed_files, total_chunks, last_indexed, stale_files}` |
+| `get_file_context` | `file_path: String` | `{chunks: [...], imports: [...], imported_by: [...]}`. Returns empty arrays (not an error) if the file has not been indexed. |
+| `index_status` | `path?: String` | `{indexed_files: u32, total_chunks: u32, last_indexed: String (ISO8601), estimated_stale: u32}` |
+
+`estimated_stale` in `index_status` is computed by comparing mtime+size from the manifest
+against current filesystem state — it is a fast estimate (no full walk, no re-hashing)
+and may not reflect renames or deletions detected only during a full walk.
 
 ### MCP server startup
 
@@ -274,15 +294,17 @@ async fn main() -> anyhow::Result<()> {
 ## CLI Commands
 
 ```
-skelesearch index <path> [--provider fastembed|ollama|openai|voyage] [--watch]
+skelesearch index <path> [--provider fastembed|ollama|openai|voyage]
 skelesearch search "<query>" [--top-k 5] [--graph] [--json]
 skelesearch context <file>
 skelesearch status [<path>]
 skelesearch clear [<path>]
+skelesearch watch <path> [--provider fastembed|ollama|openai|voyage]
 ```
 
-`--watch` starts a background file watcher (`notify` + `notify-debouncer-full`) that re-indexes
-changed files on save. Debounce window: 1 second. Off by default in v1.
+`watch` is a separate subcommand (not a flag on `index`) that starts a persistent background
+file watcher. Uses `notify` 6.x + `notify-debouncer-full` (handles vim rename-over-tempfile).
+Debounce window: 1 second. Opt-in in v1 — not invoked automatically by `index`.
 
 ---
 
@@ -319,6 +341,95 @@ Builds via `crane` (incremental Rust builds in Nix). The RocksDB dependency requ
 and a C++20-capable compiler — both are available in `pkgs.buildInputs` on darwin and linux.
 
 Use `storage-sqlite` feature during development (faster compile), `storage-rocksdb` in release.
+
+---
+
+## StorageBackend Trait
+
+All CozoDB-specific code lives in `crates/core/src/schema.rs` behind this trait.
+The `CozoBackend` struct in that file is the only implementation in v1. Migration to
+LanceDB+Tantivy means providing a second implementation — no other files change.
+
+```rust
+#[async_trait]
+pub trait StorageBackend: Send + Sync {
+    /// Create schema (relations + indices) if not already present.
+    /// `dim` must match `EmbedProvider::dim()` — stored in index metadata.
+    async fn initialize(&self, dim: usize) -> Result<()>;
+
+    // --- File records ---
+    async fn upsert_file(&self, record: &FileRecord) -> Result<()>;
+    async fn delete_file(&self, file_path: &str) -> Result<()>;
+    /// Returns all file_paths currently tracked in the backend.
+    async fn list_indexed_paths(&self) -> Result<Vec<String>>;
+
+    // --- Chunks ---
+    async fn upsert_chunks(&self, chunks: &[ChunkRecord]) -> Result<()>;
+    async fn delete_chunks_for_file(&self, file_path: &str) -> Result<()>;
+    async fn get_chunks_for_file(&self, file_path: &str) -> Result<Vec<ChunkRecord>>;
+
+    // --- Edges ---
+    async fn upsert_edges(&self, edges: &[EdgeRecord]) -> Result<()>;
+    async fn delete_edges_for_file(&self, file_path: &str) -> Result<()>;
+    /// Returns file_paths that import `file_path`.
+    async fn get_importers(&self, file_path: &str) -> Result<Vec<String>>;
+    /// Returns file_paths imported by `file_path`.
+    async fn get_imports(&self, file_path: &str) -> Result<Vec<String>>;
+
+    // --- Search ---
+    async fn hybrid_search(
+        &self,
+        query_vec: &[f32],
+        query_str: &str,
+        top_k: usize,
+    ) -> Result<Vec<SearchResult>>;
+
+    // --- Status ---
+    async fn stats(&self) -> Result<IndexStats>;
+}
+
+pub struct FileRecord {
+    pub file_path: String,
+    pub language: String,
+    pub last_modified: i64,
+    pub chunk_count: usize,
+}
+
+pub struct ChunkRecord {
+    pub file_path: String,
+    pub chunk_idx: usize,
+    pub content: String,
+    pub normalized: String,
+    pub chunk_type: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub embedding: Option<Vec<f32>>,
+}
+
+pub struct EdgeRecord {
+    pub from_file: String,
+    pub from_chunk: usize,
+    pub to_file: String,
+    pub edge_type: String,  // "imports"
+}
+
+pub struct SearchResult {
+    pub file_path: String,
+    pub chunk_idx: usize,
+    pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub chunk_type: String,
+    pub score: f32,
+    pub why: String,  // "vector", "fts", or "both"
+}
+
+pub struct IndexStats {
+    pub indexed_files: u32,
+    pub total_chunks: u32,
+    pub last_indexed: Option<chrono::DateTime<chrono::Utc>>,
+}
+```
 
 ---
 

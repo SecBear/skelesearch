@@ -122,13 +122,14 @@ works with Claude Code's MCP configuration out of the box.
 
 ---
 
-## ADR-008: Watch mode is opt-in in v1
+## ADR-008: Watch mode is a separate `watch` subcommand, opt-in in v1
 
-**Decision:** `skelesearch watch` is a CLI command that users invoke explicitly. There is no
-automatic background watcher running on `index`.
+**Decision:** `skelesearch watch <path>` is a separate CLI subcommand. There is no `--watch`
+flag on `index`, and no automatic background watcher.
 
 **Why:** The embedding step (5–50 chunks/sec depending on provider) is expensive enough that
-auto-triggering on every save would be disruptive. Watch mode uses `notify` 6.x +
+auto-triggering on every save would be disruptive. Keeping watch as a separate subcommand
+makes the "I'm now running a daemon" distinction explicit. Watch mode uses `notify` 6.x +
 `notify-debouncer-full` (handles vim's rename-over-tempfile pattern). Debounce window: 1s.
 
 ---
