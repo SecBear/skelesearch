@@ -17,7 +17,7 @@ license = "MIT OR Apache-2.0"
 # Default: storage-sqlite (fast compile, persistent, full feature parity for dev)
 # Release: override in crate Cargo.toml with features = ["storage-rocksdb"]
 # or: cargo build --features skelesearch-core/storage-rocksdb
-cozo = { version = "0.7.6", default-features = false }
+cozo = { version = "0.7.6", default-features = false, features = ["storage-sqlite", "rayon"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Tree-sitter
@@ -30,14 +30,14 @@ tree-sitter-javascript = "0.23"
 tree-sitter-go = "0.23"
 
 # Chunking
-text-splitter = { version = "0.17", features = ["code"] }
+text-splitter = { version = "0.29", features = ["code"] }
 
 # Hashing & walking
 twox-hash = "2"
 ignore = "0.4"
 
 # Embedding
-fastembed = { version = "4", optional = true }
+fastembed = { version = "4" }
 
 # MCP server
 rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
@@ -59,5 +59,8 @@ anyhow = "1"
 thiserror = "2"
 
 # File watching (optional)
-notify = { version = "6", optional = true }
-notify-debouncer-full = { version = "0.3", optional = true }
+notify = { version = "6" }
+notify-debouncer-full = { version = "0.3" }
+
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"
