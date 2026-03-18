@@ -5,3 +5,4 @@ crates/cli/.fastembed_cache/
 .brain/
 .fastembed_cache/
 .skelesearch/
+.env*
