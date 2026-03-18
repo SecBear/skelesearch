@@ -44,6 +44,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     ///
     /// Returns an empty `Vec` when no results match; never returns an error
     /// for a zero-result query.
+    #[tracing::instrument(skip_all, fields(%query, top_k, diversity))]
     pub async fn search(
         &self,
         query: &str,

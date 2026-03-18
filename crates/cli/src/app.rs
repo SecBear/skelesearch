@@ -169,11 +169,14 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
 
     let indexer = Indexer::new(backend, manifest, provider)
         .with_excludes(config.index.exclude.clone());
+    let start = std::time::Instant::now();
     let result = indexer.index_path(&root).await?;
+    let elapsed = start.elapsed();
 
     println!(
-        "indexed {} file(s), {} chunk(s) ({} removed)",
-        result.indexed_files, result.total_chunks, result.deleted_files
+        "indexed {} file(s), {} chunk(s) ({} removed, {} cache hits) in {:.1}s",
+        result.indexed_files, result.total_chunks, result.deleted_files,
+        result.cache_hits, elapsed.as_secs_f64()
     );
     Ok(())
 }
@@ -204,7 +207,10 @@ async fn run_search(
     backend.initialize(dim).await?;
 
     let searcher = Searcher::new(backend, provider);
+    let start = std::time::Instant::now();
     let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity).await.unwrap_or_default();
+    let elapsed = start.elapsed();
+    tracing::info!(elapsed_ms = elapsed.as_millis() as u64, results = results.len(), "search complete");
 
     if json_output {
         let rows: Vec<serde_json::Value> = results
@@ -238,6 +244,9 @@ async fn run_search(
             );
             println!("{}", r.content);
             println!();
+        }
+        if !results.is_empty() {
+            println!("({} results in {:.0}ms)", results.len(), elapsed.as_secs_f64() * 1000.0);
         }
     }
     Ok(())

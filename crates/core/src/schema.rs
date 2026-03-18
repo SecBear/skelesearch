@@ -244,6 +244,7 @@ impl CozoBackend {
     /// Run FTS only and return raw tuples:
     /// `(file_path, chunk_idx, bm25_score, content, chunk_type, start_line, end_line)`.
     /// Results are ordered by bm25 score descending.
+    #[tracing::instrument(skip_all, fields(limit))]
     fn fts_search(
         &self,
         query_text: &str,
@@ -291,6 +292,7 @@ impl CozoBackend {
     /// Run HNSW vector search and return raw tuples:
     /// `(file_path, chunk_idx, cosine_distance, content, chunk_type, start_line, end_line)`.
     /// Results are ordered by cosine distance ascending (lower = more similar).
+    #[tracing::instrument(skip_all, fields(limit))]
     fn vector_search(
         &self,
         query_vec: &[f32],
@@ -616,6 +618,7 @@ impl StorageBackend for CozoBackend {
         Ok(result)
     }
 
+    #[tracing::instrument(skip_all, fields(top_k))]
     async fn hybrid_search(
         &self,
         query_vec: &[f32],

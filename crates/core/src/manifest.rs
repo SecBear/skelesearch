@@ -293,6 +293,7 @@ impl ManifestStore {
     ///
     /// Returns `None` for cache misses, `Some(vec)` for hits.
     /// Embedding is stored as packed little-endian f32 bytes.
+    #[tracing::instrument(skip_all, fields(count = hashes.len()))]
     pub fn get_cached_embeddings(&self, hashes: &[String]) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
         hashes

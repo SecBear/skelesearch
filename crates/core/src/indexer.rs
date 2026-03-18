@@ -26,6 +26,10 @@ pub struct IndexResult {
     pub total_chunks: usize,
     /// Number of files that failed to parse during chunking.
     pub parse_errors: usize,
+    /// Number of chunk embeddings served from the persistent cache.
+    pub cache_hits: usize,
+    /// Number of chunk embeddings computed fresh by the provider.
+    pub cache_misses: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +94,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
     /// File content, chunk texts, and embeddings are held in memory only for
     /// the current `FILE_BATCH_SIZE`-file batch.  Phase 1 collects metadata
     /// only — no file content is loaded until Phase 2.
+    #[tracing::instrument(skip_all, fields(root = %root.display()))]
     pub async fn index_path(&self, root: &Path) -> anyhow::Result<IndexResult> {
         let dim = self.provider.dim();
         self.backend.initialize(dim).await?;
@@ -306,6 +311,8 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 let cached_count = sub.len() - miss_indices.len();
                 let miss_count = miss_indices.len();
                 tracing::debug!(hits = cached_count, misses = miss_count, "embedding cache");
+                result.cache_hits += cached_count;
+                result.cache_misses += miss_count;
 
                 // Embed only the cache misses (skip provider call if none).
                 let fresh_embs: Vec<Vec<f32>> = if miss_texts.is_empty() {

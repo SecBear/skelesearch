@@ -165,6 +165,7 @@ impl SkeleSearchServer {
     /// Semantic + FTS hybrid search.
     ///
     /// Returns an error when the index is empty (via `prepare_search_provider`).
+    #[tracing::instrument(skip_all, fields(query = %input.query, top_k = input.top_k))]
     pub async fn search_code(
         &self,
         input: SearchCodeInput,
@@ -173,9 +174,11 @@ impl SkeleSearchServer {
         let searcher = Searcher::new(Arc::clone(&self.backend), provider);
         let top_k = input.top_k.max(1);
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
+        let start = std::time::Instant::now();
         let results = searcher
             .search(&input.query, top_k, input.include_graph, max_depth, input.diversity)
             .await?;
+        tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, results = results.len(), "search_code complete");
         Ok(results
             .into_iter()
             .map(|r| SearchCodeRow {
@@ -200,6 +203,7 @@ impl SkeleSearchServer {
     /// We avoid this by moving the indexing work into `spawn_blocking`, where a
     /// dedicated single-thread runtime runs the `!Send` future without crossing
     /// thread boundaries.
+    #[tracing::instrument(skip_all, fields(path = %input.path))]
     pub async fn index_codebase(
         &self,
         input: IndexCodebaseInput,
@@ -255,6 +259,7 @@ impl SkeleSearchServer {
             status: "ok".to_string(),
             indexed: result.indexed_files,
             chunks: result.total_chunks,
+            cache_hits: result.cache_hits,
         })
     }
 
@@ -325,6 +330,7 @@ impl SkeleSearchServer {
     /// Grep path: derives the common ancestor directory from indexed file paths
     /// and calls [`grep_codebase`] with `top_k` as the result cap.
     /// Semantic path: delegates to [`Self::search_code`].
+    #[tracing::instrument(skip_all, fields(query = %input.query))]
     pub async fn smart_search(
         &self,
         input: SmartSearchInput,

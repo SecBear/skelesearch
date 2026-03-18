@@ -87,6 +87,8 @@ pub struct IndexCodebaseOutput {
     pub status: String,
     pub indexed: usize,
     pub chunks: usize,
+    /// Embedding cache hits during this indexing run.
+    pub cache_hits: usize,
 }
 
 /// Output of the `index_status` tool.
