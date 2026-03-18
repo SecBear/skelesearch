@@ -1,0 +1,11 @@
+{
+  "name": "skelesearch",
+  "version": "0.1.0",
+  "description": "AST-aware semantic code search for Claude Code",
+  "author": {
+    "name": "bear",
+    "email": "bear@golden-neuron.dev"
+  },
+  "homepage": "https://github.com/golden-neuron/skelesearch",
+  "repository": "https://github.com/golden-neuron/skelesearch"
+}

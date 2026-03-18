@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Locate skelesearch binary: PATH first, then local debug build
+if command -v skelesearch &>/dev/null; then
+    SK="skelesearch"
+elif [ -x "$PLUGIN_ROOT/target/debug/skelesearch" ]; then
+    SK="$PLUGIN_ROOT/target/debug/skelesearch"
+else
+    # Not available — graceful degradation, no output
+    exit 0
+fi
+
+STATUS="$("$SK" status --json 2>/dev/null)" || { exit 0; }
+
+INDEXED="$(printf '%s' "$STATUS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indexed_files',0))" 2>/dev/null)" || INDEXED=0
+
+if [ "$INDEXED" -gt 0 ]; then
+    printf '{"hookSpecificOutput":{"additionalContext":"skelesearch index ready: %s files indexed. Use skelesearch search to find relevant code. Results are candidates — verify before acting."}}\n' "$INDEXED"
+else
+    # No index yet — start one in the background
+    "$SK" index . &>/dev/null &
+    printf '{"hookSpecificOutput":{"additionalContext":"skelesearch: no index found. Background indexing started. Run skelesearch status to check progress."}}\n'
+fi

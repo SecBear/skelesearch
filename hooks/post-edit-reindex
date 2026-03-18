@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Locate skelesearch binary: PATH first, then local debug build
+if command -v skelesearch &>/dev/null; then
+    SK="skelesearch"
+elif [ -x "$PLUGIN_ROOT/target/debug/skelesearch" ]; then
+    SK="$PLUGIN_ROOT/target/debug/skelesearch"
+else
+    exit 0
+fi
+
+STATUS="$("$SK" status --json 2>/dev/null)" || { exit 0; }
+
+WATCHING="$(printf '%s' "$STATUS" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('watching') else 'false')" 2>/dev/null)" || WATCHING=false
+
+# If watch mode is active, the watcher handles re-indexing
+if [ "$WATCHING" = "true" ]; then
+    exit 0
+fi
+
+# Spawn background incremental index and return immediately
+"$SK" index . &>/dev/null &
+exit 0

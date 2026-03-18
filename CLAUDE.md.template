@@ -1,0 +1,6 @@
+# Project: {{PROJECT_NAME}}
+
+Search with: `skelesearch search "<query>" --json`
+Results are candidates — read surrounding context before acting on them.
+Index: `skelesearch index .`
+Status: `skelesearch status --json`
