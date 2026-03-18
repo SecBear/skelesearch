@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["bear <bear@golden-neuron.dev>"]
-homepage = "https://github.com/golden-neuron/skelesearch"
-repository = "https://github.com/golden-neuron/skelesearch"
+homepage = "https://github.com/SecBear/skelesearch"
+repository = "https://github.com/SecBear/skelesearch"
 
 [workspace.dependencies]
 # Storage
