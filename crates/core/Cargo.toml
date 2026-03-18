@@ -27,6 +27,7 @@ tree-sitter-go = { workspace = true }
 text-splitter = { workspace = true }
 twox-hash = { workspace = true }
 ignore = { workspace = true }
+ndarray = { workspace = true }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }

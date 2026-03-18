@@ -51,6 +51,12 @@ pub struct SearchResult {
     pub end_line: usize,
     pub chunk_type: String,
     pub score: f64,
+    /// Relative quality label: `"high"`, `"moderate"`, or `"low"`.
+    /// Set by `Searcher`; empty string until shaped.
+    pub match_quality: String,
+    /// Retrieval provenance: `"vector"`, `"fts"`, `"both"`, or `"imports <file>"`.
+    /// Set by `Searcher`; empty string until shaped.
+    pub why: String,
 }
 
 #[derive(Debug, Clone)]
@@ -421,17 +427,19 @@ impl StorageBackend for CozoBackend {
 
         // Build the RRF query.  We use a union of two legs: vector (if embeddings
         // exist) and FTS.  Results that appear in both legs receive a higher score.
-        let query_vec_dv: DataValue =
-            DataValue::List(query_vec.iter().map(|&f| Self::dv_float(f as f64)).collect());
+        let query_vec_dv: DataValue = {
+            let arr = ndarray::Array1::from(query_vec.to_vec());
+            DataValue::Vec(cozo::Vector::F32(arr))
+        };
 
         let script = if emb_count > 0 {
             format!(
                 r#"
-vec_scored[fp, ci, score] :=
-    ~chunks:semantic{{ fp, ci | query: $qv, k: 50, ef: 50, bind_distance: dist }},
+vec_scored[file_path, chunk_idx, score] :=
+    ~chunks:semantic{{ file_path, chunk_idx | query: $qv, k: 50, ef: 50, bind_distance: dist }},
     score = 1.0 / (60.0 + dist * 50.0)
-fts_scored[fp, ci, score] :=
-    ~chunks:text{{ fp, ci | query: $qs, k: 50, bind_score: bm25 }},
+fts_scored[file_path, chunk_idx, score] :=
+    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: 50, bind_score: bm25 }},
     score = 1.0 / (60.0 + 1.0 / (bm25 + 0.001))
 rrf[fp, ci, sum(score)] := vec_scored[fp, ci, score]
 rrf[fp, ci, sum(score)] := fts_scored[fp, ci, score]
@@ -447,8 +455,8 @@ rrf[fp, ci, sum(score)] := fts_scored[fp, ci, score]
             // No embeddings yet — fall back to FTS only.
             format!(
                 r#"
-fts_scored[fp, ci, score] :=
-    ~chunks:text{{ fp, ci | query: $qs, k: 50, bind_score: bm25 }},
+fts_scored[file_path, chunk_idx, score] :=
+    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: 50, bind_score: bm25 }},
     score = 1.0 / (60.0 + 1.0 / (bm25 + 0.001))
 ?[rrf_score, file_path, chunk_idx, content, start_line, end_line, chunk_type] :=
     fts_scored[fp, ci, rrf_score],
@@ -493,6 +501,9 @@ fts_scored[fp, ci, score] :=
                     start_line: Self::int_col(&r[4])? as usize,
                     end_line: Self::int_col(&r[5])? as usize,
                     chunk_type: Self::str_col(&r[6])?,
+                    // Filled in by Searcher after backend returns raw results.
+                    match_quality: String::new(),
+                    why: String::new(),
                 })
             })
             .collect()
@@ -549,5 +560,70 @@ fts_scored[fp, ci, score] :=
             last_indexed,
             watching: false,
         })
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Blanket impl: Arc<B> delegates to B so Indexer/Searcher can hold Arc<B>
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<B: StorageBackend> StorageBackend for Arc<B> {
+    async fn initialize(&self, dim: usize) -> anyhow::Result<()> {
+        (**self).initialize(dim).await
+    }
+
+    async fn upsert_file(&self, record: &FileRecord) -> anyhow::Result<()> {
+        (**self).upsert_file(record).await
+    }
+
+    async fn delete_file(&self, file_path: &str) -> anyhow::Result<()> {
+        (**self).delete_file(file_path).await
+    }
+
+    async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> {
+        (**self).list_indexed_paths().await
+    }
+
+    async fn upsert_chunks(&self, chunks: &[ChunkRecord]) -> anyhow::Result<()> {
+        (**self).upsert_chunks(chunks).await
+    }
+
+    async fn delete_chunks_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        (**self).delete_chunks_for_file(file_path).await
+    }
+
+    async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> {
+        (**self).get_chunks_for_file(file_path).await
+    }
+
+    async fn upsert_edges(&self, edges: &[EdgeRecord]) -> anyhow::Result<()> {
+        (**self).upsert_edges(edges).await
+    }
+
+    async fn delete_edges_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        (**self).delete_edges_for_file(file_path).await
+    }
+
+    async fn get_importers(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        (**self).get_importers(file_path).await
+    }
+
+    async fn get_imports(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        (**self).get_imports(file_path).await
+    }
+
+    async fn hybrid_search(
+        &self,
+        query_vec: &[f32],
+        query_str: &str,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        (**self).hybrid_search(query_vec, query_str, top_k).await
+    }
+
+    async fn stats(&self) -> anyhow::Result<IndexStats> {
+        (**self).stats().await
     }
 }
