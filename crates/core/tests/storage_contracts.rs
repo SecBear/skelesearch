@@ -80,3 +80,50 @@ async fn cozo_backend_initializes_and_reports_empty_stats() -> anyhow::Result<()
     assert!(hits.is_empty());
     Ok(())
 }
+
+
+#[tokio::test]
+async fn upsert_chunks_batch_handles_500_chunks() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let backend = CozoBackend::open(temp.path().join("index.db"))?;
+    backend.initialize(8).await?;
+
+    let chunks: Vec<ChunkRecord> = (0..500)
+        .map(|i| ChunkRecord {
+            file_path: "big_file.rs".into(),
+            chunk_idx: i,
+            content: format!("fn func_{i}() {{}}"),
+            normalized: format!("fn func {i}"),
+            chunk_type: "code".into(),
+            start_line: i * 10 + 1,
+            end_line: (i + 1) * 10,
+            embedding: Some(vec![0.1; 8]),
+        })
+        .collect();
+
+    backend.upsert_chunks(&chunks).await?;
+    let stored = backend.get_chunks_for_file("big_file.rs").await?;
+    assert_eq!(stored.len(), 500);
+    Ok(())
+}
+
+#[tokio::test]
+async fn upsert_edges_batch_handles_many_edges() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let backend = CozoBackend::open(temp.path().join("index.db"))?;
+    backend.initialize(8).await?;
+
+    let edges: Vec<EdgeRecord> = (0..200)
+        .map(|i| EdgeRecord {
+            from_file: format!("src/mod_{i}.rs"),
+            from_chunk: 0,
+            to_file: "src/lib.rs".into(),
+            edge_type: "imports".into(),
+        })
+        .collect();
+
+    backend.upsert_edges(&edges).await?;
+    let importers = backend.get_importers("src/lib.rs").await?;
+    assert_eq!(importers.len(), 200);
+    Ok(())
+}

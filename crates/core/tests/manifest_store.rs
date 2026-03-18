@@ -63,3 +63,19 @@ fn manifest_remove_deletes_entry() -> anyhow::Result<()> {
     assert!(!manifest.is_unchanged("src/lib.rs", 10, 100, "hash-a")?);
     Ok(())
 }
+
+
+#[test]
+fn concurrent_manifest_access_no_busy_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("manifest.db");
+    let store1 = ManifestStore::open(&db_path).unwrap();
+    let store2 = ManifestStore::open(&db_path).unwrap();
+    for i in 0..100 {
+        let path = format!("file_{i}.rs");
+        store1.upsert(&path, i as i64, 100, "hash_a").unwrap();
+        store2.upsert(&path, i as i64, 200, "hash_b").unwrap();
+    }
+    let paths = store1.list_paths().unwrap();
+    assert_eq!(paths.len(), 100);
+}

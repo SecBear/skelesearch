@@ -1,5 +1,8 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
+
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Metadata about a single indexed file.
 pub struct ManifestEntry {
@@ -15,15 +18,21 @@ pub struct ManifestEntry {
 /// `mtime` + `size` are checked first (O(1)); `xxhash3` is consulted only
 /// when metadata suggests a change, avoiding unnecessary hashing on unchanged
 /// files.
+///
+/// The inner `Mutex<Connection>` makes `ManifestStore` `Send + Sync`, allowing
+/// safe use from multiple threads. WAL mode + a 5-second busy timeout prevent
+/// SQLITE_BUSY errors under concurrent access.
 pub struct ManifestStore {
-    conn: sqlite::Connection,
+    conn: Mutex<Connection>,
 }
 
 impl ManifestStore {
     /// Open or create the manifest database at `path`.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let conn = sqlite::open(path.as_ref())?;
-        conn.execute(
+        let conn = Connection::open(path.as_ref())?;
+        conn.pragma_update(None, "journal_mode", "wal")?;
+        conn.pragma_update(None, "busy_timeout", "5000")?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS file_hashes (
                 file_path TEXT PRIMARY KEY,
                 mtime     INTEGER NOT NULL,
@@ -31,7 +40,9 @@ impl ManifestStore {
                 xxhash3   TEXT    NOT NULL
             );",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Insert or update the manifest entry for `file_path`.
@@ -42,15 +53,15 @@ impl ManifestStore {
         size: i64,
         xxhash3: &str,
     ) -> anyhow::Result<()> {
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO file_hashes (file_path, mtime, size, xxhash3) VALUES (?, ?, ?, ?)
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        conn.execute(
+            "INSERT INTO file_hashes (file_path, mtime, size, xxhash3) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(file_path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, xxhash3=excluded.xxhash3",
+            params![file_path, mtime, size, xxhash3],
         )?;
-        stmt.bind((1, file_path))?;
-        stmt.bind((2, mtime))?;
-        stmt.bind((3, size))?;
-        stmt.bind((4, xxhash3))?;
-        stmt.next()?;
         Ok(())
     }
 
@@ -63,35 +74,43 @@ impl ManifestStore {
         size: i64,
         xxhash3: &str,
     ) -> anyhow::Result<bool> {
-        let mut stmt = self.conn.prepare(
-            "SELECT mtime, size, xxhash3 FROM file_hashes WHERE file_path = ?",
-        )?;
-        stmt.bind((1, file_path))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        let result = conn
+            .query_row(
+                "SELECT mtime, size, xxhash3 FROM file_hashes WHERE file_path = ?1",
+                params![file_path],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
 
-        use sqlite::State;
-        match stmt.next()? {
-            State::Done => Ok(false),
-            State::Row => {
-                let stored_mtime: i64 = stmt.read(0)?;
-                let stored_size: i64 = stmt.read(1)?;
-                let stored_hash: String = stmt.read(2)?;
-                Ok(stored_mtime == mtime && stored_size == size && stored_hash == xxhash3)
+        Ok(match result {
+            None => false,
+            Some((stored_mtime, stored_size, stored_hash)) => {
+                stored_mtime == mtime && stored_size == size && stored_hash == xxhash3
             }
-        }
+        })
     }
 
     /// All file paths currently recorded in the manifest, sorted ascending.
     pub fn list_paths(&self) -> anyhow::Result<Vec<String>> {
-        let mut stmt = self
+        let conn = self
             .conn
-            .prepare("SELECT file_path FROM file_hashes ORDER BY file_path")?;
-
-        let mut paths = Vec::new();
-        use sqlite::State;
-        while let Ok(State::Row) = stmt.next() {
-            let path: String = stmt.read(0)?;
-            paths.push(path);
-        }
+            .lock()
+            .map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        let mut stmt =
+            conn.prepare("SELECT file_path FROM file_hashes ORDER BY file_path")?;
+        let paths = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
         Ok(paths)
     }
 
@@ -110,11 +129,14 @@ impl ManifestStore {
 
     /// Remove the manifest entry for `file_path`.
     pub fn remove(&self, file_path: &str) -> anyhow::Result<()> {
-        let mut stmt = self
+        let conn = self
             .conn
-            .prepare("DELETE FROM file_hashes WHERE file_path = ?")?;
-        stmt.bind((1, file_path))?;
-        stmt.next()?;
+            .lock()
+            .map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        conn.execute(
+            "DELETE FROM file_hashes WHERE file_path = ?1",
+            params![file_path],
+        )?;
         Ok(())
     }
 }

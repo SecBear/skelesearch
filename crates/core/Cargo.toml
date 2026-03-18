@@ -13,7 +13,7 @@ watch = ["notify", "notify-debouncer-full"]
 
 [dependencies]
 cozo = { workspace = true }
-sqlite = "0.32"
+rusqlite = { workspace = true }
 
 tree-sitter = { workspace = true }
 streaming-iterator = "0.1"

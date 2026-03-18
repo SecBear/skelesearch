@@ -295,20 +295,40 @@ impl StorageBackend for CozoBackend {
     }
 
     async fn upsert_chunks(&self, chunks: &[ChunkRecord]) -> anyhow::Result<()> {
-        for c in chunks {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let dim = self.dim.load(Ordering::Relaxed);
+        const BATCH_SIZE: usize = 500;
+
+        for batch in chunks.chunks(BATCH_SIZE) {
+            let rows: Vec<Vec<DataValue>> = batch
+                .iter()
+                .map(|c| {
+                    vec![
+                        Self::dv_str(&c.file_path),
+                        Self::dv_int(c.chunk_idx as i64),
+                        Self::dv_str(&c.content),
+                        Self::dv_str(&c.normalized),
+                        Self::dv_str(&c.chunk_type),
+                        Self::dv_int(c.start_line as i64),
+                        Self::dv_int(c.end_line as i64),
+                        Self::embedding_to_dv(&c.embedding, dim),
+                    ]
+                })
+                .collect();
+
+            let data = DataValue::List(
+                rows.into_iter()
+                    .map(|r| DataValue::List(r))
+                    .collect(),
+            );
+
             let mut p = BTreeMap::new();
-            p.insert("fp".into(), Self::dv_str(&c.file_path));
-            p.insert("ci".into(), Self::dv_int(c.chunk_idx as i64));
-            p.insert("cont".into(), Self::dv_str(&c.content));
-            p.insert("norm".into(), Self::dv_str(&c.normalized));
-            p.insert("ct".into(), Self::dv_str(&c.chunk_type));
-            p.insert("sl".into(), Self::dv_int(c.start_line as i64));
-            p.insert("el".into(), Self::dv_int(c.end_line as i64));
-            let dim = self.dim.load(Ordering::Relaxed);
-            p.insert("emb".into(), Self::embedding_to_dv(&c.embedding, dim));
+            p.insert("rows".into(), data);
+
             self.run_mut(
-                "?[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding] \
-                 <- [[$fp, $ci, $cont, $norm, $ct, $sl, $el, $emb]] \
+                "?[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding] <- $rows \
                  :put chunks { file_path, chunk_idx => content, normalized, chunk_type, start_line, end_line, embedding }",
                 p,
             )?;
@@ -340,16 +360,37 @@ impl StorageBackend for CozoBackend {
     }
 
     async fn upsert_edges(&self, edges: &[EdgeRecord]) -> anyhow::Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
         let now = chrono::Utc::now().timestamp();
-        for e in edges {
+        const BATCH_SIZE: usize = 500;
+
+        for batch in edges.chunks(BATCH_SIZE) {
+            let rows: Vec<Vec<DataValue>> = batch
+                .iter()
+                .map(|e| {
+                    vec![
+                        Self::dv_str(&e.from_file),
+                        Self::dv_int(e.from_chunk as i64),
+                        Self::dv_str(&e.to_file),
+                        Self::dv_str(&e.edge_type),
+                        Self::dv_int(now),
+                    ]
+                })
+                .collect();
+
+            let data = DataValue::List(
+                rows.into_iter()
+                    .map(|r| DataValue::List(r))
+                    .collect(),
+            );
+
             let mut p = BTreeMap::new();
-            p.insert("ff".into(), Self::dv_str(&e.from_file));
-            p.insert("fc".into(), Self::dv_int(e.from_chunk as i64));
-            p.insert("tf".into(), Self::dv_str(&e.to_file));
-            p.insert("et".into(), Self::dv_str(&e.edge_type));
-            p.insert("ca".into(), Self::dv_int(now));
+            p.insert("rows".into(), data);
+
             self.run_mut(
-                "?[from_file, from_chunk, to_file, edge_type, created_at] <- [[$ff, $fc, $tf, $et, $ca]] \
+                "?[from_file, from_chunk, to_file, edge_type, created_at] <- $rows \
                  :put code_edges { from_file, from_chunk, to_file => edge_type, created_at }",
                 p,
             )?;
