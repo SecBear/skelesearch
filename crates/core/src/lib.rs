@@ -21,3 +21,7 @@ pub use searcher::{FileContext, Searcher};
 pub use gc::collect_garbage;
 pub use grep::{grep_codebase, GrepMatch, GrepOptions};
 pub use config::{Config, IndexConfig, SearchConfig};
+pub mod router;
+pub use router::{classify_query, QueryStrategy};
+pub mod symbols;
+pub use symbols::{extract_symbols, SymbolDef};

@@ -102,4 +102,14 @@ pub enum Commands {
         /// Project root (defaults to current directory).
         path: Option<std::path::PathBuf>,
     },
+
+    /// Look up named symbol definitions in the index.
+    Symbol {
+        /// Symbol name to search for (exact match).
+        name: String,
+
+        /// Optional kind filter (function, struct, class, method, trait, enum, type).
+        #[arg(long)]
+        kind: Option<String>,
+    },
 }

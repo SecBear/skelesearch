@@ -23,12 +23,13 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
-use skelesearch_core::{CozoBackend, EmbedProvider, Indexer, ManifestStore, Searcher, StorageBackend};
+use skelesearch_core::{classify_query, grep_codebase, CozoBackend, EmbedProvider, GrepOptions, Indexer, ManifestStore, QueryStrategy, Searcher, StorageBackend};
 use skelesearch_embed_fastembed::FastEmbedProvider;
 
 use crate::tools::{
-    ChunkInfo, FileContextOutput, GetFileContextInput, IndexCodebaseInput, IndexCodebaseOutput,
-    IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeRow,
+    ChunkInfo, FileContextOutput, FindSymbolInput, GetFileContextInput, IndexCodebaseInput,
+    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeRow,
+    SmartSearchInput, SmartSearchOutput, SymbolRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,8 +118,9 @@ impl SkeleSearchServer {
     ) -> anyhow::Result<Vec<SearchCodeRow>> {
         let searcher = Searcher::new(Arc::clone(&self.backend), self.provider.clone());
         let top_k = input.top_k.max(1);
+        let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
         let results = searcher
-            .search(&input.query, top_k, input.include_graph)
+            .search(&input.query, top_k, input.include_graph, max_depth)
             .await?;
         Ok(results
             .into_iter()
@@ -234,6 +236,73 @@ impl SkeleSearchServer {
         })
     }
 
+    /// Classify `input.query` with [`classify_query`] and dispatch to grep or
+    /// semantic search.  Returns the chosen strategy name and serialised results.
+    ///
+    /// Grep path: derives the common ancestor directory from indexed file paths
+    /// and calls [`grep_codebase`] with `top_k` as the result cap.
+    /// Semantic path: delegates to [`Self::search_code`].
+    pub async fn smart_search(
+        &self,
+        input: SmartSearchInput,
+    ) -> anyhow::Result<SmartSearchOutput> {
+        let strategy = classify_query(&input.query);
+        let results = match &strategy {
+            QueryStrategy::Grep => {
+                let paths = self.backend.list_indexed_paths().await?;
+                if paths.is_empty() {
+                    serde_json::Value::Array(vec![])
+                } else {
+                    let root = common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"));
+                    let opts = GrepOptions { max_results: input.top_k.max(1), case_insensitive: false };
+                    let matches = grep_codebase(&root, &input.query, &opts)?;
+                    let json: Vec<serde_json::Value> = matches
+                        .into_iter()
+                        .map(|m| serde_json::json!({
+                            "file_path": m.file_path,
+                            "line_number": m.line_number,
+                            "line_content": m.line_content,
+                        }))
+                        .collect();
+                    serde_json::Value::Array(json)
+                }
+            }
+            QueryStrategy::Semantic => {
+                let rows = self
+                    .search_code(SearchCodeInput {
+                        query: input.query,
+                        top_k: input.top_k,
+                        include_graph: input.include_graph,
+                        max_depth: None,
+                    })
+                    .await?;
+                serde_json::to_value(&rows)?
+            }
+        };
+        Ok(SmartSearchOutput { strategy: strategy.to_string(), results })
+    }
+
+    /// Find symbol definitions by name, optionally filtered by kind.
+    pub async fn find_symbol(
+        &self,
+        input: FindSymbolInput,
+    ) -> anyhow::Result<Vec<SymbolRow>> {
+        let results = self
+            .backend
+            .find_symbols(&input.name, input.kind.as_deref())
+            .await?;
+        Ok(results
+            .into_iter()
+            .map(|s| SymbolRow {
+                file_path: s.file_path,
+                name: s.name,
+                kind: s.kind,
+                start_line: s.start_line,
+                end_line: s.end_line,
+            })
+            .collect())
+    }
+
     // -----------------------------------------------------------------------
     // MCP stdio server entry point
     // -----------------------------------------------------------------------
@@ -303,6 +372,30 @@ impl SkeleSearchServer {
             .map(|out| serde_json::to_string(&out).unwrap_or_default())
             .map_err(|e| e.to_string())
     }
+
+    /// Automatically route the query to grep or semantic search based on its shape.
+    #[tool(name = "smart_search")]
+    async fn mcp_smart_search(
+        &self,
+        Parameters(input): Parameters<SmartSearchInput>,
+    ) -> Result<String, String> {
+        self.smart_search(input)
+            .await
+            .map(|out| serde_json::to_string(&out).unwrap_or_default())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Find symbol definitions by name.
+    #[tool(name = "find_symbol")]
+    async fn mcp_find_symbol(
+        &self,
+        Parameters(input): Parameters<FindSymbolInput>,
+    ) -> Result<String, String> {
+        self.find_symbol(input)
+            .await
+            .map(|rows| serde_json::to_string(&rows).unwrap_or_default())
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -338,4 +431,28 @@ fn make_provider(name: &str) -> anyhow::Result<ArcProvider> {
             other
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Path utilities
+// ---------------------------------------------------------------------------
+
+/// Return the deepest common ancestor directory for a slice of absolute file paths.
+///
+/// Walks upward from the first path's parent, popping components until every
+/// remaining path starts with the candidate.  Returns `None` when `paths` is
+/// empty or when the candidates collapse to `/` with no common prefix.
+fn common_ancestor(paths: &[String]) -> Option<PathBuf> {
+    let first = PathBuf::from(paths.first()?);	
+    let mut common = first.parent()?.to_path_buf();
+    for p in &paths[1..] {
+        let path = PathBuf::from(p);
+        // Walk upward until `common` is a prefix of `path`.
+        while !path.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    Some(common)
 }

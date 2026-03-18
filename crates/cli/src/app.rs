@@ -43,6 +43,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Grep { pattern, path, max_results, ignore_case, json } => {
             run_grep(pattern, path, max_results, ignore_case, json).await
         }
+        Commands::Symbol { name, kind } => run_symbol(name, kind).await,
     }
 }
 
@@ -215,7 +216,7 @@ async fn run_search(
     backend.initialize(dim).await?;
 
     let searcher = Searcher::new(backend, provider);
-    let results = searcher.search(&query, top_k, graph).await.unwrap_or_default();
+    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }).await.unwrap_or_default();
 
     if json_output {
         let rows: Vec<serde_json::Value> = results
@@ -514,4 +515,23 @@ impl skelesearch_core::EmbedProvider for NoopProvider {
     async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         anyhow::bail!("NoopProvider does not support embedding; use a real provider for search")
     }
+}
+
+
+async fn run_symbol(name: String, kind: Option<String>) -> anyhow::Result<()> {
+    let root = std::env::current_dir()?;
+    let dir = index_dir(&root);
+    if !dir.join("index.db").exists() {
+        anyhow::bail!("No index found in {}. Run `skelesearch index <path>` first.", dir.display());
+    }
+    let backend = open_backend(&dir)?;
+    let results = backend.find_symbols(&name, kind.as_deref()).await?;
+    if results.is_empty() {
+        println!("No symbols found for {:?}", name);
+        return Ok(());
+    }
+    for sym in &results {
+        println!("{} {} @ {}:{}-{}", sym.kind, sym.name, sym.file_path, sym.start_line, sym.end_line);
+    }
+    Ok(())
 }

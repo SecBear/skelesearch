@@ -20,9 +20,12 @@ pub struct SearchCodeInput {
     /// Maximum number of results to return (default: 5).
     #[serde(default = "default_top_k")]
     pub top_k: usize,
-    /// When true, augment results with one-hop import-graph neighbours.
+    /// When true, augment results with transitive import-graph neighbours.
     #[serde(default)]
     pub include_graph: bool,
+    /// Maximum graph traversal depth (default: 2 when include_graph is true).
+    #[serde(default)]
+    pub max_depth: Option<usize>,
 }
 
 fn default_top_k() -> usize {
@@ -108,4 +111,46 @@ pub struct FileContextOutput {
     pub chunks: Vec<ChunkInfo>,
     pub imports: Vec<String>,
     pub imported_by: Vec<String>,
+}
+
+
+/// Input for the `smart_search` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SmartSearchInput {
+    /// Natural-language or keyword query; automatically routed to grep or semantic search.
+    pub query: String,
+    /// Maximum number of results to return (default: 5).
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    /// When true (semantic path only), augment results with one-hop import-graph neighbours.
+    #[serde(default)]
+    pub include_graph: bool,
+}
+
+/// Output of the `smart_search` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SmartSearchOutput {
+    /// Which strategy was chosen: `"grep"` or `"semantic"`.
+    pub strategy: String,
+    /// Results; shape depends on strategy.
+    pub results: serde_json::Value,
+}
+
+/// Input for the `find_symbol` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindSymbolInput {
+    /// Symbol name to search for.
+    pub name: String,
+    /// Optional kind filter (e.g., "function", "struct", "class").
+    pub kind: Option<String>,
+}
+
+/// A single symbol definition.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SymbolRow {
+    pub file_path: String,
+    pub name: String,
+    pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
 }

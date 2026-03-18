@@ -192,16 +192,18 @@ fn run_mcp_exchange(messages: &[String]) -> anyhow::Result<McpTranscript> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn list_tools_exposes_the_four_v1_tools() -> anyhow::Result<()> {
+async fn list_tools_exposes_the_v1_tools() -> anyhow::Result<()> {
     let server = test_server().await?;
     let names = server.tool_names().await?;
     assert_eq!(
         names,
         vec![
+            "find_symbol",
             "get_file_context",
             "index_codebase",
             "index_status",
-            "search_code"
+            "search_code",
+            "smart_search",
         ]
     );
     Ok(())
@@ -215,6 +217,7 @@ async fn search_code_output_exposes_spec_fields() -> anyhow::Result<()> {
             query: "import edges".into(),
             top_k: 3,
             include_graph: true,
+            max_depth: None,
         })
         .await?;
     assert!(

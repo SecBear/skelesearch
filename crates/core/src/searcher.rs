@@ -36,9 +36,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
     /// Search the index for `query`.
     ///
-    /// - `top_k` — maximum number of primary results.
-    /// - `include_graph` — when `true`, augment results with one-hop import
-    ///   neighbours, annotating them with `why = "imports <target>"`.
+    /// - `top_k`        — maximum number of primary results.
+    /// - `include_graph` — when `true`, augment results with transitive import
+    ///   neighbours up to `max_depth` hops.
+    /// - `max_depth`    — BFS depth for graph augmentation; 0 disables graph
+    ///   traversal even when `include_graph` is `true`.
     ///
     /// Returns an empty `Vec` when no results match; never returns an error
     /// for a zero-result query.
@@ -47,6 +49,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         query: &str,
         top_k: usize,
         include_graph: bool,
+        max_depth: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Produce the query vector.  A single-element batch keeps the
         // provider interface uniform.
@@ -75,8 +78,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             hit.why = "vector".to_string();
         }
 
-        if include_graph {
-            hits = self.augment_with_graph(hits, top_k).await?;
+        if include_graph && max_depth > 0 {
+            hits = self.augment_with_graph(hits, max_depth).await?;
         }
 
         Ok(hits)
@@ -121,77 +124,49 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
     // -- Private helpers -----------------------------------------------------
 
-    /// Extend `hits` with one-hop import-graph neighbours.
-    ///
-    /// For each unique file in the primary result set, fetch the files it
-    /// imports and the files that import it.  Add synthetic results for any
-    /// neighbour not already present, annotated with
-    /// `why = "imports <original_file>"`.
+    /// Extend `hits` with transitive import-graph neighbours up to `max_depth`
+    /// hops.  For each primary result file, `traverse_imports` performs a
+    /// level-batched BFS; each discovered file's chunks are added as `"graph
+    /// (depth N)"` results.  The visited set inside `traverse_imports` handles
+    /// cycles.  Files with no chunks are silently skipped.
     async fn augment_with_graph(
         &self,
         mut hits: Vec<SearchResult>,
-        top_k: usize,
+        max_depth: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
         let present: std::collections::HashSet<String> =
             hits.iter().map(|h| h.file_path.clone()).collect();
 
-        let mut neighbours: Vec<SearchResult> = Vec::new();
-
-        for file_path in &present {
-            // Outbound: files this file imports.
-            for target in self.backend.get_imports(file_path).await? {
-                if !present.contains(&target) {
-                    let chunks = self.backend.get_chunks_for_file(&target).await?;
-                    for chunk in chunks {
-                        neighbours.push(SearchResult {
-                            file_path: chunk.file_path,
-                            chunk_idx: chunk.chunk_idx,
-                            content: chunk.content,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            chunk_type: chunk.chunk_type,
-                            score: 0.0,
-                            match_quality: "low".to_string(),
-                            why: format!("imports {file_path}"),
-                        });
-                    }
-                }
-            }
-            // Inbound: files that import this file.
-            for importer in self.backend.get_importers(file_path).await? {
-                if !present.contains(&importer) {
-                    let chunks = self.backend.get_chunks_for_file(&importer).await?;
-                    for chunk in chunks {
-                        neighbours.push(SearchResult {
-                            file_path: chunk.file_path,
-                            chunk_idx: chunk.chunk_idx,
-                            content: chunk.content,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            chunk_type: chunk.chunk_type,
-                            score: 0.0,
-                            match_quality: "low".to_string(),
-                            why: format!("imports {file_path}"),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Deduplicate neighbours by (file_path, chunk_idx).
+        // Track chunks already represented so we never emit duplicates.
         let mut seen_chunks: std::collections::HashSet<(String, usize)> =
             hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
-        for n in neighbours {
-            let key = (n.file_path.clone(), n.chunk_idx);
-            if seen_chunks.insert(key) {
-                hits.push(n);
+
+        for file_path in &present {
+            let reachable = self.backend.traverse_imports(file_path, max_depth).await?;
+            for target in reachable {
+                // `traverse_imports` already de-duplicates across BFS levels,
+                // but multiple primary files may independently reach the same
+                // target; guard with `seen_chunks` per-chunk.
+                let chunks = self.backend.get_chunks_for_file(&target).await?;
+                for chunk in chunks {
+                    let key = (chunk.file_path.clone(), chunk.chunk_idx);
+                    if seen_chunks.insert(key) {
+                        hits.push(SearchResult {
+                            file_path: chunk.file_path,
+                            chunk_idx: chunk.chunk_idx,
+                            content: chunk.content,
+                            start_line: chunk.start_line,
+                            end_line: chunk.end_line,
+                            chunk_type: chunk.chunk_type,
+                            score: 0.0,
+                            match_quality: "low".to_string(),
+                            why: format!("graph (depth {max_depth})"),
+                        });
+                    }
+                }
             }
         }
 
-        // Respect the caller's top_k for the non-graph portion; graph hits are
-        // additive.  We've already trimmed the base results to top_k in the
-        // backend, so just return everything here.
-        let _ = top_k; // retained for documentation; base is already bounded
         Ok(hits)
     }
 }

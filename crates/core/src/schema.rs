@@ -1,3 +1,5 @@
+use crate::symbols::SymbolDef;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cozo::{DataValue, DbInstance, NamedRows};
@@ -90,6 +92,11 @@ pub trait StorageBackend: Send + Sync {
     async fn get_importers(&self, file_path: &str) -> anyhow::Result<Vec<String>>;
     async fn get_imports(&self, file_path: &str) -> anyhow::Result<Vec<String>>;
 
+    /// BFS traversal of the import graph starting from `file_path`, up to
+    /// `max_depth` hops.  Returns all reachable files (excluding the start
+    /// node).  Cycles are handled by the visited set.
+    async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>>;
+
     async fn hybrid_search(
         &self,
         query_vec: &[f32],
@@ -98,6 +105,10 @@ pub trait StorageBackend: Send + Sync {
     ) -> anyhow::Result<Vec<SearchResult>>;
 
     async fn stats(&self) -> anyhow::Result<IndexStats>;
+
+    async fn upsert_symbols(&self, symbols: &[SymbolDef]) -> anyhow::Result<()>;
+    async fn delete_symbols_for_file(&self, file_path: &str) -> anyhow::Result<()>;
+    async fn find_symbols(&self, name: &str, kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +263,12 @@ impl StorageBackend for CozoBackend {
         // Create FTS index — idempotent.
         self.run_mut_ignore(
             "::fts create chunks:text { extractor: normalized, tokenizer: Simple, filters: [Lowercase, AlphaNumOnly] }",
+            "already exists",
+        )?;
+
+        // Create symbols relation — idempotent.
+        self.run_mut_ignore(
+            ":create symbols { file_path: String, name: String, start_line: Int => kind: String, end_line: Int }",
             "already exists",
         )?;
 
@@ -429,6 +446,46 @@ impl StorageBackend for CozoBackend {
         rows.rows.iter().map(|r| Self::str_col(&r[0])).collect()
     }
 
+    async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>> {
+        use std::collections::HashSet;
+        if max_depth == 0 {
+            return Ok(vec![]);
+        }
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(file_path.to_string());
+        let mut frontier = vec![file_path.to_string()];
+        let mut result: Vec<String> = Vec::new();
+
+        for _ in 0..max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+            // Build frontier as DataValue::List for CozoDB's is_in() predicate.
+            let frontier_dv = DataValue::List(
+                frontier.iter().map(|k| Self::dv_str(k)).collect(),
+            );
+            let mut p = BTreeMap::new();
+            p.insert("frontier".into(), frontier_dv);
+
+            let rows = self.run_imm(
+                "?[to_file] := *code_edges[from_file, _, to_file, _, _], is_in(from_file, $frontier)",
+                p,
+            )?;
+
+            frontier.clear();
+            for row in &rows.rows {
+                if let Ok(to_file) = Self::str_col(&row[0]) {
+                    if !visited.contains(&to_file) {
+                        visited.insert(to_file.clone());
+                        result.push(to_file.clone());
+                        frontier.push(to_file);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     async fn hybrid_search(
         &self,
         query_vec: &[f32],
@@ -602,6 +659,83 @@ fts_scored[file_path, chunk_idx, score] :=
             watching: false,
         })
     }
+
+    async fn upsert_symbols(&self, symbols: &[SymbolDef]) -> anyhow::Result<()> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        const BATCH_SIZE: usize = 500;
+        for batch in symbols.chunks(BATCH_SIZE) {
+            let rows: Vec<Vec<DataValue>> = batch
+                .iter()
+                .map(|s| {
+                    vec![
+                        Self::dv_str(&s.file_path),
+                        Self::dv_str(&s.name),
+                        Self::dv_int(s.start_line as i64),
+                        Self::dv_str(&s.kind),
+                        Self::dv_int(s.end_line as i64),
+                    ]
+                })
+                .collect();
+            let data = DataValue::List(
+                rows.into_iter().map(|r| DataValue::List(r)).collect(),
+            );
+            let mut p = BTreeMap::new();
+            p.insert("rows".into(), data);
+            self.run_mut(
+                "?[file_path, name, start_line, kind, end_line] <- $rows \
+                 :put symbols { file_path, name, start_line => kind, end_line }",
+                p,
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn delete_symbols_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        let mut p = BTreeMap::new();
+        p.insert("fp".into(), Self::dv_str(file_path));
+        self.run_mut(
+            "?[file_path, name, start_line] := *symbols[file_path, name, start_line, _, _], file_path = $fp \
+             :rm symbols { file_path, name, start_line }",
+            p,
+        )?;
+        Ok(())
+    }
+
+    async fn find_symbols(&self, name: &str, kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> {
+        let mut p = BTreeMap::new();
+        p.insert("name".into(), Self::dv_str(name));
+        let rows = if let Some(k) = kind {
+            p.insert("kind".into(), Self::dv_str(k));
+            self.run_imm(
+                "?[file_path, name, kind, start_line, end_line] := \
+                   *symbols[file_path, name, start_line, kind, end_line], \
+                   name = $name, kind = $kind",
+                p,
+            )?
+        } else {
+            self.run_imm(
+                "?[file_path, name, kind, start_line, end_line] := \
+                   *symbols[file_path, name, start_line, kind, end_line], \
+                   name = $name",
+                p,
+            )?
+        };
+        rows.rows
+            .iter()
+            .map(|r| {
+                Ok(SymbolDef {
+                    file_path: Self::str_col(&r[0])?,
+                    name: Self::str_col(&r[1])?,
+                    kind: Self::str_col(&r[2])?,
+                    start_line: Self::int_col(&r[3])? as usize,
+                    end_line: Self::int_col(&r[4])? as usize,
+                })
+            })
+            .collect()
+    }
+
 }
 
 
@@ -655,6 +789,10 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         (**self).get_imports(file_path).await
     }
 
+    async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>> {
+        (**self).traverse_imports(file_path, max_depth).await
+    }
+
     async fn hybrid_search(
         &self,
         query_vec: &[f32],
@@ -666,5 +804,17 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
 
     async fn stats(&self) -> anyhow::Result<IndexStats> {
         (**self).stats().await
+    }
+
+    async fn upsert_symbols(&self, symbols: &[SymbolDef]) -> anyhow::Result<()> {
+        (**self).upsert_symbols(symbols).await
+    }
+
+    async fn delete_symbols_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        (**self).delete_symbols_for_file(file_path).await
+    }
+
+    async fn find_symbols(&self, name: &str, kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> {
+        (**self).find_symbols(name, kind).await
     }
 }
