@@ -28,6 +28,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(level))
         .with_writer(std::io::stderr)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .init();
 
     match cli.command {
