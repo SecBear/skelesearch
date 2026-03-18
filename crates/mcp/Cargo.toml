@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "MCP server for skelesearch — exposes semantic code search as MCP tools"
 
+[lib]
+name = "skelesearch_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "skelesearch-mcp"
 path = "src/main.rs"
@@ -18,3 +22,10 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = { workspace = true }
+
+[dev-dependencies]

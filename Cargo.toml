@@ -42,7 +42,7 @@ fastembed = { version = "4" }
 
 # MCP server
 rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
-schemars = "0.8"
+schemars = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
