@@ -6,7 +6,8 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context as _;
 
 use crate::{
-    ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore, StorageBackend,
+    content_hash, ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore,
+    StorageBackend,
 };
 use crate::symbols::extract_symbols;
 
@@ -287,18 +288,58 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 vec![Vec::new(); batch_files.len()];
 
             for sub in pending.chunks(self.batch_size) {
-                let texts: Vec<String> = sub.iter().map(|(_, c)| c.content.clone()).collect();
-                let embs = if texts.is_empty() {
+                // --- embedding cache lookup ---
+                let hashes: Vec<String> =
+                    sub.iter().map(|(_, c)| content_hash(&c.content)).collect();
+                let cached = self.manifest.get_cached_embeddings(&hashes)?;
+
+                // Partition into hits and misses; track original sub-indices.
+                let mut miss_indices: Vec<usize> = Vec::new();
+                let mut miss_texts: Vec<String> = Vec::new();
+                for (i, hit) in cached.iter().enumerate() {
+                    if hit.is_none() {
+                        miss_indices.push(i);
+                        miss_texts.push(sub[i].1.content.clone());
+                    }
+                }
+
+                let cached_count = sub.len() - miss_indices.len();
+                let miss_count = miss_indices.len();
+                tracing::debug!(hits = cached_count, misses = miss_count, "embedding cache");
+
+                // Embed only the cache misses (skip provider call if none).
+                let fresh_embs: Vec<Vec<f32>> = if miss_texts.is_empty() {
                     vec![]
                 } else {
-                    self.provider.embed_batch(texts).await?
+                    let result = self.provider.embed_batch(miss_texts).await?;
+                    anyhow::ensure!(
+                        result.len() == miss_count,
+                        "embedding count mismatch: provider returned {} vectors for {} texts",
+                        result.len(),
+                        miss_count
+                    );
+                    result
                 };
-                anyhow::ensure!(
-                    embs.len() == sub.len(),
-                    "embedding count mismatch: provider returned {} vectors for {} texts",
-                    embs.len(),
-                    sub.len()
-                );
+
+                // Persist fresh embeddings to cache.
+                let to_cache: Vec<(String, Vec<f32>)> = miss_indices
+                    .iter()
+                    .zip(fresh_embs.iter())
+                    .map(|(&i, emb)| (hashes[i].clone(), emb.clone()))
+                    .collect();
+                self.manifest.cache_embeddings(&to_cache)?;
+
+                // Merge cached + fresh into per-original-index embeddings.
+                // cached[i] is Some(hit) or None (miss); fill misses from fresh_embs in order.
+                let mut fresh_iter = fresh_embs.into_iter();
+                let embs: Vec<Vec<f32>> = cached
+                    .into_iter()
+                    .map(|hit| match hit {
+                        Some(v) => v,
+                        None => fresh_iter.next().expect("miss count matches fresh_embs"),
+                    })
+                    .collect();
+
                 for ((fi, chunk), emb) in sub.iter().zip(embs) {
                     let fc = batch_files[*fi].candidate;
                     chunk_records_per_file[*fi].push(ChunkRecord {

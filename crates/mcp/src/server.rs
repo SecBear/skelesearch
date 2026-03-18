@@ -174,7 +174,7 @@ impl SkeleSearchServer {
         let top_k = input.top_k.max(1);
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
         let results = searcher
-            .search(&input.query, top_k, input.include_graph, max_depth)
+            .search(&input.query, top_k, input.include_graph, max_depth, input.diversity)
             .await?;
         Ok(results
             .into_iter()
@@ -362,6 +362,7 @@ impl SkeleSearchServer {
                         top_k: input.top_k,
                         include_graph: input.include_graph,
                         max_depth: None,
+                        diversity: input.diversity,
                     })
                     .await?;
                 SmartSearchResults::Semantic(rows)

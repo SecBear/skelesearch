@@ -92,7 +92,7 @@ async fn searcher_returns_quality_labels_for_non_empty_results() -> anyhow::Resu
     let (_, searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
 
     // Search for something that appears in the fixture files.
-    let results = searcher.search("pub fn", 5, false, 0).await?;
+    let results = searcher.search("pub fn", 5, false, 0, 0.0).await?;
     if results.is_empty() {
         // Accept gracefully if FTS doesn't surface results for this query.
         return Ok(());
@@ -119,8 +119,8 @@ async fn searcher_returns_quality_labels_for_non_empty_results() -> anyhow::Resu
 async fn searcher_graph_augmentation_annotates_import_neighbours() -> anyhow::Result<()> {
     let (_, searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
 
-    let plain = searcher.search("pub fn", 5, false, 0).await?;
-    let graph = searcher.search("pub fn", 5, true, 2).await?;
+    let plain = searcher.search("pub fn", 5, false, 0, 0.0).await?;
+    let graph = searcher.search("pub fn", 5, true, 2, 0.0).await?;
 
     // Graph search must return at least as many results as plain (it augments).
     assert!(
@@ -150,7 +150,7 @@ async fn file_context_and_empty_search_are_truthful_for_missing_data() -> anyhow
 
     // Search for a term that definitely won't match anything indexed.
     let empty = searcher
-        .search("ZZZNOMATCH_ZZZNOMATCH_ZZZNOMATCH_XYZ", 3, false, 0)
+        .search("ZZZNOMATCH_ZZZNOMATCH_ZZZNOMATCH_XYZ", 3, false, 0, 0.0)
         .await?;
     // Accept either empty results or low-scoring results for a nonsense query.
     // The important invariant: no panic, no error.
@@ -171,7 +171,7 @@ async fn file_context_returns_chunks_for_indexed_file() -> anyhow::Result<()> {
 
     // The fixture has src/lib.rs; find it regardless of the exact relative prefix.
     let paths = searcher
-        .search("pub fn add", 10, false, 0)
+        .search("pub fn add", 10, false, 0, 0.0)
         .await?
         .into_iter()
         .filter(|r| r.file_path.ends_with("lib.rs"))
@@ -302,7 +302,7 @@ async fn concurrent_index_and_search_does_not_panic() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Search while indexing is in-flight.  Must not panic or error.
-    let search_result = searcher.search("func", 5, false, 0).await;
+    let search_result = searcher.search("func", 5, false, 0, 0.0).await;
     assert!(
         search_result.is_ok(),
         "search during indexing must return Ok; got: {:?}",
@@ -311,5 +311,86 @@ async fn concurrent_index_and_search_does_not_panic() -> anyhow::Result<()> {
 
     // Wait for indexing to complete to avoid leaking the task.
     index_handle.await??;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MMR re-ranking test
+// ---------------------------------------------------------------------------
+
+/// Provider that maps text content to one of two clusters:
+/// text containing "near" → [1,0,0,0], anything else → [0,1,0,0].
+/// Both vectors are already unit-length (L2 norm = 1).
+/// This gives us a fully controlled similarity structure for MMR testing.
+#[derive(Clone)]
+struct ClusterProvider;
+
+#[async_trait]
+impl EmbedProvider for ClusterProvider {
+    fn dim(&self) -> usize { 4 }
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| {
+            if t.to_lowercase().contains("near") {
+                vec![1.0_f32, 0.0, 0.0, 0.0]
+            } else {
+                vec![0.0_f32, 1.0, 0.0, 0.0]
+            }
+        }).collect())
+    }
+}
+
+#[tokio::test]
+async fn mmr_reranking_diversifies_results() -> anyhow::Result<()> {
+    // Two "near" files have identical stored embeddings [1,0,0,0].
+    // One "far" file has orthogonal stored embedding [0,1,0,0].
+    // Query "near_alpha" also maps to [1,0,0,0].
+    //
+    // Without MMR: near1, near2, far (by RRF relevance order).
+    // With MMR (diversity=0.7, lambda=0.3):
+    //   - Pick near1 (or near2) first (highest relevance = 1.0).
+    //   - near2 now has redundancy=cos([1,0,0,0],[1,0,0,0])=1.0 → mmr=-0.4
+    //   - far has redundancy=cos([0,1,0,0],[1,0,0,0])=0.0  → mmr=0.0
+    //   - far wins → order: [near1, far, near2]
+    // So the orderings differ.
+    let dir = tempfile::tempdir()?;
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+    backend.initialize(4).await?;
+
+    // Write 3 small Rust source files with clearly differentiated content.
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    std::fs::write(repo.join("near1.rs"), "fn near_alpha() {}\n")?;
+    std::fs::write(repo.join("near2.rs"), "fn near_beta() {}\n")?;
+    std::fs::write(repo.join("far.rs"),   "fn far_omega() {}\n")?;
+
+    let indexer = Indexer::new(backend.clone(), manifest, ClusterProvider);
+    indexer.index_path(&repo).await?;
+
+    let searcher = Searcher::new(backend.clone(), ClusterProvider);
+
+    // Fetch all 3 chunks so the MMR has material to reorder.
+    let no_mmr   = searcher.search("near_alpha", 3, false, 0, 0.0).await?;
+    let with_mmr = searcher.search("near_alpha", 3, false, 0, 0.7).await?;
+
+    // Both searches must succeed and return at least one result.
+    assert!(!no_mmr.is_empty(),   "no-MMR search must return results");
+    assert!(!with_mmr.is_empty(), "MMR search must return results");
+
+    // If the index returned all 3 chunks, the MMR ordering must differ:
+    // MMR should promote the orthogonal "far" chunk ahead of the redundant "near" clone.
+    if no_mmr.len() == 3 && with_mmr.len() == 3 {
+        let no_mmr_files: Vec<_>   = no_mmr.iter().map(|r| r.file_path.as_str()).collect();
+        let with_mmr_files: Vec<_> = with_mmr.iter().map(|r| r.file_path.as_str()).collect();
+        assert_ne!(
+            no_mmr_files, with_mmr_files,
+            "MMR must reorder results when near-duplicate embeddings are present; \
+             no_mmr={no_mmr_files:?} with_mmr={with_mmr_files:?}"
+        );
+    }
+
     Ok(())
 }

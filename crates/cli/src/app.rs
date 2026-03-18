@@ -203,7 +203,7 @@ async fn run_search(
     backend.initialize(dim).await?;
 
     let searcher = Searcher::new(backend, provider);
-    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }).await.unwrap_or_default();
+    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, 0.0).await.unwrap_or_default();
 
     if json_output {
         let rows: Vec<serde_json::Value> = results

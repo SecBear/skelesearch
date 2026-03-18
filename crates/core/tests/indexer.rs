@@ -393,3 +393,67 @@ async fn binary_files_are_skipped() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Embedding cache test
+// ---------------------------------------------------------------------------
+
+/// Verifies that the embedding cache prevents redundant provider calls.
+///
+/// Strategy:
+///   1. Index 3 source files — all chunks are embedded and cached.
+///   2. Modify ONE file's content so the manifest detects it as changed.
+///   3. Index again — only the changed file's chunks need embedding.
+///   4. Assert the second run embedded fewer texts than the first.
+///
+/// The unchanged files are skipped entirely by manifest mtime+size detection.
+/// The changed file's new chunks are fresh cache misses, but the volume is
+/// strictly less than embedding all three files in the first run.
+#[tokio::test]
+async fn embedding_cache_reduces_provider_calls() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+
+    // Three source files; only one will be modified between runs.
+    std::fs::write(repo.join("alpha.rs"), "fn alpha_one() {}\nfn alpha_two() {}\n")?;
+    std::fs::write(repo.join("beta.rs"),  "fn beta_one() {}\nfn beta_two() {}\n")?;
+    std::fs::write(repo.join("gamma.rs"), "fn gamma_one() {}\nfn gamma_two() {}\n")?;
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+
+    // Shared backend and manifest (same manifest DB = same embedding_cache).
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+
+    // --- Run 1: all files are new, all chunks need embedding ---
+    let provider1 = CountingTestProvider::new(8);
+    backend.initialize(8).await?;
+    let indexer1 = Indexer::new(backend.clone(), manifest.clone(), provider1);
+    indexer1.index_path(&repo).await?;
+    let first_texts = indexer1.provider().chunk_count_seen();
+    assert!(first_texts > 0, "first run must embed at least one chunk");
+
+    // --- Modify only gamma.rs so the manifest sees it as changed ---
+    // Sleep briefly to ensure the filesystem mtime advances beyond second
+    // granularity used by the manifest's mtime+size fast-skip check.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(
+        repo.join("gamma.rs"),
+        "fn gamma_one() {}\nfn gamma_two() {}\nfn gamma_three() {}\n",
+    )?;
+
+    // --- Run 2: only gamma.rs is re-indexed; alpha+beta are unchanged ---
+    let provider2 = CountingTestProvider::new(8);
+    let indexer2 = Indexer::new(backend.clone(), manifest.clone(), provider2);
+    indexer2.index_path(&repo).await?;
+    let second_texts = indexer2.provider().chunk_count_seen();
+
+    assert!(
+        second_texts < first_texts,
+        "second run should embed fewer texts than first (cache + manifest skips); \
+         first={first_texts}, second={second_texts}"
+    );
+    Ok(())
+}

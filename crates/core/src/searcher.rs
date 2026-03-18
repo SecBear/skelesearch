@@ -50,6 +50,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         top_k: usize,
         include_graph: bool,
         max_depth: usize,
+        diversity: f32,
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Produce the query vector.  A single-element batch keeps the
         // provider interface uniform.
@@ -83,6 +84,17 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // for the planned identifier-based dependency graph approach.
         // The include_graph parameter is accepted but currently a no-op.
         let _ = (include_graph, max_depth);
+
+        // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
+        let diversity = diversity.clamp(0.0, 1.0);
+        if diversity > 0.0 && hits.len() > 1 {
+            let keys: Vec<(String, usize)> = hits
+                .iter()
+                .map(|h| (h.file_path.clone(), h.chunk_idx))
+                .collect();
+            let result_vecs = self.backend.get_chunk_embeddings(&keys).await?;
+            hits = mmr_rerank(hits, &query_vec, &result_vecs, 1.0 - diversity);
+        }
 
         Ok(hits)
     }
@@ -173,4 +185,70 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
         Ok(hits)
     }
+}
+
+// ---------------------------------------------------------------------------
+// MMR re-ranking
+// ---------------------------------------------------------------------------
+
+/// Cosine similarity between two vectors.  Returns 0.0 for zero vectors.
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
+}
+
+/// Maximal Marginal Relevance re-ranking.
+///
+/// Re-orders `results` to balance relevance against diversity.
+/// `lambda` in [0, 1]: 1.0 = pure relevance (no change), 0.0 = pure diversity.
+/// `query_vec` is the embedded query; `result_vecs` are embeddings for each result
+/// in the same order as `results`.
+fn mmr_rerank(
+    results: Vec<SearchResult>,
+    query_vec: &[f32],
+    result_vecs: &[Vec<f32>],
+    lambda: f32,
+) -> Vec<SearchResult> {
+    let n = results.len();
+    let mut selected: Vec<usize> = Vec::with_capacity(n);
+    let mut candidates: Vec<usize> = (0..n).collect();
+
+    while !candidates.is_empty() {
+        let best = candidates
+            .iter()
+            .copied()
+            .max_by(|&i, &j| {
+                let score_i = mmr_score(i, &selected, query_vec, result_vecs, lambda);
+                let score_j = mmr_score(j, &selected, query_vec, result_vecs, lambda);
+                score_i.partial_cmp(&score_j).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("candidates is non-empty");
+        candidates.retain(|&c| c != best);
+        selected.push(best);
+    }
+
+    selected.into_iter().map(|i| results[i].clone()).collect()
+}
+
+/// MMR score for candidate `i` given already-selected items.
+fn mmr_score(
+    i: usize,
+    selected: &[usize],
+    query_vec: &[f32],
+    result_vecs: &[Vec<f32>],
+    lambda: f32,
+) -> f32 {
+    let relevance = cosine_sim(query_vec, &result_vecs[i]);
+    let redundancy = selected
+        .iter()
+        .map(|&s| cosine_sim(&result_vecs[i], &result_vecs[s]))
+        .fold(f32::NEG_INFINITY, f32::max);
+    // When no items have been selected yet, redundancy is -inf; treat as 0.
+    let redundancy = if redundancy == f32::NEG_INFINITY { 0.0 } else { redundancy };
+    lambda * relevance - (1.0 - lambda) * redundancy
 }

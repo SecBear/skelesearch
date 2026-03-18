@@ -111,6 +111,10 @@ pub trait StorageBackend: Send + Sync {
     async fn upsert_symbols(&self, symbols: &[SymbolDef]) -> anyhow::Result<()>;
     async fn delete_symbols_for_file(&self, file_path: &str) -> anyhow::Result<()>;
     async fn find_symbols(&self, name: &str, kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>>;
+
+    /// Fetch stored embedding vectors for specific chunks.
+    /// Returns embeddings in the same order as `keys`. Missing chunks yield a zero vector.
+    async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -856,8 +860,38 @@ impl StorageBackend for CozoBackend {
             .collect()
     }
 
+    async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let dim = self.dim.load(Ordering::Relaxed);
+        let zero = vec![0.0f32; dim];
+        let mut result = Vec::with_capacity(keys.len());
+        for (file_path, chunk_idx) in keys {
+            let mut p = BTreeMap::new();
+            p.insert("fp".into(), Self::dv_str(file_path));
+            p.insert("ci".into(), DataValue::Num(cozo::Num::Int(*chunk_idx as i64)));
+            let rows = self.run_imm(
+                "?[emb] := *chunks[fp, ci, _, _, _, _, _, emb], fp = $fp, ci = $ci",
+                p,
+            )?;
+            let emb = rows
+                .rows
+                .into_iter()
+                .next()
+                .and_then(|row| match &row[0] {
+                    DataValue::List(items) if !items.is_empty() => Some(
+                        items.iter().map(|d| match d {
+                            DataValue::Num(cozo::Num::Float(f)) => *f as f32,
+                            DataValue::Num(cozo::Num::Int(i)) => *i as f32,
+                            _ => 0.0,
+                        }).collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_else(|| zero.clone());
+            result.push(emb);
+        }
+        Ok(result)
+    }
 }
-
 
 // ---------------------------------------------------------------------------
 // Blanket impl: Arc<B> delegates to B so Indexer/Searcher can hold Arc<B>
@@ -936,5 +970,8 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
 
     async fn find_symbols(&self, name: &str, kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> {
         (**self).find_symbols(name, kind).await
+    }
+    async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> {
+        (**self).get_chunk_embeddings(keys).await
     }
 }

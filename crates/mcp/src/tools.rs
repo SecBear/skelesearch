@@ -26,10 +26,18 @@ pub struct SearchCodeInput {
     /// Maximum graph traversal depth (default: 2 when include_graph is true).
     #[serde(default)]
     pub max_depth: Option<usize>,
+    /// Diversity factor for MMR re-ranking (0.0–1.0). 0.0 = pure relevance,
+    /// higher values reduce redundancy. Default: 0.3.
+    #[serde(default = "default_diversity")]
+    pub diversity: f32,
 }
 
 fn default_top_k() -> usize {
     5
+}
+
+fn default_diversity() -> f32 {
+    0.3
 }
 
 /// Input for the `index_codebase` tool.
@@ -125,6 +133,10 @@ pub struct SmartSearchInput {
     /// When true (semantic path only), augment results with one-hop import-graph neighbours.
     #[serde(default)]
     pub include_graph: bool,
+    /// Diversity factor for MMR re-ranking (0.0–1.0). 0.0 = pure relevance,
+    /// higher values reduce redundancy. Default: 0.3.
+    #[serde(default = "default_diversity")]
+    pub diversity: f32,
 }
 
 /// A single grep result row returned by `smart_search` on the grep path.

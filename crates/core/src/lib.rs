@@ -12,7 +12,7 @@ pub mod config;
 // `use skelesearch_core::CozoBackend` instead of the full path.
 pub use chunker::{normalize_for_fts, Chunker, ImportEdge, ParsedChunk};
 pub use indexer::{IndexResult, Indexer};
-pub use manifest::{IncompleteBatch, ManifestStore};
+pub use manifest::{content_hash, IncompleteBatch, ManifestStore};
 pub use provider::EmbedProvider;
 pub use schema::{
     ChunkRecord, CozoBackend, EdgeRecord, FileRecord, IndexStats, SearchResult, StorageBackend,

@@ -46,6 +46,11 @@ impl ManifestStore {
                 status     TEXT    NOT NULL DEFAULT 'pending',
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (run_id, batch_idx)
+            );
+            CREATE TABLE IF NOT EXISTS embedding_cache (
+                content_hash TEXT PRIMARY KEY,
+                dim          INTEGER NOT NULL,
+                embedding    BLOB NOT NULL
             );",
         )?;
         Ok(Self {
@@ -283,4 +288,68 @@ impl ManifestStore {
         )?;
         Ok(())
     }
+
+    /// Look up cached embeddings by content hash.
+    ///
+    /// Returns `None` for cache misses, `Some(vec)` for hits.
+    /// Embedding is stored as packed little-endian f32 bytes.
+    pub fn get_cached_embeddings(&self, hashes: &[String]) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        hashes
+            .iter()
+            .map(|hash| {
+                let result: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT embedding FROM embedding_cache WHERE content_hash = ?1",
+                        params![hash],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(result.map(|bytes| {
+                    // BLOB is packed little-endian f32 bytes; 4 bytes per float.
+                    bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect()
+                }))
+            })
+            .collect()
+    }
+
+    /// Store embeddings in the cache. Uses INSERT OR REPLACE for idempotence.
+    ///
+    /// Each entry is `(content_hash, embedding_vec)`; the embedding is encoded
+    /// as packed little-endian f32 bytes.
+    pub fn cache_embeddings(&self, entries: &[(String, Vec<f32>)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO embedding_cache (content_hash, dim, embedding) VALUES (?1, ?2, ?3)",
+            )?;
+            for (hash, emb) in entries {
+                // Encode as packed little-endian f32 bytes.
+                let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(params![hash, emb.len() as i64, bytes])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+
+/// Compute a stable content hash for a chunk of text using XxHash3-64.
+///
+/// The hex string is used as the `content_hash` primary key in the
+/// `embedding_cache` table so that identical text always maps to the same
+/// cached embedding regardless of which file it came from.
+pub fn content_hash(text: &str) -> String {
+    use std::hash::Hasher as _;
+    let mut h = twox_hash::XxHash3_64::default();
+    h.write(text.as_bytes());
+    format!("{:016x}", h.finish())
 }
