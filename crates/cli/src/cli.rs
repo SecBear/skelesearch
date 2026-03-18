@@ -40,6 +40,11 @@ pub enum Commands {
         /// Output results as a JSON array.
         #[arg(long)]
         json: bool,
+
+        /// Diversity factor for MMR re-ranking (0.0-1.0). Higher values reduce
+        /// redundancy in results. 0 disables MMR.
+        #[arg(long, default_value_t = 0.0)]
+        diversity: f32,
     },
 
     /// Show all indexed chunks plus import graph for a file.

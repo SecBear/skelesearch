@@ -394,7 +394,7 @@ impl SkeleSearchServer {
     }
 
     // -----------------------------------------------------------------------
-    // MCP stdio server entry point
+    // MCP transport entry points
     // -----------------------------------------------------------------------
 
     /// Start the server on stdin/stdout and block until the connection closes.
@@ -404,6 +404,37 @@ impl SkeleSearchServer {
             .await
             .context("MCP server initialization failed")?;
         service.waiting().await?;
+        Ok(())
+    }
+
+    /// Start the server over Streamable HTTP on the given address.
+    ///
+    /// The MCP Streamable HTTP transport uses POST for requests and SSE
+    /// for streaming responses.  This is the preferred transport for
+    /// non-subprocess consumers (VS Code extensions, remote agents, HTTP
+    /// clients).
+    pub async fn serve_http(self, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService,
+            session::local::LocalSessionManager,
+        };
+
+        let config = StreamableHttpServerConfig::default();
+        // The factory is called once per session (stateless mode, the default).
+        // All fields behind Arc so cloning is cheap.
+        let service = StreamableHttpService::<SkeleSearchServer, LocalSessionManager>::new(
+            move || Ok(self.clone()),
+            Default::default(),
+            config,
+        );
+
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .with_context(|| format!("bind to {addr}"))?;
+        tracing::info!("skelesearch-mcp HTTP listening on {addr}");
+
+        axum::serve(listener, router).await
+            .context("HTTP server error")?;
         Ok(())
     }
 }

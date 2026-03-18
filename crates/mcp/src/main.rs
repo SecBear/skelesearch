@@ -4,13 +4,14 @@
 // JSON-RPC messages sent by rmcp.  Any log line written to stdout would
 // corrupt the MCP framing and break the client.
 //
-// Transport: stdio (Claude Code / MCP-compatible)
+// Transport: stdio (default) or Streamable HTTP (--http <addr>)
 // Framework: rmcp 0.16 (#[tool_router] + #[tool_handler])
 
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use clap::Parser;
 use skelesearch_core::EmbedProvider;
 use skelesearch_mcp::server::SkeleSearchServer;
 
@@ -38,6 +39,15 @@ impl EmbedProvider for NoopProvider {
     }
 }
 
+#[derive(Parser)]
+#[command(name = "skelesearch-mcp", version)]
+struct Args {
+    /// Listen on HTTP (Streamable HTTP transport) instead of stdio.
+    /// When set, the server binds to this address (e.g., 127.0.0.1:3000).
+    #[arg(long)]
+    http: Option<String>,
+}
+
 fn main() {
     // Initialise tracing to stderr before touching anything else.
     tracing_subscriber::fmt()
@@ -56,6 +66,8 @@ fn main() {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
     let project_root = find_project_root();
     let skelesearch_dir = project_root.join(".skelesearch");
     std::fs::create_dir_all(&skelesearch_dir)
@@ -69,12 +81,21 @@ async fn async_main() -> anyhow::Result<()> {
 
     let server = SkeleSearchServer::new(backend, manifest_path, NoopProvider);
 
-    tracing::info!(
-        "skelesearch-mcp starting on stdio (storage: {})",
-        skelesearch_dir.display()
-    );
-
-    server.serve_stdio().await
+    if let Some(addr_str) = args.http {
+        let addr: std::net::SocketAddr = addr_str.parse()
+            .context("invalid --http address")?;
+        tracing::info!(
+            "skelesearch-mcp starting on HTTP (storage: {})",
+            skelesearch_dir.display()
+        );
+        server.serve_http(addr).await
+    } else {
+        tracing::info!(
+            "skelesearch-mcp starting on stdio (storage: {})",
+            skelesearch_dir.display()
+        );
+        server.serve_stdio().await
+    }
 }
 
 /// Walk up from cwd until we find a directory containing `.git`, then return

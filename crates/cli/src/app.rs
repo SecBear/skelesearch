@@ -32,8 +32,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,
-        Commands::Search { query, top_k, graph, json } => {
-            run_search(query, top_k as usize, graph, json).await
+        Commands::Search { query, top_k, graph, json, diversity } => {
+            run_search(query, top_k as usize, graph, json, diversity).await
         }
         Commands::Context { file } => run_context(file).await,
         Commands::Status { path, json } => run_status(path, json).await,
@@ -183,6 +183,7 @@ async fn run_search(
     top_k: usize,
     graph: bool,
     json_output: bool,
+    diversity: f32,
 ) -> anyhow::Result<()> {
     let root = std::env::current_dir().context("failed to get current directory")?;
     let dir = index_dir(&root);
@@ -203,7 +204,7 @@ async fn run_search(
     backend.initialize(dim).await?;
 
     let searcher = Searcher::new(backend, provider);
-    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, 0.0).await.unwrap_or_default();
+    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity).await.unwrap_or_default();
 
     if json_output {
         let rows: Vec<serde_json::Value> = results
