@@ -279,3 +279,77 @@ async fn indexer_handles_empty_directory_gracefully() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+
+// ---------------------------------------------------------------------------
+// BatchTrackingProvider — records call sizes for streaming assertions
+// ---------------------------------------------------------------------------
+
+/// Tracks the size of every `embed_batch` call so tests can assert that no
+/// single call exceeds the configured `batch_size` limit.
+struct BatchTrackingProvider {
+    dim: usize,
+    call_sizes: std::sync::Mutex<Vec<usize>>,
+}
+
+impl BatchTrackingProvider {
+    fn new(dim: usize) -> Self {
+        Self { dim, call_sizes: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    fn call_sizes(&self) -> Vec<usize> {
+        self.call_sizes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl EmbedProvider for BatchTrackingProvider {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.call_sizes.lock().unwrap().push(texts.len());
+        Ok(texts.iter().map(|_| vec![0.1_f32; self.dim]).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming pipeline test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn indexer_processes_in_bounded_file_batches() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+
+    // 60 small .rs files: exceeds FILE_BATCH_SIZE of 50, so at least two
+    // pipeline batches will run.
+    for i in 0..60 {
+        std::fs::write(repo.join(format!("mod_{i}.rs")), format!("fn func_{i}() {{}}"))?;
+    }
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+    let backend = std::sync::Arc::new(skelesearch_core::CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = std::sync::Arc::new(skelesearch_core::ManifestStore::open(idx_dir.join("manifest.db"))?);
+    let provider = BatchTrackingProvider::new(8);
+
+    backend.initialize(8).await?;
+    let indexer = skelesearch_core::Indexer::new(backend, manifest, provider);
+    let result = indexer.index_path(&repo).await?;
+
+    assert_eq!(result.indexed_files, 60, "all 60 files should be indexed");
+
+    // No single embed_batch call may exceed batch_size (64) — the streaming
+    // design processes at most FILE_BATCH_SIZE (50) files per outer batch,
+    // and each file contributes at most a handful of chunks.
+    let sizes = indexer.provider().call_sizes();
+    assert!(!sizes.is_empty(), "expected at least one embed call");
+    for &size in &sizes {
+        assert!(size <= 64, "embed_batch call exceeded batch_size: {size}");
+    }
+
+    Ok(())
+}

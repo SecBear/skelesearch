@@ -173,6 +173,35 @@ impl ManifestStore {
     }
 }
 
+impl ManifestStore {
+    /// Count files where stored mtime differs from current filesystem mtime.
+    /// Deleted files count as stale.
+    pub fn count_stale(&self, root: &std::path::Path) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare("SELECT file_path, mtime FROM file_hashes")?;
+        let mut count = 0usize;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let file_path: String = row.get(0)?;
+            let stored_mtime: i64 = row.get(1)?;
+            let abs_path = root.join(&file_path);
+            if let Ok(meta) = std::fs::metadata(&abs_path) {
+                let current_mtime = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if current_mtime != stored_mtime {
+                    count += 1;
+                }
+            } else {
+                count += 1; // deleted file = stale
+            }
+        }
+        Ok(count)
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // Checkpoint types and methods
 // ---------------------------------------------------------------------------

@@ -172,6 +172,265 @@ impl LanguageConfig for GoConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 1: Java
+// ---------------------------------------------------------------------------
+
+pub struct JavaConfig;
+
+impl LanguageConfig for JavaConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["java"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_java::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &[
+            "method_declaration",
+            "constructor_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+        ]
+    }
+
+    fn import_query(&self) -> &str {
+        "(import_declaration) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: C
+// ---------------------------------------------------------------------------
+
+pub struct CConfig;
+
+impl LanguageConfig for CConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["c", "h"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_c::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &["function_definition", "struct_specifier", "declaration"]
+    }
+
+    fn import_query(&self) -> &str {
+        "(preproc_include) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: C++
+// ---------------------------------------------------------------------------
+
+pub struct CppConfig;
+
+impl LanguageConfig for CppConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["cpp", "cc", "cxx", "hpp"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_cpp::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &[
+            "function_definition",
+            "class_specifier",
+            "struct_specifier",
+        ]
+    }
+
+    fn import_query(&self) -> &str {
+        "(preproc_include) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: Ruby
+// ---------------------------------------------------------------------------
+
+pub struct RubyConfig;
+
+impl LanguageConfig for RubyConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["rb"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_ruby::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &["method", "singleton_method", "class", "module"]
+    }
+
+    fn import_query(&self) -> &str {
+        // require/require_relative are method calls in Ruby
+        r#"(call
+            method: (identifier) @_fn
+            arguments: (argument_list (string) @path)
+            (#match? @_fn "^require"))"#
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: PHP
+// The crate exposes LANGUAGE_PHP (full PHP with tags) and LANGUAGE_PHP_ONLY
+// (pure PHP without the surrounding HTML context).
+// ---------------------------------------------------------------------------
+
+pub struct PhpConfig;
+
+impl LanguageConfig for PhpConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["php"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_php::LANGUAGE_PHP.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &[
+            "function_definition",
+            "method_declaration",
+            "class_declaration",
+            "interface_declaration",
+        ]
+    }
+
+    fn import_query(&self) -> &str {
+        "(namespace_use_declaration) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: C#
+// ---------------------------------------------------------------------------
+
+pub struct CSharpConfig;
+
+impl LanguageConfig for CSharpConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["cs"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_c_sharp::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &[
+            "method_declaration",
+            "constructor_declaration",
+            "class_declaration",
+            "interface_declaration",
+        ]
+    }
+
+    fn import_query(&self) -> &str {
+        "(using_directive) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: Kotlin
+// Uses tree-sitter-kotlin-sg (compatible with tree-sitter ≥0.24).
+// Note: tree-sitter-kotlin (the original crate) depends on tree-sitter 0.20
+// and is ABI-incompatible with tree-sitter 0.26.
+// ---------------------------------------------------------------------------
+
+pub struct KotlinConfig;
+
+impl LanguageConfig for KotlinConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["kt", "kts"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_kotlin_sg::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &[
+            "function_declaration",
+            "class_declaration",
+            "object_declaration",
+        ]
+    }
+
+    fn import_query(&self) -> &str {
+        "(import_header) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: Swift
+// ---------------------------------------------------------------------------
+
+pub struct SwiftConfig;
+
+impl LanguageConfig for SwiftConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["swift"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_swift::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &[
+            "function_declaration",
+            "class_declaration",
+            "struct_declaration",
+            "protocol_declaration",
+        ]
+    }
+
+    fn import_query(&self) -> &str {
+        "(import_declaration) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: Scala
+// ---------------------------------------------------------------------------
+
+pub struct ScalaConfig;
+
+impl LanguageConfig for ScalaConfig {
+    fn file_extensions(&self) -> &[&'static str] {
+        &["scala", "sc"]
+    }
+
+    fn language(&self) -> Language {
+        tree_sitter_scala::LANGUAGE.into()
+    }
+
+    fn chunk_node_kinds(&self) -> &[&'static str] {
+        &[
+            "function_definition",
+            "class_definition",
+            "object_definition",
+            "trait_definition",
+        ]
+    }
+
+    fn import_query(&self) -> &str {
+        "(import_declaration) @path"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry: extension → LanguageConfig
 // ---------------------------------------------------------------------------
 
@@ -185,6 +444,15 @@ pub fn config_for_extension(extension: &str) -> Option<Box<dyn LanguageConfig>> 
         "ts" | "tsx" => Some(Box::new(TypeScriptConfig)),
         "js" | "jsx" => Some(Box::new(JavaScriptConfig)),
         "go" => Some(Box::new(GoConfig)),
+        "java" => Some(Box::new(JavaConfig)),
+        "c" | "h" => Some(Box::new(CConfig)),
+        "cpp" | "cc" | "cxx" | "hpp" => Some(Box::new(CppConfig)),
+        "rb" => Some(Box::new(RubyConfig)),
+        "php" => Some(Box::new(PhpConfig)),
+        "cs" => Some(Box::new(CSharpConfig)),
+        "kt" | "kts" => Some(Box::new(KotlinConfig)),
+        "swift" => Some(Box::new(SwiftConfig)),
+        "scala" | "sc" => Some(Box::new(ScalaConfig)),
         _ => None,
     }
 }

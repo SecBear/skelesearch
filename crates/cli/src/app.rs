@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde_json::json;
 use skelesearch_core::{
     CozoBackend, EmbedProvider, IndexStats, Indexer, ManifestStore, Searcher, StorageBackend,
@@ -16,6 +17,19 @@ use crate::cli::{Cli, Commands};
 // ---------------------------------------------------------------------------
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    // Initialise tracing before dispatching so every command gets structured
+    // logging.  Write to stderr so stdout remains clean for MCP JSON-RPC.
+    let level = match cli.verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(level))
+        .with_writer(std::io::stderr)
+        .init();
+
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,
         Commands::Search { query, top_k, graph, json } => {
@@ -25,6 +39,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Status { path, json } => run_status(path, json).await,
         Commands::Clear { path } => run_clear(path).await,
         Commands::Watch { path, provider } => run_watch(path, provider).await,
+        Commands::Gc { path } => run_gc(path).await,
+        Commands::Grep { pattern, path, max_results, ignore_case, json } => {
+            run_grep(pattern, path, max_results, ignore_case, json).await
+        }
     }
 }
 
@@ -77,6 +95,24 @@ fn open_manifest(dir: &Path) -> anyhow::Result<Arc<ManifestStore>> {
     Ok(Arc::new(store))
 }
 
+/// Acquire an exclusive lock on `.skelesearch/.skelesearch.lock`.
+///
+/// The returned `File` MUST be kept alive for the duration of the operation;
+/// dropping it releases the lock.
+fn acquire_lock(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = dir.join(".skelesearch.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(file),
+        Err(_) => anyhow::bail!(
+            "Another skelesearch process is running (lock held at {})",
+            lock_path.display()
+        ),
+    }
+}
 // ---------------------------------------------------------------------------
 // Watch sentinel: PID-file mechanism
 // ---------------------------------------------------------------------------
@@ -137,6 +173,7 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     let dir = index_dir(&root);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create index dir: {}", dir.display()))?;
+    let _lock = acquire_lock(&dir)?;
 
     let backend = open_backend(&dir)?;
     let manifest = open_manifest(&dir)?;
@@ -312,7 +349,7 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
             "indexed_files":    stats.indexed_files,
             "total_chunks":     stats.total_chunks,
             "last_indexed":     stats.last_indexed.map(|dt: DateTime<Utc>| dt.to_rfc3339()),
-            "estimated_stale":  0,
+            "estimated_stale":  open_manifest(&dir).map(|m| m.count_stale(&root).unwrap_or(0)).unwrap_or(0),
             "watching":         watching,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
@@ -360,6 +397,7 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     // Write the PID file first so concurrent `status --json` calls see
     // watching=true immediately, before any slow model initialisation.
     std::fs::create_dir_all(&dir)?;
+    let _lock = acquire_lock(&dir)?;
     std::fs::write(pid_file(&dir), std::process::id().to_string())
         .context("failed to write watch PID file")?;
 
@@ -402,6 +440,58 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
 
     // Best-effort cleanup: remove PID file so `status` shows watching=false.
     let _ = std::fs::remove_file(pid_file(&dir));
+    Ok(())
+}
+
+async fn run_gc(path: Option<PathBuf>) -> anyhow::Result<()> {
+    let root = resolve_root(path)?;
+    let dir = index_dir(&root);
+    if !dir.join("index.db").exists() {
+        println!("No index found.");
+        return Ok(());
+    }
+    let backend = open_backend(&dir)?;
+    let manifest = open_manifest(&dir)?;
+    let removed = skelesearch_core::gc::collect_garbage(&root, &backend, &manifest).await?;
+    println!("Removed {removed} orphaned file(s) from index.");
+    Ok(())
+}
+
+async fn run_grep(
+    pattern: String,
+    path: Option<PathBuf>,
+    max_results: usize,
+    ignore_case: bool,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let root = resolve_root(path)?;
+    let opts = skelesearch_core::GrepOptions {
+        max_results,
+        case_insensitive: ignore_case,
+    };
+    let results = skelesearch_core::grep_codebase(&root, &pattern, &opts)?;
+
+    if json_output {
+        let rows: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "file_path": r.file_path,
+                    "line_number": r.line_number,
+                    "line_content": r.line_content,
+                    "why": "grep",
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        if results.is_empty() {
+            println!("No matches.");
+        }
+        for r in &results {
+            println!("{}:{}: {}", r.file_path, r.line_number, r.line_content);
+        }
+    }
     Ok(())
 }
 

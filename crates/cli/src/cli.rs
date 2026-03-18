@@ -6,6 +6,10 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
+
+    /// Increase log verbosity (-v info, -vv debug, -vvv trace).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    pub verbose: u8,
 }
 
 #[derive(Subcommand)]
@@ -70,5 +74,32 @@ pub enum Commands {
         /// Embedding provider (default: fastembed).
         #[arg(long, default_value = "fastembed")]
         provider: String,
+    },
+
+    /// Search files for a regex or literal pattern.
+    Grep {
+        /// Regex pattern to search for.
+        pattern: String,
+
+        /// Directory to search (defaults to current directory).
+        path: Option<std::path::PathBuf>,
+
+        /// Maximum number of results.
+        #[arg(long, default_value_t = 50)]
+        max_results: usize,
+
+        /// Case-insensitive matching.
+        #[arg(short, long)]
+        ignore_case: bool,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove index entries for deleted files.
+    Gc {
+        /// Project root (defaults to current directory).
+        path: Option<std::path::PathBuf>,
     },
 }

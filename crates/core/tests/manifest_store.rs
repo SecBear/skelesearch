@@ -79,3 +79,38 @@ fn concurrent_manifest_access_no_busy_errors() {
     let paths = store1.list_paths().unwrap();
     assert_eq!(paths.len(), 100);
 }
+
+#[test]
+fn count_stale_empty_manifest_returns_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let manifest = ManifestStore::open(dir.path().join("manifest.db")).unwrap();
+    assert_eq!(manifest.count_stale(&root).unwrap(), 0);
+}
+
+#[test]
+fn count_stale_detects_modified_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.rs"), "fn a() {}").unwrap();
+    std::fs::write(root.join("b.rs"), "fn b() {}").unwrap();
+    let manifest = ManifestStore::open(dir.path().join("manifest.db")).unwrap();
+    // Store with mtime=1000, but actual file mtime is current time
+    manifest.upsert("a.rs", 1000, 10, "hash_a").unwrap();
+    manifest.upsert("b.rs", 1000, 10, "hash_b").unwrap();
+    let stale = manifest.count_stale(&root).unwrap();
+    assert!(stale >= 1, "expected at least 1 stale file, got {stale}");
+}
+
+#[test]
+fn count_stale_counts_deleted_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let manifest = ManifestStore::open(dir.path().join("manifest.db")).unwrap();
+    manifest.upsert("deleted.rs", 1000, 10, "hash").unwrap();
+    // deleted.rs doesn't exist on disk
+    assert_eq!(manifest.count_stale(&root).unwrap(), 1);
+}
