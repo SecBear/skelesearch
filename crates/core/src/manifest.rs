@@ -38,6 +38,14 @@ impl ManifestStore {
                 mtime     INTEGER NOT NULL,
                 size      INTEGER NOT NULL,
                 xxhash3   TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS index_progress (
+                run_id     TEXT    NOT NULL,
+                batch_idx  INTEGER NOT NULL,
+                files      TEXT    NOT NULL,
+                status     TEXT    NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (run_id, batch_idx)
             );",
         )?;
         Ok(Self {
@@ -127,6 +135,30 @@ impl ManifestStore {
             .collect())
     }
 
+    /// Returns `true` iff the stored entry for `file_path` has matching `mtime`
+    /// **and** `size`.  Does not read the hash — used as a cheap pre-filter in
+    /// Phase 1 of the indexer to skip obviously-unchanged files without reading
+    /// file content.
+    pub fn mtime_size_unchanged(
+        &self,
+        file_path: &str,
+        mtime: i64,
+        size: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        let result = conn
+            .query_row(
+                "SELECT mtime, size FROM file_hashes WHERE file_path = ?1",
+                rusqlite::params![file_path],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(matches!(result, Some((m, s)) if m == mtime && s == size))
+    }
+
     /// Remove the manifest entry for `file_path`.
     pub fn remove(&self, file_path: &str) -> anyhow::Result<()> {
         let conn = self
@@ -136,6 +168,75 @@ impl ManifestStore {
         conn.execute(
             "DELETE FROM file_hashes WHERE file_path = ?1",
             params![file_path],
+        )?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint types and methods
+// ---------------------------------------------------------------------------
+
+/// A batch that was started but not completed — indicates a previous crash.
+#[derive(Debug, Clone)]
+pub struct IncompleteBatch {
+    pub run_id: String,
+    pub batch_idx: i64,
+    pub files: Vec<String>,
+}
+
+impl ManifestStore {
+    /// Record that a batch is about to be processed (write-before-transition).
+    /// Uses INSERT OR REPLACE so retries after a crash are idempotent.
+    pub fn begin_batch(&self, run_id: &str, batch_idx: usize, files: &[&str]) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let files_json = serde_json::to_string(files)?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO index_progress (run_id, batch_idx, files, status, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)",
+            params![run_id, batch_idx as i64, files_json, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a batch as successfully completed.
+    pub fn complete_batch(&self, run_id: &str, batch_idx: usize) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "UPDATE index_progress SET status = 'complete' WHERE run_id = ?1 AND batch_idx = ?2",
+            params![run_id, batch_idx as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Find batches that were started but never completed (crash recovery).
+    pub fn find_incomplete_batches(&self) -> anyhow::Result<Vec<IncompleteBatch>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, batch_idx, files FROM index_progress WHERE status = 'pending' ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let run_id: String = row.get(0)?;
+                let batch_idx: i64 = row.get(1)?;
+                let files_json: String = row.get(2)?;
+                Ok((run_id, batch_idx, files_json))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(run_id, batch_idx, files_json)| {
+                let files: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
+                IncompleteBatch { run_id, batch_idx, files }
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Remove all completed batch records for a run.
+    pub fn clear_completed_batches(&self, run_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "DELETE FROM index_progress WHERE run_id = ?1 AND status = 'complete'",
+            params![run_id],
         )?;
         Ok(())
     }

@@ -28,6 +28,13 @@ pub struct IndexResult {
 // Indexer
 // ---------------------------------------------------------------------------
 
+/// Maximum number of files processed in one pipeline batch.
+///
+/// Bounds peak memory to roughly `FILE_BATCH_SIZE` files worth of chunk
+/// content + embeddings.  Larger values reduce backend round-trips at the
+/// cost of more in-flight memory.
+const FILE_BATCH_SIZE: usize = 50;
+
 /// Orchestrates file walking, change detection, chunking, embedding, and
 /// backend upsert.
 ///
@@ -52,8 +59,20 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         }
     }
 
+    /// Expose the embedding provider for test observability (e.g. call-count
+    /// assertions).
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
     /// Walk `root`, detect changed files via the manifest, chunk and embed
     /// them, upsert to the backend, then reconcile deletions/renames.
+    ///
+    /// ## Memory contract
+    ///
+    /// File content, chunk texts, and embeddings are held in memory only for
+    /// the current `FILE_BATCH_SIZE`-file batch.  Phase 1 collects metadata
+    /// only — no file content is loaded until Phase 2.
     pub async fn index_path(&self, root: &Path) -> anyhow::Result<IndexResult> {
         let dim = self.provider.dim();
         self.backend.initialize(dim).await?;
@@ -62,19 +81,35 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         let mut visited: HashSet<String> = HashSet::new();
         let mut result = IndexResult::default();
 
-        // -- Phase 1: Walk and collect files that need re-indexing ----------
 
-        struct FileWork {
+        // -- Crash recovery: re-index files from incomplete prior batches -----
+        //    A batch is "pending" iff begin_batch was written before a crash
+        //    prevented complete_batch from running.  Force those files through
+        //    even if mtime_size_unchanged would otherwise skip them.
+
+        let incomplete = self.manifest.find_incomplete_batches()?;
+        let force_reindex: HashSet<String> = incomplete
+            .iter()
+            .flat_map(|b| b.files.iter().cloned())
+            .collect();
+        // Retire the stale pending rows so they don't accumulate.
+        for batch in &incomplete {
+            self.manifest.complete_batch(&batch.run_id, batch.batch_idx as usize)?;
+        }
+        // -- Phase 1: Walk ALL files, collect metadata only -------------------
+        //    Use mtime+size as a fast skip — no file content is read here.
+        //    Files whose mtime+size match the manifest are assumed unchanged
+        //    and skipped immediately.  The full hash check happens in Phase 2
+        //    when we read the content anyway.
+
+        struct FileCandidate {
             rel_path: String,
             mtime: i64,
             size: i64,
-            hash: String,
             lang: String,
-            chunks: Vec<crate::ParsedChunk>,
-            edges: Vec<crate::ImportEdge>,
         }
 
-        let mut work: Vec<FileWork> = Vec::new();
+        let mut candidates: Vec<FileCandidate> = Vec::new();
 
         let walker = ignore::WalkBuilder::new(root).build();
         for entry in walker {
@@ -101,112 +136,157 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 .unwrap_or(0);
             let size = meta.len() as i64;
 
-            // Read content once — needed for both hashing and chunking.
-            let content = std::fs::read(&abs_path)
-                .with_context(|| format!("reading {rel_path}"))?;
-            let hash = file_hash(&content);
-
-            // Skip if nothing changed (mtime, size, and content hash all match).
-            if self.manifest.is_unchanged(&rel_path, mtime, size, &hash)? {
+            // Fast skip: mtime+size unchanged — unless forced by crash recovery.
+            if !force_reindex.contains(&rel_path)
+                && self.manifest.mtime_size_unchanged(&rel_path, mtime, size)?
+            {
                 continue;
             }
 
-            let source = String::from_utf8_lossy(&content).to_string();
             let lang = language_for(&rel_path);
-            let chunks = chunker.chunk_file(&rel_path, &source).unwrap_or_default();
-            let edges = chunker.extract_edges(&rel_path, &source).unwrap_or_default();
-
-            work.push(FileWork { rel_path, mtime, size, hash, lang, chunks, edges });
+            candidates.push(FileCandidate { rel_path, mtime, size, lang });
         }
 
-        // -- Phase 2: Delete old data for every file that will be re-indexed -
-        //    CozoDB :rm is idempotent, so this is safe for new files too.
+        // -- Phase 2: Process candidates in bounded batches -------------------
+        //    For each batch: read content, full hash check, chunk, delete
+        //    stale backend data, embed, upsert, update manifest.
+        //    All content/embedding memory is dropped at end of each iteration.
 
-        for fw in &work {
-            self.backend.delete_chunks_for_file(&fw.rel_path).await?;
-            self.backend.delete_edges_for_file(&fw.rel_path).await?;
-        }
-
-        // -- Phase 3: Batch-embed all chunks ---------------------------------
-        //    Gather all texts, emit in batches of `batch_size` to satisfy the
-        //    "fewer calls than chunks" invariant under the counting test.
-
-        let all_texts: Vec<String> = work
-            .iter()
-            .flat_map(|fw| fw.chunks.iter().map(|c| c.content.clone()))
-            .collect();
-
-        let embeddings: Vec<Vec<f32>> = if all_texts.is_empty() {
-            vec![]
-        } else {
-            let mut out = Vec::with_capacity(all_texts.len());
-            for batch in all_texts.chunks(self.batch_size) {
-                let mut batch_embs = self.provider.embed_batch(batch.to_vec()).await?;
-                out.append(&mut batch_embs);
-            }
-            out
-        };
-
-        // -- Phase 4: Upsert files, chunks, and edges ------------------------
-
+        let run_id = format!("run_{}", chrono::Utc::now().timestamp_millis());
         let now = chrono::Utc::now().timestamp();
-        let mut emb_iter = embeddings.into_iter();
+        let mut batch_idx = 0usize;
 
-        for fw in &work {
-            let chunk_records: Vec<ChunkRecord> = fw
-                .chunks
-                .iter()
-                .map(|c| ChunkRecord {
-                    file_path: fw.rel_path.clone(),
-                    chunk_idx: c.chunk_idx,
-                    content: c.content.clone(),
-                    normalized: c.normalized.clone(),
-                    chunk_type: c.chunk_type.clone(),
-                    start_line: c.start_line,
-                    end_line: c.end_line,
-                    embedding: emb_iter.next(),
-                })
-                .collect();
-
-            let chunk_count = chunk_records.len();
-            result.total_chunks += chunk_count;
-
-            self.backend
-                .upsert_file(&FileRecord {
-                    file_path: fw.rel_path.clone(),
-                    language: fw.lang.clone(),
-                    last_modified: fw.mtime,
-                    last_indexed: now,
-                    chunk_count,
-                })
-                .await?;
-
-            if !chunk_records.is_empty() {
-                self.backend.upsert_chunks(&chunk_records).await?;
+        for batch in candidates.chunks(FILE_BATCH_SIZE) {
+            // Write checkpoint before processing.
+            let file_paths: Vec<&str> = batch.iter().map(|f| f.rel_path.as_str()).collect();
+            self.manifest.begin_batch(&run_id, batch_idx, &file_paths)?;
+            // 2a. Read content, hash, full unchanged check, chunk.
+            struct BatchFile<'a> {
+                candidate: &'a FileCandidate,
+                hash: String,
+                chunks: Vec<crate::ParsedChunk>,
+                edges: Vec<crate::ImportEdge>,
             }
 
-            let edge_records: Vec<EdgeRecord> = fw
-                .edges
-                .iter()
-                .map(|e| EdgeRecord {
-                    from_file: e.from_file.clone(),
-                    // ImportEdge doesn't carry a chunk index; use 0 as a
-                    // sentinel — sufficient for v1 graph traversal.
-                    from_chunk: 0,
-                    to_file: e.to_file.clone(),
-                    edge_type: "imports".into(),
-                })
-                .collect();
+            let mut batch_files: Vec<BatchFile<'_>> = Vec::with_capacity(batch.len());
 
-            if !edge_records.is_empty() {
-                self.backend.upsert_edges(&edge_records).await?;
+            for fc in batch {
+                let abs_path = root.join(&fc.rel_path);
+                let content = std::fs::read(&abs_path)
+                    .with_context(|| format!("reading {}", fc.rel_path))?;
+                let hash = file_hash(&content);
+
+                // Rare case: mtime/size changed but content is identical.
+                if self.manifest.is_unchanged(&fc.rel_path, fc.mtime, fc.size, &hash)? {
+                    continue;
+                }
+
+                let source = String::from_utf8_lossy(&content).to_string();
+                let chunks = chunker.chunk_file(&fc.rel_path, &source).unwrap_or_default();
+                let edges = chunker.extract_edges(&fc.rel_path, &source).unwrap_or_default();
+
+                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges });
             }
 
-            self.manifest.upsert(&fw.rel_path, fw.mtime, fw.size, &fw.hash)?;
-            result.indexed_files += 1;
+            if batch_files.is_empty() {
+                continue;
+            }
+
+            // 2b. Delete stale backend data for this batch.
+            for bf in &batch_files {
+                self.backend
+                    .delete_chunks_for_file(&bf.candidate.rel_path)
+                    .await?;
+                self.backend
+                    .delete_edges_for_file(&bf.candidate.rel_path)
+                    .await?;
+            }
+
+            // 2c. Collect chunk texts for this batch, embed in sub-batches.
+            let batch_texts: Vec<String> = batch_files
+                .iter()
+                .flat_map(|bf| bf.chunks.iter().map(|c| c.content.clone()))
+                .collect();
+
+            let embeddings: Vec<Vec<f32>> = if batch_texts.is_empty() {
+                vec![]
+            } else {
+                let mut out = Vec::with_capacity(batch_texts.len());
+                for sub in batch_texts.chunks(self.batch_size) {
+                    let mut embs = self.provider.embed_batch(sub.to_vec()).await?;
+                    out.append(&mut embs);
+                }
+                out
+            };
+
+            // 2d. Upsert files, chunks, and edges; update manifest.
+            let mut emb_iter = embeddings.into_iter();
+
+            for bf in &batch_files {
+                let fc = bf.candidate;
+
+                let chunk_records: Vec<ChunkRecord> = bf
+                    .chunks
+                    .iter()
+                    .map(|c| ChunkRecord {
+                        file_path: fc.rel_path.clone(),
+                        chunk_idx: c.chunk_idx,
+                        content: c.content.clone(),
+                        normalized: c.normalized.clone(),
+                        chunk_type: c.chunk_type.clone(),
+                        start_line: c.start_line,
+                        end_line: c.end_line,
+                        embedding: emb_iter.next(),
+                    })
+                    .collect();
+
+                let chunk_count = chunk_records.len();
+                result.total_chunks += chunk_count;
+
+                self.backend
+                    .upsert_file(&FileRecord {
+                        file_path: fc.rel_path.clone(),
+                        language: fc.lang.clone(),
+                        last_modified: fc.mtime,
+                        last_indexed: now,
+                        chunk_count,
+                    })
+                    .await?;
+
+                if !chunk_records.is_empty() {
+                    self.backend.upsert_chunks(&chunk_records).await?;
+                }
+
+                let edge_records: Vec<EdgeRecord> = bf
+                    .edges
+                    .iter()
+                    .map(|e| EdgeRecord {
+                        from_file: e.from_file.clone(),
+                        // ImportEdge doesn't carry a chunk index; use 0 as a
+                        // sentinel — sufficient for v1 graph traversal.
+                        from_chunk: 0,
+                        to_file: e.to_file.clone(),
+                        edge_type: "imports".into(),
+                    })
+                    .collect();
+
+                if !edge_records.is_empty() {
+                    self.backend.upsert_edges(&edge_records).await?;
+                }
+
+                self.manifest.upsert(&fc.rel_path, fc.mtime, fc.size, &bf.hash)?;
+                result.indexed_files += 1;
+            }
+            // batch_files (and all content/embeddings within) drop here.
+
+            self.manifest.complete_batch(&run_id, batch_idx)?;
+            batch_idx += 1;
         }
 
-        // -- Phase 5: Reconcile deletions and renames ------------------------
+        // Clean up completed batch records for this run.
+        self.manifest.clear_completed_batches(&run_id)?;
+
+        // -- Phase 3: Reconcile deletions and renames ------------------------
         //    Any manifest path not visited this run is stale (file gone or
         //    moved).  Remove it from both the backend and the manifest.
 
