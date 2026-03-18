@@ -33,10 +33,12 @@
           # Release packages always compile against RocksDB for production
           # durability; SQLite remains the dev-shell default.
           skelesearch-cli = craneLib.buildPackage (commonArgs // {
+            pname = "skelesearch-cli";
             cargoExtraArgs = "-p skelesearch-cli --features skelesearch-core/storage-rocksdb";
           });
 
           skelesearch-mcp = craneLib.buildPackage (commonArgs // {
+            pname = "skelesearch-mcp";
             cargoExtraArgs = "-p skelesearch-mcp --features skelesearch-core/storage-rocksdb";
           });
 
