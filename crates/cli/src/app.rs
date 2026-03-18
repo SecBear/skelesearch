@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
+use notify::Watcher as _;
 use serde_json::json;
 use skelesearch_core::{
     CozoBackend, Config, EmbedProvider, IndexStats, Indexer, ManifestStore, Searcher, StorageBackend,
@@ -33,8 +34,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,
-        Commands::Search { query, top_k, graph, json, diversity, provider } => {
-            run_search(query, top_k as usize, graph, json, diversity, provider).await
+        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens } => {
+            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens).await
         }
         Commands::Context { file } => run_context(file).await,
         Commands::Status { path, json } => run_status(path, json).await,
@@ -189,6 +190,7 @@ async fn run_search(
     json_output: bool,
     diversity: f32,
     provider_name: String,
+    max_tokens: Option<usize>,
 ) -> anyhow::Result<()> {
     let root = std::env::current_dir().context("failed to get current directory")?;
     let dir = index_dir(&root);
@@ -210,7 +212,7 @@ async fn run_search(
 
     let searcher = Searcher::new(backend, provider);
     let start = std::time::Instant::now();
-    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity).await.unwrap_or_default();
+    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity, max_tokens).await.unwrap_or_default();
     let elapsed = start.elapsed();
     tracing::info!(elapsed_ms = elapsed.as_millis() as u64, results = results.len(), "search complete");
 
@@ -383,14 +385,13 @@ async fn run_clear(path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
-    // provider_from_name validates the name before any I/O — unknown names fail fast.
-
     let root = std::fs::canonicalize(&path)
         .with_context(|| format!("cannot access path: {}", path.display()))?;
     let dir = index_dir(&root);
+    let config = Config::load(&root)?;
 
-    // Write the PID file first so concurrent `status --json` calls see
-    // watching=true immediately, before any slow model initialisation.
+    // Write PID sentinel so concurrent `status --json` calls see watching=true
+    // immediately, before any slow model initialisation.
     std::fs::create_dir_all(&dir)?;
     let _lock = acquire_lock(&dir)?;
     std::fs::write(pid_file(&dir), std::process::id().to_string())
@@ -398,14 +399,12 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
 
     // Best-effort initial indexing pass: if the provider is unavailable
     // (no model, no network), log a warning and continue watching without
-    // an initial index rather than failing the whole command.  The PID
-    // file is already written so `status --json` will report watching=true.
+    // an initial index rather than failing the whole command.
     match provider_from_name(&provider_name) {
         Ok(provider) => {
             let dim = provider.dim();
             let backend = open_backend(&dir)?;
             let manifest = open_manifest(&dir)?;
-            let config = Config::load(&root)?;
             if let Err(e) = backend.initialize(dim).await {
                 eprintln!("skelesearch watch: backend init failed: {e}");
             } else {
@@ -430,10 +429,84 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
 
     eprintln!("skelesearch watch: watching {} (Ctrl-C to stop)", root.display());
 
-    // Wait for termination signal.  File-change re-indexing is a v2 feature;
-    // in v1 this loop merely keeps the process alive and the PID sentinel
-    // valid so other tools can detect that watching is active.
-    tokio::signal::ctrl_c().await.ok();
+    // Set up file watcher with a 2-second debounce window.  Rapid edits (e.g.
+    // a save-on-format cascade) are coalesced into a single re-index trigger.
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel();
+    let mut debouncer = notify_debouncer_full::new_debouncer(
+        std::time::Duration::from_secs(2),
+        None,
+        sync_tx,
+    )?;
+    debouncer.watcher().watch(&root, notify::RecursiveMode::Recursive)?;
+
+    // Bridge the sync mpsc channel to tokio so we can select! with ctrl_c.
+    // The bridge thread owns `sync_rx` and forwards every batch until the
+    // async receiver is dropped (on loop exit).
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = sync_rx.recv() {
+            if async_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Sentinel directories: events here are internal write-back and must be
+    // ignored to avoid re-index storms triggered by our own index writes.
+    let git_dir = root.join(".git");
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("skelesearch watch: shutting down");
+                break;
+            }
+            Some(event_result) = async_rx.recv() => {
+                match event_result {
+                    Ok(events) => {
+                        // Ignore changes in .skelesearch/ (our own index writes)
+                        // and .git/ (VCS bookkeeping that we don't index).
+                        let relevant_count = events.iter()
+                            .flat_map(|e| &e.paths)
+                            .filter(|p| !p.starts_with(&dir) && !p.starts_with(&git_dir))
+                            .count();
+                        if relevant_count == 0 {
+                            continue;
+                        }
+                        tracing::info!(changed_files = relevant_count, "file changes detected, re-indexing");
+                        match provider_from_name(&provider_name) {
+                            Ok(provider) => {
+                                let dim = provider.dim();
+                                let backend = open_backend(&dir)?;
+                                let manifest = open_manifest(&dir)?;
+                                if let Err(e) = backend.initialize(dim).await {
+                                    eprintln!("skelesearch watch: re-index backend init failed: {e}");
+                                } else {
+                                    let indexer = Indexer::new(backend, manifest, provider)
+                                        .with_excludes(config.index.exclude.clone());
+                                    match indexer.index_path(&root).await {
+                                        Ok(r) => eprintln!(
+                                            "skelesearch watch: re-indexed {} file(s), {} chunk(s)",
+                                            r.indexed_files, r.total_chunks
+                                        ),
+                                        Err(e) => eprintln!("skelesearch watch: re-index failed: {e}"),
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("skelesearch watch: provider unavailable ({e}), skipping re-index");
+                            }
+                        }
+                    }
+                    Err(errs) => {
+                        for e in errs {
+                            tracing::warn!("file watcher error: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Best-effort cleanup: remove PID file so `status` shows watching=false.
     let _ = std::fs::remove_file(pid_file(&dir));

@@ -219,6 +219,7 @@ async fn search_code_output_exposes_spec_fields() -> anyhow::Result<()> {
             include_graph: true,
             max_depth: None,
             diversity: 0.0,
+            max_tokens: None,
         })
         .await?;
     assert!(

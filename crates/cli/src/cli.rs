@@ -49,6 +49,11 @@ pub enum Commands {
         /// Embedding provider (must match the provider used during indexing).
         #[arg(long, default_value = "fastembed")]
         provider: String,
+
+        /// Maximum token budget for results. Results are included greedily by
+        /// score until the budget is exhausted. Approximate: 1 token ~ 4 chars.
+        #[arg(long)]
+        max_tokens: Option<usize>,
     },
 
     /// Show all indexed chunks plus import graph for a file.

@@ -51,7 +51,11 @@ impl ManifestStore {
                 content_hash TEXT PRIMARY KEY,
                 dim          INTEGER NOT NULL,
                 embedding    BLOB NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS metadata (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );"
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -178,6 +182,30 @@ impl ManifestStore {
     }
 }
 
+impl ManifestStore {
+    /// Get a metadata value by key.
+    pub fn get_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        let mut stmt = conn.prepare("SELECT value FROM metadata WHERE key = ?1")?;
+        let result = stmt.query_row(params![key], |row| row.get::<_, String>(0));
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set a metadata key-value pair (upsert).
+    pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+}
 impl ManifestStore {
     /// Count files where stored mtime differs from current filesystem mtime.
     /// Deleted files count as stale.

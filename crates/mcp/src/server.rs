@@ -53,6 +53,10 @@ impl EmbedProvider for ArcProvider {
         self.0.dim()
     }
 
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         self.0.embed_batch(texts).await
     }
@@ -176,7 +180,7 @@ impl SkeleSearchServer {
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
         let start = std::time::Instant::now();
         let results = searcher
-            .search(&input.query, top_k, input.include_graph, max_depth, input.diversity)
+            .search(&input.query, top_k, input.include_graph, max_depth, input.diversity, input.max_tokens)
             .await?;
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, results = results.len(), "search_code complete");
         Ok(results
@@ -369,6 +373,7 @@ impl SkeleSearchServer {
                         include_graph: input.include_graph,
                         max_depth: None,
                         diversity: input.diversity,
+                        max_tokens: input.max_tokens,
                     })
                     .await?;
                 SmartSearchResults::Semantic(rows)

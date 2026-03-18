@@ -92,7 +92,7 @@ async fn searcher_returns_quality_labels_for_non_empty_results() -> anyhow::Resu
     let (_, searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
 
     // Search for something that appears in the fixture files.
-    let results = searcher.search("pub fn", 5, false, 0, 0.0).await?;
+    let results = searcher.search("pub fn", 5, false, 0, 0.0, None).await?;
     if results.is_empty() {
         // Accept gracefully if FTS doesn't surface results for this query.
         return Ok(());
@@ -119,8 +119,8 @@ async fn searcher_returns_quality_labels_for_non_empty_results() -> anyhow::Resu
 async fn searcher_graph_augmentation_annotates_import_neighbours() -> anyhow::Result<()> {
     let (_, searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
 
-    let plain = searcher.search("pub fn", 5, false, 0, 0.0).await?;
-    let graph = searcher.search("pub fn", 5, true, 2, 0.0).await?;
+    let plain = searcher.search("pub fn", 5, false, 0, 0.0, None).await?;
+    let graph = searcher.search("pub fn", 5, true, 2, 0.0, None).await?;
 
     // Graph search must return at least as many results as plain (it augments).
     assert!(
@@ -149,8 +149,7 @@ async fn file_context_and_empty_search_are_truthful_for_missing_data() -> anyhow
     let (_, searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
 
     // Search for a term that definitely won't match anything indexed.
-    let empty = searcher
-        .search("ZZZNOMATCH_ZZZNOMATCH_ZZZNOMATCH_XYZ", 3, false, 0, 0.0)
+    let empty = searcher.search("ZZZNOMATCH_ZZZNOMATCH_ZZZNOMATCH_XYZ", 3, false, 0, 0.0, None)
         .await?;
     // Accept either empty results or low-scoring results for a nonsense query.
     // The important invariant: no panic, no error.
@@ -170,8 +169,7 @@ async fn file_context_returns_chunks_for_indexed_file() -> anyhow::Result<()> {
     let (_, searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
 
     // The fixture has src/lib.rs; find it regardless of the exact relative prefix.
-    let paths = searcher
-        .search("pub fn add", 10, false, 0, 0.0)
+    let paths = searcher.search("pub fn add", 10, false, 0, 0.0, None)
         .await?
         .into_iter()
         .filter(|r| r.file_path.ends_with("lib.rs"))
@@ -302,7 +300,7 @@ async fn concurrent_index_and_search_does_not_panic() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Search while indexing is in-flight.  Must not panic or error.
-    let search_result = searcher.search("func", 5, false, 0, 0.0).await;
+    let search_result = searcher.search("func", 5, false, 0, 0.0, None).await;
     assert!(
         search_result.is_ok(),
         "search during indexing must return Ok; got: {:?}",
@@ -373,8 +371,8 @@ async fn mmr_reranking_diversifies_results() -> anyhow::Result<()> {
     let searcher = Searcher::new(backend.clone(), ClusterProvider);
 
     // Fetch all 3 chunks so the MMR has material to reorder.
-    let no_mmr   = searcher.search("near_alpha", 3, false, 0, 0.0).await?;
-    let with_mmr = searcher.search("near_alpha", 3, false, 0, 0.7).await?;
+    let no_mmr   = searcher.search("near_alpha", 3, false, 0, 0.0, None).await?;
+    let with_mmr = searcher.search("near_alpha", 3, false, 0, 0.7, None).await?;
 
     // Both searches must succeed and return at least one result.
     assert!(!no_mmr.is_empty(),   "no-MMR search must return results");

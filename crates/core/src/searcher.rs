@@ -52,6 +52,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         include_graph: bool,
         max_depth: usize,
         diversity: f32,
+        max_tokens: Option<usize>,
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Produce the query vector.  A single-element batch keeps the
         // provider interface uniform.
@@ -96,6 +97,24 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             let result_vecs = self.backend.get_chunk_embeddings(&keys).await?;
             hits = mmr_rerank(hits, &query_vec, &result_vecs, 1.0 - diversity);
         }
+
+        // Apply token budget if specified.  Results are already scored
+        // highest-first; greedily include until the budget is exhausted.
+        // The first result is always included even if it alone exceeds the
+        // budget — callers must never receive an empty set when hits exist.
+        let hits = if let Some(budget) = max_tokens {
+            let mut total = 0usize;
+            let mut count = 0usize;
+            hits.into_iter()
+                .take_while(move |r| {
+                    total += r.content.len() / 4; // approximate: 1 token ~ 4 chars
+                    count += 1;
+                    count == 1 || total <= budget
+                })
+                .collect()
+        } else {
+            hits
+        };
 
         Ok(hits)
     }

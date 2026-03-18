@@ -9,6 +9,9 @@ pub trait EmbedProvider: Send + Sync {
     /// Dimensionality of vectors produced by this provider.
     fn dim(&self) -> usize;
 
+    /// Human-readable provider name for manifest storage.
+    fn name(&self) -> &str { "unknown" }
+
     /// Embed a batch of texts, returning one vector per input in order.
     ///
     /// # Errors
@@ -24,6 +27,10 @@ pub trait EmbedProvider: Send + Sync {
 impl<T: EmbedProvider + ?Sized> EmbedProvider for Box<T> {
     fn dim(&self) -> usize {
         (**self).dim()
+    }
+
+    fn name(&self) -> &str {
+        (**self).name()
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {

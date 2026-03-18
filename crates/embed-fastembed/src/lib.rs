@@ -57,6 +57,10 @@ impl EmbedProvider for FastEmbedProvider {
         self.dim
     }
 
+    fn name(&self) -> &str {
+        "fastembed"
+    }
+
     #[tracing::instrument(skip_all, fields(batch_size = texts.len()))]
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {

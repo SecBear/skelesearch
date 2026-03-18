@@ -30,6 +30,9 @@ pub struct SearchCodeInput {
     /// higher values reduce redundancy. Default: 0.3.
     #[serde(default = "default_diversity")]
     pub diversity: f32,
+    /// Maximum token budget for results. Omit for unlimited.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 }
 
 fn default_top_k() -> usize {
@@ -139,6 +142,9 @@ pub struct SmartSearchInput {
     /// higher values reduce redundancy. Default: 0.3.
     #[serde(default = "default_diversity")]
     pub diversity: f32,
+    /// Maximum token budget for results. Omit for unlimited.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 }
 
 /// A single grep result row returned by `smart_search` on the grep path.

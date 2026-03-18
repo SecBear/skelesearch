@@ -423,6 +423,10 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         // Clean up completed batch records for this run.
         self.manifest.clear_completed_batches(&run_id)?;
 
+        // Record which provider and dimension were used for this index.
+        self.manifest.set_meta("provider", self.provider.name())?;
+        self.manifest.set_meta("dim", &self.provider.dim().to_string())?;
+
         // -- Phase 3: Reconcile deletions and renames ------------------------
         //    Any manifest path not visited this run is stale (file gone or
         //    moved).  Remove it from both the backend and the manifest.
