@@ -3,7 +3,7 @@ name = "skelesearch-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI for skelesearch — index, search, context, status, clear"
+description = "CLI for skelesearch — index, search, context, status, clear, watch"
 
 [[bin]]
 name = "skelesearch"
@@ -18,4 +18,15 @@ skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
