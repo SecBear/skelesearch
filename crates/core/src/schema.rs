@@ -69,6 +69,8 @@ pub struct IndexStats {
     pub last_indexed: Option<DateTime<Utc>>,
     /// Always `false` in v1 (watching is a v2 feature).
     pub watching: bool,
+    /// Estimated number of stale entries (files changed since last index).
+    pub estimated_stale: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +659,7 @@ fts_scored[file_path, chunk_idx, score] :=
             total_chunks,
             last_indexed,
             watching: false,
+            estimated_stale: 0,
         })
     }
 

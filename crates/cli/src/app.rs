@@ -330,9 +330,10 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
             total_chunks: 0,
             last_indexed: None::<DateTime<Utc>>,
             watching: false,
+            estimated_stale: 0,
         })
     } else {
-        IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None::<DateTime<Utc>>, watching: false }
+        IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None::<DateTime<Utc>>, watching: false, estimated_stale: 0 }
     };
 
     // Overlay the watching flag from the PID sentinel.

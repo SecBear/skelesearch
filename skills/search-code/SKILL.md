@@ -6,7 +6,7 @@
 - Confirming whether a pattern, API, or identifier exists anywhere in the project
 
 ## How it works
-`skelesearch` indexes source files with tree-sitter AST chunking and FAISS-backed semantic search.
+`skelesearch` indexes source files with tree-sitter AST chunking and CozoDB HNSW-indexed semantic search.
 Query results are ranked by vector similarity against the embedded query string.
 
 ## CANDIDATES to verify

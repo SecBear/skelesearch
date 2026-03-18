@@ -22,6 +22,8 @@ pub struct IndexResult {
     pub deleted_files: usize,
     /// Total chunks written to the backend during this run.
     pub total_chunks: usize,
+    /// Number of files that failed to parse during chunking.
+    pub parse_errors: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +184,14 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 }
 
                 let source = String::from_utf8_lossy(&content).to_string();
-                let chunks = chunker.chunk_file(&fc.rel_path, &source).unwrap_or_default();
+                let chunks = match chunker.chunk_file(&fc.rel_path, &source) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(file = %fc.rel_path, error = %e, "chunk parse failed, skipping");
+                        result.parse_errors += 1;
+                        continue;
+                    }
+                };
                 let edges = chunker.extract_edges(&fc.rel_path, &source).unwrap_or_default();
 
                 batch_files.push(BatchFile { candidate: fc, hash, chunks, edges });

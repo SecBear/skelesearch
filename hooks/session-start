@@ -15,7 +15,7 @@ fi
 
 STATUS="$("$SK" status --json 2>/dev/null)" || { exit 0; }
 
-INDEXED="$(printf '%s' "$STATUS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indexed_files',0))" 2>/dev/null)" || INDEXED=0
+INDEXED="$(printf '%s' "$STATUS" | grep -o '"indexed_files":[0-9]*' | cut -d: -f2)" || INDEXED=0
 
 if [ "$INDEXED" -gt 0 ]; then
     printf '{"hookSpecificOutput":{"additionalContext":"skelesearch index ready: %s files indexed. Use skelesearch search to find relevant code. Results are candidates — verify before acting."}}\n' "$INDEXED"
