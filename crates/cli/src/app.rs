@@ -33,8 +33,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,
-        Commands::Search { query, top_k, graph, json, diversity } => {
-            run_search(query, top_k as usize, graph, json, diversity).await
+        Commands::Search { query, top_k, graph, json, diversity, provider } => {
+            run_search(query, top_k as usize, graph, json, diversity, provider).await
         }
         Commands::Context { file } => run_context(file).await,
         Commands::Status { path, json } => run_status(path, json).await,
@@ -188,6 +188,7 @@ async fn run_search(
     graph: bool,
     json_output: bool,
     diversity: f32,
+    provider_name: String,
 ) -> anyhow::Result<()> {
     let root = std::env::current_dir().context("failed to get current directory")?;
     let dir = index_dir(&root);
@@ -202,7 +203,7 @@ async fn run_search(
         return Ok(());
     }
 
-    let provider = provider_from_name("fastembed")?;
+    let provider = provider_from_name(&provider_name)?;
     let dim = provider.dim();
     let backend = open_backend(&dir)?;
     backend.initialize(dim).await?;
@@ -382,18 +383,7 @@ async fn run_clear(path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
-    // Validate provider name immediately so we fail fast on bad input.
-    // We do NOT construct the provider yet — writing the PID file first
-    // ensures `status --json` reports watching=true even while the model
-    // loads, which may take time on first use.
-
-    // Reject unknown providers before doing any I/O.
-    if provider_name != "fastembed" {
-        anyhow::bail!(
-            "unknown embedding provider: '{}'. Supported providers: fastembed",
-            provider_name
-        );
-    }
+    // provider_from_name validates the name before any I/O — unknown names fail fast.
 
     let root = std::fs::canonicalize(&path)
         .with_context(|| format!("cannot access path: {}", path.display()))?;

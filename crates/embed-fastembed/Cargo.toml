@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "fastembed-rs EmbedProvider for skelesearch (jina-v2-base-code default)"
 
+[features]
+default = ["openai"]
+openai = ["dep:skelesearch-embed-openai"]
+
 [dependencies]
 skelesearch-core = { path = "../core" }
 fastembed = { workspace = true }
@@ -13,7 +17,7 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-
+skelesearch-embed-openai = { path = "../embed-openai", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

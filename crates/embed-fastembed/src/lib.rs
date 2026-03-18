@@ -96,23 +96,25 @@ impl EmbedProvider for FastEmbedProvider {
 // Provider factory
 // ---------------------------------------------------------------------------
 
-/// Build a [`FastEmbedProvider`] by name.
+/// Build an [`EmbedProvider`] by name, returning it boxed as a trait object.
 ///
-/// Only `"fastembed"` is currently supported.  Unknown names are rejected
-/// immediately with a clear error so callers learn exactly what went wrong
-/// rather than receiving a runtime panic.
+/// Supported names: `"fastembed"`, `"openai"` (when the `openai` feature is enabled).
+/// Unknown names are rejected immediately with a clear error.
 ///
 /// # Errors
 /// Returns an error if the name is unrecognized or if the underlying
-/// model fails to initialize (see [`FastEmbedProvider::default`]).
-pub fn provider_from_name(name: &str) -> anyhow::Result<FastEmbedProvider> {
+/// provider fails to initialize.
+pub fn provider_from_name(name: &str) -> anyhow::Result<Box<dyn skelesearch_core::EmbedProvider>> {
     match name {
         "fastembed" => {
-            FastEmbedProvider::default()
-                .map_err(|e| e.context("failed to initialise fastembed provider"))
+            let p = FastEmbedProvider::default()
+                .map_err(|e| e.context("failed to initialise fastembed provider"))?;
+            Ok(Box::new(p))
         }
+        #[cfg(feature = "openai")]
+        "openai" => Ok(Box::new(skelesearch_embed_openai::OpenAIProvider::new()?)),
         other => anyhow::bail!(
-            "unknown embedding provider: '{}'. Supported providers: fastembed",
+            "unknown embedding provider: '{}'. Supported: fastembed, openai",
             other
         ),
     }

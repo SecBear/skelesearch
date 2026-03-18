@@ -16,3 +16,17 @@ pub trait EmbedProvider: Send + Sync {
     /// vector count does not match `texts.len()`.
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>>;
 }
+
+
+// Blanket impl so `Box<dyn EmbedProvider>` satisfies `P: EmbedProvider` bounds.
+// Without this, generic call sites (Indexer, Searcher) cannot accept a boxed provider.
+#[async_trait]
+impl<T: EmbedProvider + ?Sized> EmbedProvider for Box<T> {
+    fn dim(&self) -> usize {
+        (**self).dim()
+    }
+
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        (**self).embed_batch(texts).await
+    }
+}

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/embed-fastembed", "crates/mcp", "crates/cli"]
+members = ["crates/core", "crates/embed-fastembed", "crates/embed-openai", "crates/mcp", "crates/cli"]
 resolver = "2"
 
 [workspace.package]
@@ -48,6 +48,8 @@ ignore = "0.4"
 ndarray = { version = "0.15", features = ["serde"] }
 
 # Embedding
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
 fastembed = { version = "4" }
 
 # MCP server

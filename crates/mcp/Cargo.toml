@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 skelesearch-core = { path = "../core" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }
+skelesearch-embed-openai = { path = "../embed-openai" }
 rmcp = { workspace = true }
 clap = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

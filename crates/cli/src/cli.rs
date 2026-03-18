@@ -45,6 +45,10 @@ pub enum Commands {
         /// redundancy in results. 0 disables MMR.
         #[arg(long, default_value_t = 0.0)]
         diversity: f32,
+
+        /// Embedding provider (must match the provider used during indexing).
+        #[arg(long, default_value = "fastembed")]
+        provider: String,
     },
 
     /// Show all indexed chunks plus import graph for a file.
