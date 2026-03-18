@@ -22,6 +22,7 @@ pub async fn collect_garbage<B: StorageBackend>(
         if !abs_path.exists() {
             backend.delete_chunks_for_file(file_path).await?;
             backend.delete_edges_for_file(file_path).await?;
+            backend.delete_symbols_for_file(file_path).await?;
             backend.delete_file(file_path).await?;
             manifest.remove(file_path)?;
             removed += 1;

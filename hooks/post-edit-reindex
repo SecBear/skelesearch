@@ -14,7 +14,14 @@ fi
 
 STATUS="$("$SK" status --json 2>/dev/null)" || { exit 0; }
 
-WATCHING="$(printf '%s' "$STATUS" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('watching') else 'false')" 2>/dev/null)" || WATCHING=false
+# Detect watch mode without python3 or jq: match the literal JSON field.
+# grep -q returns 0 on match, non-zero otherwise — safe with set -e because
+# the conditional form "if ...; then" suppresses exit on non-zero.
+if printf '%s' "$STATUS" | grep -q '"watching"[[:space:]]*:[[:space:]]*true'; then
+    WATCHING=true
+else
+    WATCHING=false
+fi
 
 # If watch mode is active, the watcher handles re-indexing
 if [ "$WATCHING" = "true" ]; then

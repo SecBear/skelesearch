@@ -1,3 +1,17 @@
+// Tests for ManifestStore checkpoint-table semantics.
+//
+// These tests verify that:
+//   - the checkpoint table is initialised on first open
+//   - batches begun but never completed appear as incomplete
+//   - completing a batch removes it from the incomplete set
+//   - files whose batch completed are not re-indexed on a subsequent run
+//
+// NOTE: These tests do NOT exercise real process-kill crash recovery.
+// They simulate "interrupted batch" by calling begin_batch without
+// complete_batch in the same in-process session.  A separate test
+// (not yet written) would need to spawn a child process, kill it, and
+// reopen the store to verify cross-process durability.
+
 use skelesearch_core::{CozoBackend, Indexer, ManifestStore, StorageBackend};
 use std::sync::Arc;
 
@@ -23,7 +37,7 @@ async fn checkpoint_table_created_on_open() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn incomplete_batch_detected_after_simulated_crash() -> anyhow::Result<()> {
+async fn incomplete_batch_detected_when_complete_not_called() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let manifest = ManifestStore::open(dir.path().join("manifest.db"))?;
 
@@ -43,7 +57,7 @@ async fn incomplete_batch_detected_after_simulated_crash() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn completed_files_not_reindexed_on_restart() -> anyhow::Result<()> {
+async fn completed_files_not_reindexed_on_subsequent_run() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo)?;

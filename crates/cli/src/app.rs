@@ -6,9 +6,9 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde_json::json;
 use skelesearch_core::{
-    CozoBackend, EmbedProvider, IndexStats, Indexer, ManifestStore, Searcher, StorageBackend,
+    CozoBackend, Config, EmbedProvider, IndexStats, Indexer, ManifestStore, Searcher, StorageBackend,
 };
-use skelesearch_embed_fastembed::FastEmbedProvider;
+use skelesearch_embed_fastembed::provider_from_name;
 
 use crate::cli::{Cli, Commands};
 
@@ -64,21 +64,6 @@ fn resolve_root(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Validate and build a FastEmbedProvider for the given provider name.
-///
-/// Only `"fastembed"` is supported in v1.  Unknown names are rejected with a
-/// clear error so callers get a useful message rather than a panic.
-fn make_provider(name: &str) -> anyhow::Result<FastEmbedProvider> {
-    match name {
-        "fastembed" => {
-            FastEmbedProvider::default().context("failed to initialise fastembed provider")
-        }
-        other => anyhow::bail!(
-            "unknown embedding provider: '{}'. Supported providers: fastembed",
-            other
-        ),
-    }
-}
 
 /// Open the CozoBackend at `dir/index.db`.
 fn open_backend(dir: &Path) -> anyhow::Result<Arc<CozoBackend>> {
@@ -166,7 +151,7 @@ fn process_is_alive(_pid: u32) -> bool {
 
 async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     // Validate provider before doing any work.
-    let provider = make_provider(&provider_name)?;
+    let provider = provider_from_name(&provider_name)?;
     let dim = provider.dim();
 
     let root = std::fs::canonicalize(&path)
@@ -178,10 +163,12 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
 
     let backend = open_backend(&dir)?;
     let manifest = open_manifest(&dir)?;
+    let config = Config::load(&root)?;
 
     backend.initialize(dim).await?;
 
-    let indexer = Indexer::new(backend, manifest, provider);
+    let indexer = Indexer::new(backend, manifest, provider)
+        .with_excludes(config.index.exclude.clone());
     let result = indexer.index_path(&root).await?;
 
     println!(
@@ -210,7 +197,7 @@ async fn run_search(
         return Ok(());
     }
 
-    let provider = make_provider("fastembed")?;
+    let provider = provider_from_name("fastembed")?;
     let dim = provider.dim();
     let backend = open_backend(&dir)?;
     backend.initialize(dim).await?;
@@ -369,6 +356,11 @@ async fn run_clear(path: Option<PathBuf>) -> anyhow::Result<()> {
     let dir = index_dir(&root);
 
     if dir.exists() {
+        // Acquire the write lock before deleting so we don't race with a
+        // concurrent index or watch that is mid-write.  The OS keeps the
+        // flock alive even after remove_dir_all unlinks the lock file.
+        std::fs::create_dir_all(&dir)?;
+        let _lock = acquire_lock(&dir)?;
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("failed to remove index directory: {}", dir.display()))?;
         println!("Index cleared: {}", dir.display());
@@ -407,15 +399,17 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     // (no model, no network), log a warning and continue watching without
     // an initial index rather than failing the whole command.  The PID
     // file is already written so `status --json` will report watching=true.
-    match make_provider(&provider_name) {
+    match provider_from_name(&provider_name) {
         Ok(provider) => {
             let dim = provider.dim();
             let backend = open_backend(&dir)?;
             let manifest = open_manifest(&dir)?;
+            let config = Config::load(&root)?;
             if let Err(e) = backend.initialize(dim).await {
                 eprintln!("skelesearch watch: backend init failed: {e}");
             } else {
-                let indexer = Indexer::new(backend, manifest, provider);
+                let indexer = Indexer::new(backend, manifest, provider)
+                    .with_excludes(config.index.exclude.clone());
                 match indexer.index_path(&root).await {
                     Ok(r) => eprintln!(
                         "skelesearch watch: indexed {} file(s) in {}",
@@ -452,6 +446,7 @@ async fn run_gc(path: Option<PathBuf>) -> anyhow::Result<()> {
         println!("No index found.");
         return Ok(());
     }
+    let _lock = acquire_lock(&dir)?;
     let backend = open_backend(&dir)?;
     let manifest = open_manifest(&dir)?;
     let removed = skelesearch_core::gc::collect_garbage(&root, &backend, &manifest).await?;

@@ -1,53 +1,16 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+mod test_utils;
+use test_utils::{copy_dir_all, DeterministicTestProvider};
 use skelesearch_core::{
     CozoBackend, EmbedProvider, IndexResult, Indexer, ManifestStore, StorageBackend,
 };
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Test doubles
+// Local test doubles (DeterministicTestProvider lives in test_utils)
 // ---------------------------------------------------------------------------
-
-/// Returns identical fixed vectors of the given dimensionality for every input.
-///
-/// Deterministic output allows round-trip tests without a real model.
-#[derive(Clone)]
-pub struct DeterministicTestProvider {
-    dim: usize,
-}
-
-impl DeterministicTestProvider {
-    pub fn new(dim: usize) -> Self {
-        Self { dim }
-    }
-}
-
-#[async_trait]
-impl EmbedProvider for DeterministicTestProvider {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                // Slightly vary vectors per-chunk so FTS and vector scores differ.
-                let mut v = vec![0.1_f32; self.dim];
-                if !v.is_empty() {
-                    v[0] = (i as f32 + 1.0) * 0.1;
-                }
-                // Normalise to unit length so cosine similarity is well-defined.
-                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-                v.iter_mut().for_each(|x| *x /= norm);
-                v
-            })
-            .collect())
-    }
-}
 
 /// Counts `embed_batch` calls and total chunk texts seen across all calls.
 ///
@@ -124,19 +87,6 @@ fn fixture_repo() -> anyhow::Result<TempDir> {
     Ok(dir)
 }
 
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            std::fs::create_dir_all(&target)?;
-            copy_dir_all(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -351,5 +301,95 @@ async fn indexer_processes_in_bounded_file_batches() -> anyhow::Result<()> {
         assert!(size <= 64, "embed_batch call exceeded batch_size: {size}");
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Error-path tests
+// ---------------------------------------------------------------------------
+
+/// A provider that returns fewer vectors than texts — triggers the mismatch
+/// guard in the indexer's embedding loop.
+#[derive(Clone)]
+struct ShortProvider {
+    dim: usize,
+}
+
+#[async_trait]
+impl EmbedProvider for ShortProvider {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        // Return one fewer vector than requested to trigger the mismatch guard.
+        let count = texts.len().saturating_sub(1);
+        Ok((0..count).map(|_| vec![0.1_f32; self.dim]).collect())
+    }
+}
+
+#[tokio::test]
+async fn embedding_count_mismatch_returns_error() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    // Three functions → at least three chunks → short provider fires on the first non-empty batch.
+    std::fs::write(repo.join("a.rs"), "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n")?;
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+
+    backend.initialize(8).await?;
+    let indexer = Indexer::new(backend, manifest, ShortProvider { dim: 8 });
+    let err = indexer.index_path(&repo).await;
+
+    assert!(err.is_err(), "expected Err from count mismatch but got Ok");
+    let msg = format!("{:#}", err.unwrap_err());
+    assert!(
+        msg.contains("embedding count mismatch"),
+        "error should mention 'embedding count mismatch', got: {msg}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Binary-file skip test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn binary_files_are_skipped() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+
+    // A normal Rust source file — must appear in the index.
+    std::fs::write(repo.join("main.rs"), "fn main() {}\n")?;
+    // A binary file containing a null byte — must be skipped entirely.
+    std::fs::write(repo.join("data.bin"), b"\x00\x01\x02binary content\xFF")?;
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+
+    backend.initialize(8).await?;
+    let indexer = Indexer::new(backend.clone(), manifest, DeterministicTestProvider::new(8));
+    let result = indexer.index_path(&repo).await?;
+
+    // Exactly one file was indexed — the Rust source.
+    assert_eq!(result.indexed_files, 1, "only the text file should be indexed");
+
+    // The binary file must have no chunks stored in the backend.
+    let binary_chunks = backend.get_chunks_for_file("data.bin").await?;
+    assert!(binary_chunks.is_empty(), "binary file must have no stored chunks");
+
+    // The text file must appear in the indexed paths.
+    let paths = backend.list_indexed_paths().await?;
+    assert!(
+        paths.iter().any(|p| p.contains("main.rs")),
+        "main.rs should appear in indexed paths; got: {paths:?}"
+    );
     Ok(())
 }

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+mod test_utils;
+use test_utils::{copy_dir_all, DeterministicTestProvider};
 use skelesearch_core::{
     CozoBackend, EdgeRecord, EmbedProvider, FileContext, FileRecord, Indexer, ManifestStore,
     Searcher, StorageBackend,
@@ -8,42 +10,8 @@ use skelesearch_core::{
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Test doubles  (same shape as in indexer tests; each test file is independent)
+// Helpers (DeterministicTestProvider + copy_dir_all live in test_utils)
 // ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct DeterministicTestProvider {
-    dim: usize,
-}
-
-impl DeterministicTestProvider {
-    pub fn new(dim: usize) -> Self {
-        Self { dim }
-    }
-}
-
-#[async_trait]
-impl EmbedProvider for DeterministicTestProvider {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let mut v = vec![0.1_f32; self.dim];
-                if !v.is_empty() {
-                    v[0] = (i as f32 + 1.0) * 0.1;
-                }
-                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-                v.iter_mut().for_each(|x| *x /= norm);
-                v
-            })
-            .collect())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -70,19 +38,6 @@ fn fixture_repo() -> anyhow::Result<TempDir> {
     Ok(dir)
 }
 
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            std::fs::create_dir_all(&target)?;
-            copy_dir_all(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
 
 /// Build an indexed backend + searcher ready for retrieval tests.
 async fn indexed_searcher() -> anyhow::Result<(
@@ -150,7 +105,7 @@ async fn searcher_returns_quality_labels_for_non_empty_results() -> anyhow::Resu
             row.match_quality
         );
         assert!(
-            row.why == "vector" || row.why == "fts" || row.why == "both",
+            row.why == "vector" || row.why == "fts" || row.why == "hybrid",
             "unexpected why {:?}",
             row.why
         );
@@ -160,6 +115,7 @@ async fn searcher_returns_quality_labels_for_non_empty_results() -> anyhow::Resu
 }
 
 #[tokio::test]
+#[ignore = "graph augmentation disabled in v1.2 until identifier-based dependency graph lands"]
 async fn searcher_graph_augmentation_annotates_import_neighbours() -> anyhow::Result<()> {
     let (_, searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
 
@@ -285,5 +241,75 @@ async fn traverse_handles_cycles() -> anyhow::Result<()> {
 
     let neighbors = backend.traverse_imports("a.rs", 5).await?;
     assert_eq!(neighbors, vec!["b.rs".to_string()]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent index + search test
+// ---------------------------------------------------------------------------
+
+/// A provider that sleeps briefly per-batch to widen the indexing window,
+/// making it possible for a concurrent search to overlap with active indexing.
+#[derive(Clone)]
+struct SlowProvider {
+    dim: usize,
+}
+
+#[async_trait]
+impl EmbedProvider for SlowProvider {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Ok(texts.iter().map(|_| vec![0.1_f32; self.dim]).collect())
+    }
+}
+
+/// Verify that a search issued while indexing is in-flight neither panics nor
+/// returns an error.  Results may be empty or partial — that is acceptable.
+#[tokio::test]
+async fn concurrent_index_and_search_does_not_panic() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+
+    // Write enough files to ensure at least a couple of embedding batches.
+    for i in 0..10 {
+        std::fs::write(
+            repo.join(format!("mod_{i}.rs")),
+            format!("fn func_{i}() {{}}\n"),
+        )?;
+    }
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+
+    backend.initialize(8).await?;
+
+    let indexer = Indexer::new(backend.clone(), manifest, SlowProvider { dim: 8 });
+    let searcher = Searcher::new(backend.clone(), DeterministicTestProvider::new(8));
+
+    // Start indexing in a background task.
+    let index_handle = tokio::spawn(async move {
+        indexer.index_path(&repo).await
+    });
+
+    // Give the indexer a moment to start so there is genuine overlap.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Search while indexing is in-flight.  Must not panic or error.
+    let search_result = searcher.search("func", 5, false, 0).await;
+    assert!(
+        search_result.is_ok(),
+        "search during indexing must return Ok; got: {:?}",
+        search_result.unwrap_err()
+    );
+
+    // Wait for indexing to complete to avoid leaking the task.
+    index_handle.await??;
     Ok(())
 }

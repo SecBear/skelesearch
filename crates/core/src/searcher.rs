@@ -73,14 +73,16 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let labels = Self::label_match_quality(&scores);
         for (hit, label) in hits.iter_mut().zip(labels) {
             hit.match_quality = label;
-            // The backend used a hybrid (vector + FTS) RRF query; the dominant
-            // signal for these embeddings-present results is vector similarity.
-            hit.why = "vector".to_string();
+            // why is set by hybrid_search: "fts", "vector", or "hybrid"
         }
 
-        if include_graph && max_depth > 0 {
-            hits = self.augment_with_graph(hits, max_depth).await?;
-        }
+        // Graph augmentation disabled in v1.2: import edges store raw tree-sitter
+        // capture text (e.g. "use crate::foo::bar;"), not resolved file paths.
+        // traverse_imports matches against file paths and always returns empty.
+        // See AD-3 in docs/superpowers/plans/2026-03-18-skelesearch-v1.2-production.md
+        // for the planned identifier-based dependency graph approach.
+        // The include_graph parameter is accepted but currently a no-op.
+        let _ = (include_graph, max_depth);
 
         Ok(hits)
     }
@@ -125,10 +127,12 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     // -- Private helpers -----------------------------------------------------
 
     /// Extend `hits` with transitive import-graph neighbours up to `max_depth`
-    /// hops.  For each primary result file, `traverse_imports` performs a
-    /// level-batched BFS; each discovered file's chunks are added as `"graph
-    /// (depth N)"` results.  The visited set inside `traverse_imports` handles
-    /// cycles.  Files with no chunks are silently skipped.
+    /// hops.  Retained for the v2 identifier-based dependency graph approach.
+    /// Currently a no-op in callers: import edges store raw tree-sitter capture
+    /// text (e.g. `"use crate::foo::bar;"`), not resolved file paths, so
+    /// `traverse_imports` always returns empty.
+    /// See AD-3 in docs/superpowers/plans/2026-03-18-skelesearch-v1.2-production.md.
+    #[allow(dead_code)]
     async fn augment_with_graph(
         &self,
         mut hits: Vec<SearchResult>,

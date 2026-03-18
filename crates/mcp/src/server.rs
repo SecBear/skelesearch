@@ -13,23 +13,24 @@
 //     public method that tests can call directly.
 //   - Provider selection is explicit: unknown names return a clear error.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
-use skelesearch_core::{classify_query, grep_codebase, CozoBackend, EmbedProvider, GrepOptions, Indexer, ManifestStore, QueryStrategy, Searcher, StorageBackend};
-use skelesearch_embed_fastembed::FastEmbedProvider;
+use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, Indexer, ManifestStore, QueryStrategy, Searcher, StorageBackend};
+use skelesearch_embed_fastembed::{FastEmbedProvider, provider_from_name};
 
 use crate::tools::{
-    ChunkInfo, FileContextOutput, FindSymbolInput, GetFileContextInput, IndexCodebaseInput,
-    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeRow,
-    SmartSearchInput, SmartSearchOutput, SymbolRow,
+    ChunkInfo, FileContextOutput, FindSymbolInput, GetFileContextInput, GrepSearchRow,
+    IndexCodebaseInput, IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput,
+    SearchCodeInput, SearchCodeRow, SmartSearchInput, SmartSearchOutput, SmartSearchResults,
+    SymbolRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,9 +75,25 @@ pub struct SkeleSearchServer {
     /// Path to the manifest SQLite database; opened fresh per index_codebase call.
     manifest_path: Arc<PathBuf>,
     /// Provider used for query embedding in `search_code`.
-    provider: ArcProvider,
+    /// Provider used for query embedding in `search_code`.  Wrapped in an
+    /// RwLock so `run_index` can promote it to the real provider after a
+    /// successful indexing run without requiring a full server restart.
+    provider: Arc<RwLock<ArcProvider>>,
     tool_router: ToolRouter<Self>,
 }
+
+// ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+/// Returns true when `err` is a CozoDB "Stored relation … not found" error,
+/// which occurs when the DB has never been initialized (no tables exist yet).
+/// We treat this as an empty index, not a hard failure.
+fn is_uninitialized_index_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("stored relation") && msg.contains("not found")
+}
+
 
 impl SkeleSearchServer {
     /// Construct the server.
@@ -91,7 +108,7 @@ impl SkeleSearchServer {
         Self {
             backend,
             manifest_path: Arc::new(manifest_path.into()),
-            provider: ArcProvider::new(provider),
+            provider: Arc::new(RwLock::new(ArcProvider::new(provider))),
             tool_router: Self::tool_router(),
         }
     }
@@ -110,13 +127,50 @@ impl SkeleSearchServer {
             .collect())
     }
 
-    /// Semantic + FTS hybrid search.  Returns an empty vec when the index is
-    /// empty — never errors on zero results.
+    /// Ensure a usable embedding provider is ready before a search.
+    ///
+    /// Returns an error when the index is empty so callers get a clear
+    /// message rather than empty results.  When the server started with
+    /// `NoopProvider` (dim == 1) but a persistent index exists, lazily
+    /// upgrades to `FastEmbedProvider` and promotes it for future calls.
+    async fn prepare_search_provider(&self) -> anyhow::Result<ArcProvider> {
+        let stats = match self.backend.stats().await {
+            Ok(s) => s,
+            Err(ref e) if is_uninitialized_index_error(e) => {
+                return Err(anyhow::anyhow!("index is empty; run index_codebase first"));
+            }
+            Err(e) => return Err(e),
+        };
+        if stats.total_chunks == 0 {
+            return Err(anyhow::anyhow!("index is empty; run index_codebase first"));
+        }
+
+        // Fast path: already a real provider.
+        {
+            let guard = self.provider.read().map_err(|_| anyhow::anyhow!("provider lock poisoned"))?;
+            if guard.dim() > 1 {
+                return Ok(guard.clone());
+            }
+        }
+
+        // Slow path: started with NoopProvider (dim == 1) but a persisted
+        // index exists.  Lazily initialize the real provider and promote it
+        // so subsequent calls skip this branch.
+        let real = FastEmbedProvider::default().context("failed to initialize fastembed provider")?;
+        let arc_provider = ArcProvider::new(real);
+        *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = arc_provider.clone();
+        Ok(arc_provider)
+    }
+
+    /// Semantic + FTS hybrid search.
+    ///
+    /// Returns an error when the index is empty (via `prepare_search_provider`).
     pub async fn search_code(
         &self,
         input: SearchCodeInput,
     ) -> anyhow::Result<Vec<SearchCodeRow>> {
-        let searcher = Searcher::new(Arc::clone(&self.backend), self.provider.clone());
+        let provider = self.prepare_search_provider().await?;
+        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
         let top_k = input.top_k.max(1);
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
         let results = searcher
@@ -152,7 +206,7 @@ impl SkeleSearchServer {
     ) -> anyhow::Result<IndexCodebaseOutput> {
         let provider_name = input.provider.as_deref().unwrap_or("fastembed");
         // Validate provider name before launching any I/O.
-        let provider = make_provider(provider_name)?;
+        let provider = provider_from_name(provider_name).map(ArcProvider::new)?;
         self.run_index(std::path::Path::new(&input.path), provider).await
     }
 
@@ -169,6 +223,9 @@ impl SkeleSearchServer {
         let backend = Arc::clone(&self.backend);
         let manifest_path = Arc::clone(&self.manifest_path);
         let path = path.to_path_buf();
+        // Clone the provider so the closure can take ownership of one copy
+        // while we retain another for promotion after successful indexing.
+        let provider_for_closure = provider.clone();
 
         // ManifestStore is !Send; run indexing in a dedicated single-thread runtime
         // inside spawn_blocking so the outer future remains Send.
@@ -179,13 +236,20 @@ impl SkeleSearchServer {
                 .map_err(|e| anyhow::anyhow!("runtime build: {e}"))?;
             rt.block_on(async {
                 let manifest = Arc::new(ManifestStore::open(manifest_path.as_path())?);
-                let indexer = Indexer::new(backend, manifest, provider);
+                let config = Config::load(&path).context("load .skelesearch.toml")?;
+                let indexer = Indexer::new(backend, manifest, provider_for_closure)
+                    .with_excludes(config.index.exclude.clone());
                 indexer.index_path(&path).await
             })
         })
         .await
         .context("indexer task panicked")?
         .context("indexer.index_path")?;
+
+        // Promote the provider so subsequent searches use the same embedding
+        // dimension as the newly-built index.  Only runs on success so the
+        // server never holds a provider for a failed/partial index.
+        *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = provider;
 
         Ok(IndexCodebaseOutput {
             status: "ok".to_string(),
@@ -199,7 +263,19 @@ impl SkeleSearchServer {
         &self,
         _input: IndexStatusInput,
     ) -> anyhow::Result<IndexStatusOutput> {
-        let stats = self.backend.stats().await?;
+        let stats = match self.backend.stats().await {
+            Ok(s) => s,
+            Err(ref e) if is_uninitialized_index_error(e) => {
+                return Ok(IndexStatusOutput {
+                    indexed_files: 0,
+                    total_chunks: 0,
+                    last_indexed: None,
+                    estimated_stale: 0,
+                    watching: false,
+                });
+            }
+            Err(e) => return Err(e),
+        };
         Ok(IndexStatusOutput {
             indexed_files: stats.indexed_files,
             total_chunks: stats.total_chunks,
@@ -216,8 +292,15 @@ impl SkeleSearchServer {
         &self,
         input: GetFileContextInput,
     ) -> anyhow::Result<FileContextOutput> {
-        let searcher = Searcher::new(Arc::clone(&self.backend), self.provider.clone());
-        let ctx = searcher.file_context(&input.file_path).await?;
+        let provider = self.provider.read().map_err(|_| anyhow::anyhow!("provider lock poisoned"))?.clone();
+        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
+        let ctx = match searcher.file_context(&input.file_path).await {
+            Ok(c) => c,
+            Err(ref e) if is_uninitialized_index_error(e) => {
+                return Ok(FileContextOutput { chunks: vec![], imports: vec![], imported_by: vec![] });
+            }
+            Err(e) => return Err(e),
+        };
         Ok(FileContextOutput {
             chunks: ctx
                 .chunks
@@ -249,34 +332,39 @@ impl SkeleSearchServer {
         let strategy = classify_query(&input.query);
         let results = match &strategy {
             QueryStrategy::Grep => {
-                let paths = self.backend.list_indexed_paths().await?;
+                let paths = match self.backend.list_indexed_paths().await {
+                    Ok(p) => p,
+                    Err(ref e) if is_uninitialized_index_error(e) => vec![],
+                    Err(e) => return Err(e),
+                };
                 if paths.is_empty() {
-                    serde_json::Value::Array(vec![])
+                    SmartSearchResults::Grep(vec![])
                 } else {
                     let root = common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"));
                     let opts = GrepOptions { max_results: input.top_k.max(1), case_insensitive: false };
                     let matches = grep_codebase(&root, &input.query, &opts)?;
-                    let json: Vec<serde_json::Value> = matches
-                        .into_iter()
-                        .map(|m| serde_json::json!({
-                            "file_path": m.file_path,
-                            "line_number": m.line_number,
-                            "line_content": m.line_content,
-                        }))
-                        .collect();
-                    serde_json::Value::Array(json)
+                    SmartSearchResults::Grep(
+                        matches
+                            .into_iter()
+                            .map(|m| GrepSearchRow {
+                                file_path: m.file_path,
+                                line_number: m.line_number,
+                                line_content: m.line_content,
+                            })
+                            .collect(),
+                    )
                 }
             }
             QueryStrategy::Semantic => {
                 let rows = self
                     .search_code(SearchCodeInput {
-                        query: input.query,
+                        query: input.query.clone(),
                         top_k: input.top_k,
                         include_graph: input.include_graph,
                         max_depth: None,
                     })
                     .await?;
-                serde_json::to_value(&rows)?
+                SmartSearchResults::Semantic(rows)
             }
         };
         Ok(SmartSearchOutput { strategy: strategy.to_string(), results })
@@ -287,10 +375,11 @@ impl SkeleSearchServer {
         &self,
         input: FindSymbolInput,
     ) -> anyhow::Result<Vec<SymbolRow>> {
-        let results = self
-            .backend
-            .find_symbols(&input.name, input.kind.as_deref())
-            .await?;
+        let results = match self.backend.find_symbols(&input.name, input.kind.as_deref()).await {
+            Ok(r) => r,
+            Err(ref e) if is_uninitialized_index_error(e) => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
         Ok(results
             .into_iter()
             .map(|s| SymbolRow {
@@ -325,6 +414,14 @@ impl SkeleSearchServer {
 #[tool_router]
 impl SkeleSearchServer {
     /// Semantic and full-text hybrid search over the indexed codebase.
+    ///
+    /// Requires the codebase to be indexed first via `index_codebase`.
+    /// Results are candidate chunks ranked by relevance — not guaranteed to be
+    /// the exact match, but the closest the index can find.
+    ///
+    /// `include_graph` is accepted but graph augmentation is disabled in v1.2;
+    /// set it to `false` for now.
+    /// Returns an error when the index is empty.
     #[tool(name = "search_code")]
     async fn mcp_search_code(
         &self,
@@ -332,11 +429,17 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.search_code(input)
             .await
-            .map(|rows| serde_json::to_string(&rows).unwrap_or_default())
             .map_err(|e| e.to_string())
+            .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
     }
 
-    /// Index a codebase directory and make it searchable.
+    /// Index a codebase directory at `path` using the chosen embedding provider.
+    ///
+    /// Walks all source files under `path`, splits them into chunks, embeds each
+    /// chunk, and stores the results in the local index.  The only supported
+    /// provider in v1 is `"fastembed"` (default; runs locally, no API key needed).
+    /// Re-run after large code changes — the index is not updated automatically
+    /// unless the `watch` command is running.
     #[tool(name = "index_codebase")]
     async fn mcp_index_codebase(
         &self,
@@ -344,12 +447,15 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.index_codebase(input)
             .await
-            .map(|out| serde_json::to_string(&out).unwrap_or_default())
             .map_err(|e| e.to_string())
+            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Return current index statistics including file count, chunk count,
-    /// last-indexed timestamp, and whether a watch process is running.
+    /// Report whether an index exists and provide basic counts.
+    ///
+    /// Returns `indexed_files`, `total_chunks`, an RFC 3339 `last_indexed`
+    /// timestamp (or `null` if never indexed), and `estimated_stale` (v1: always 0).
+    /// Call this before `search_code` to confirm the index is populated.
     #[tool(name = "index_status")]
     async fn mcp_index_status(
         &self,
@@ -357,11 +463,15 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.index_status(input)
             .await
-            .map(|out| serde_json::to_string(&out).unwrap_or_default())
             .map_err(|e| e.to_string())
+            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Return all indexed chunks, imports, and importers for a specific file.
+    /// Return indexed chunks, import metadata, and reverse-import metadata for a specific file.
+    ///
+    /// Returns the raw stored chunks for `file_path` plus the list of files it
+    /// imports (`imports`) and the list of files that import it (`imported_by`).
+    /// Returns empty lists when the file is not in the index rather than an error.
     #[tool(name = "get_file_context")]
     async fn mcp_get_file_context(
         &self,
@@ -369,11 +479,17 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.get_file_context(input)
             .await
-            .map(|out| serde_json::to_string(&out).unwrap_or_default())
             .map_err(|e| e.to_string())
+            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Automatically route the query to grep or semantic search based on its shape.
+    /// Auto-route the query to grep or semantic search based on its shape.
+    ///
+    /// Keyword-shaped or pattern queries (identifiers, regex-like strings) are
+    /// dispatched to grep for exact matches.  Natural-language queries are sent
+    /// to the semantic search path (equivalent to `search_code`).  The response
+    /// includes a `strategy` field (`"grep"` or `"semantic"`) so callers can
+    /// see which path was taken.
     #[tool(name = "smart_search")]
     async fn mcp_smart_search(
         &self,
@@ -381,11 +497,16 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.smart_search(input)
             .await
-            .map(|out| serde_json::to_string(&out).unwrap_or_default())
             .map_err(|e| e.to_string())
+            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Find symbol definitions by name.
+    /// Exact-name symbol lookup with optional kind filter.
+    ///
+    /// Searches the symbol table for definitions whose name matches `name`
+    /// exactly (case-sensitive).  Supply `kind` (e.g. `"function"`, `"struct"`,
+    /// `"class"`) to narrow results to a specific symbol kind.
+    /// Returns file path, start/end lines, and kind for each match.
     #[tool(name = "find_symbol")]
     async fn mcp_find_symbol(
         &self,
@@ -393,8 +514,8 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.find_symbol(input)
             .await
-            .map(|rows| serde_json::to_string(&rows).unwrap_or_default())
             .map_err(|e| e.to_string())
+            .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
     }
 }
 
@@ -408,28 +529,13 @@ impl ServerHandler for SkeleSearchServer {
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "skelesearch".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                ..Default::default()
+            },
             ..Default::default()
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Provider factory
-// ---------------------------------------------------------------------------
-
-/// Create an embedding provider by name.  Returns a clear error for unknown
-/// names so callers learn exactly what went wrong.
-fn make_provider(name: &str) -> anyhow::Result<ArcProvider> {
-    match name {
-        "fastembed" => {
-            let p = FastEmbedProvider::default()
-                .context("failed to initialise FastEmbed provider")?;
-            Ok(ArcProvider::new(p))
-        }
-        other => anyhow::bail!(
-            "unknown provider '{}'; supported providers: fastembed",
-            other
-        ),
     }
 }
 

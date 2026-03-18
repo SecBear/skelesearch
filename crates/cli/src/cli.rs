@@ -64,9 +64,9 @@ pub enum Commands {
         path: Option<std::path::PathBuf>,
     },
 
-    /// Watch a path and re-index on changes.
+    /// Keep a watch sentinel active for a path (v1: no file-change re-indexing).
     ///
-    /// This is a standalone subcommand (not a flag on `index`).
+    /// Standalone subcommand — not a flag on `index`. File-change re-indexing is planned for v2.
     Watch {
         /// Directory to watch.
         path: std::path::PathBuf,

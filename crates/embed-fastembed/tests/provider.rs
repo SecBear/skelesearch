@@ -4,25 +4,15 @@ use skelesearch_core::EmbedProvider;
 /// Verifies: one vector per input, correct dimensionality, input order preserved.
 ///
 /// The jina-embeddings-v2-base-code model is ~90 MB and is downloaded on first
-/// run. Subsequent runs use the local cache. The test is marked `#[ignore]` when
-/// the environment variable `SKIP_MODEL_DOWNLOAD` is set, so CI without network
-/// access can opt out cleanly.
+/// run. Subsequent runs use the local cache. Mark ignored so CI without network
+/// access skips cleanly; run explicitly with `cargo test -- --ignored` when
+/// network / cache is available.
 #[tokio::test]
+#[ignore = "requires model download / network or cache"]
 async fn fastembed_provider_returns_one_vector_per_input_in_order() -> anyhow::Result<()> {
-    if std::env::var("SKIP_MODEL_DOWNLOAD").is_ok() {
-        eprintln!("SKIP_MODEL_DOWNLOAD set — skipping model download test");
-        return Ok(());
-    }
-
-    let provider = match FastEmbedProvider::default() {
-        Ok(p) => p,
-        Err(e) => {
-            // Model load failed (e.g., no network). Surface the reason but don't
-            // fail the suite hard — callers that need this must run with network.
-            eprintln!("FastEmbedProvider::default() failed (network?): {e}");
-            return Ok(());
-        }
-    };
+    // If model initialisation fails here (no network, no cache), let the error
+    // propagate — a test run with --ignored must not silently pass.
+    let provider = FastEmbedProvider::default()?;
 
     let ab = provider
         .embed_batch(vec!["fn alpha() {}".into(), "fn beta() {}".into()])
@@ -51,17 +41,9 @@ async fn fastembed_provider_returns_one_vector_per_input_in_order() -> anyhow::R
 }
 
 #[tokio::test]
+#[ignore = "requires model download / network or cache"]
 async fn fastembed_provider_empty_batch_returns_empty() -> anyhow::Result<()> {
-    if std::env::var("SKIP_MODEL_DOWNLOAD").is_ok() {
-        return Ok(());
-    }
-    let provider = match FastEmbedProvider::default() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("FastEmbedProvider::default() failed: {e}");
-            return Ok(());
-        }
-    };
+    let provider = FastEmbedProvider::default()?;
     let result = provider.embed_batch(vec![]).await?;
     assert!(result.is_empty(), "empty input must yield empty output");
     Ok(())

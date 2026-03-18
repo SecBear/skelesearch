@@ -69,7 +69,7 @@ pub struct SearchCodeRow {
     pub score: f64,
     /// Relative quality label: `"high"`, `"moderate"`, or `"low"`.
     pub match_quality: String,
-    /// Retrieval provenance: `"vector"`, `"fts"`, `"both"`, or `"imports <file>"`.
+    /// Retrieval provenance: `"vector"`, `"fts"`, or `"hybrid"`.
     pub why: String,
 }
 
@@ -127,13 +127,29 @@ pub struct SmartSearchInput {
     pub include_graph: bool,
 }
 
+/// A single grep result row returned by `smart_search` on the grep path.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GrepSearchRow {
+    pub file_path: String,
+    pub line_number: usize,
+    pub line_content: String,
+}
+
+/// Typed result set for `smart_search`; variant chosen by the query classifier.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(tag = "kind", content = "items", rename_all = "lowercase")]
+pub enum SmartSearchResults {
+    Grep(Vec<GrepSearchRow>),
+    Semantic(Vec<SearchCodeRow>),
+}
+
 /// Output of the `smart_search` tool.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SmartSearchOutput {
     /// Which strategy was chosen: `"grep"` or `"semantic"`.
     pub strategy: String,
-    /// Results; shape depends on strategy.
-    pub results: serde_json::Value,
+    /// Typed result set; inspect `kind` to determine the row schema.
+    pub results: SmartSearchResults,
 }
 
 /// Input for the `find_symbol` tool.

@@ -7,7 +7,7 @@
 // Transport: stdio (Claude Code / MCP-compatible)
 // Framework: rmcp 0.16 (#[tool_router] + #[tool_handler])
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -56,22 +56,39 @@ fn main() {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let backend_dir = tempfile::tempdir().context("create backend temp dir")?;
-    let manifest_dir = tempfile::tempdir().context("create manifest temp dir")?;
+    let project_root = find_project_root();
+    let skelesearch_dir = project_root.join(".skelesearch");
+    std::fs::create_dir_all(&skelesearch_dir)
+        .with_context(|| format!("create .skelesearch dir at {}", skelesearch_dir.display()))?;
 
     let backend = Arc::new(
-        skelesearch_core::CozoBackend::open(backend_dir.path().join("index.db"))
+        skelesearch_core::CozoBackend::open(skelesearch_dir.join("index.db"))
             .context("open CozoBackend")?,
     );
-    let manifest_path = manifest_dir.path().join("manifest.db");
+    let manifest_path = skelesearch_dir.join("manifest.db");
 
     let server = SkeleSearchServer::new(backend, manifest_path, NoopProvider);
 
-    tracing::info!("skelesearch-mcp starting on stdio");
-
-    // Keep temp dirs alive until the server exits.
-    let _backend_dir = backend_dir;
-    let _manifest_dir = manifest_dir;
+    tracing::info!(
+        "skelesearch-mcp starting on stdio (storage: {})",
+        skelesearch_dir.display()
+    );
 
     server.serve_stdio().await
+}
+
+/// Walk up from cwd until we find a directory containing `.git`, then return
+/// that directory.  Falls back to cwd if no `.git` ancestor is found.
+fn find_project_root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut dir = cwd.clone();
+    loop {
+        if dir.join(".git").exists() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return cwd,
+        }
+    }
 }

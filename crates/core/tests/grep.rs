@@ -108,3 +108,30 @@ fn grep_case_insensitive() {
 
     assert_eq!(matches.len(), 2, "case-insensitive search should match both 'Hello' and 'HELLO'");
 }
+
+#[test]
+fn grep_matches_unicode_content() {
+    let dir = TempDir::new().unwrap();
+    // UTF-8 source with non-ASCII identifiers and comments, as you might find
+    // in multilingual codebases or documentation-heavy files.
+    write_file(
+        &dir,
+        "unicode_src.py",
+        "# αβγ alpha beta gamma\ndef αdd(a, b):\n    return a + b\n# café au lait\n",
+    );
+
+    let opts = GrepOptions::default();
+
+    // Match a Greek identifier.
+    let matches = grep_codebase(dir.path(), "αdd", &opts).unwrap();
+    assert_eq!(matches.len(), 1, "should find the Greek function name");
+    assert!(
+        matches[0].line_content.contains("αdd"),
+        "matched line should contain the Unicode identifier"
+    );
+
+    // Match a non-ASCII comment word.
+    let accent_matches = grep_codebase(dir.path(), "café", &opts).unwrap();
+    assert_eq!(accent_matches.len(), 1, "should find the accented word");
+    assert!(accent_matches[0].line_content.contains("café"));
+}

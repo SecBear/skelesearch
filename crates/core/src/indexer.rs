@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use crate::{
     ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore, StorageBackend,
 };
+use crate::symbols::extract_symbols;
 
 // ---------------------------------------------------------------------------
 // Public output type
@@ -49,6 +50,8 @@ pub struct Indexer<B, P> {
     provider: P,
     /// Maximum number of chunk texts sent to the provider in one `embed_batch` call.
     batch_size: usize,
+    /// Gitignore-style patterns for files/directories to skip during indexing.
+    exclude: Vec<String>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
@@ -58,6 +61,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             manifest,
             provider,
             batch_size: 64,
+            exclude: vec![],
         }
     }
 
@@ -67,6 +71,16 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         &self.provider
     }
 
+
+    /// Set gitignore-style path patterns that the indexer will skip.
+    ///
+    /// Supported cases: exact relative paths (`vendor/big.rs`), directory
+    /// prefixes with a trailing slash (`target/`, `node_modules/`), and
+    /// glob wildcards (`*.lock`, `**/*.min.js`).
+    pub fn with_excludes(mut self, exclude: Vec<String>) -> Self {
+        self.exclude = exclude;
+        self
+    }
     /// Walk `root`, detect changed files via the manifest, chunk and embed
     /// them, upsert to the backend, then reconcile deletions/renames.
     ///
@@ -88,16 +102,16 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         //    A batch is "pending" iff begin_batch was written before a crash
         //    prevented complete_batch from running.  Force those files through
         //    even if mtime_size_unchanged would otherwise skip them.
+        //
+        //    We do NOT mark stale pending rows complete here — that would lie
+        //    about the data.  Instead, we reindex their files in this run and
+        //    delete the stale rows only after all new batches succeed.
 
         let incomplete = self.manifest.find_incomplete_batches()?;
         let force_reindex: HashSet<String> = incomplete
             .iter()
             .flat_map(|b| b.files.iter().cloned())
             .collect();
-        // Retire the stale pending rows so they don't accumulate.
-        for batch in &incomplete {
-            self.manifest.complete_batch(&batch.run_id, batch.batch_idx as usize)?;
-        }
         // -- Phase 1: Walk ALL files, collect metadata only -------------------
         //    Use mtime+size as a fast skip — no file content is read here.
         //    Files whose mtime+size match the manifest are assumed unchanged
@@ -113,6 +127,27 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
 
         let mut candidates: Vec<FileCandidate> = Vec::new();
 
+        // Build an exclude matcher from config patterns using gitignore semantics.
+        // This covers directory prefixes (target/), globs (*.lock, **/*.min.js),
+        // and exact paths (vendor/big.rs) without adding new dependencies.
+        let exclude_matcher: Option<ignore::gitignore::Gitignore> = if self.exclude.is_empty() {
+            None
+        } else {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+            for pat in &self.exclude {
+                if let Err(e) = builder.add_line(None, pat) {
+                    tracing::warn!(pattern = %pat, error = %e, "invalid exclude pattern, skipping");
+                }
+            }
+            match builder.build() {
+                Ok(gi) => Some(gi),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build exclude matcher, excludes disabled");
+                    None
+                }
+            }
+        };
+
         let walker = ignore::WalkBuilder::new(root).build();
         for entry in walker {
             let entry = entry.context("directory walk entry error")?;
@@ -125,6 +160,14 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 .unwrap_or(&abs_path)
                 .to_string_lossy()
                 .to_string();
+
+            // Skip files matching any exclude pattern before adding to `visited` so
+            // previously-indexed excluded files are reconciled out on the next run.
+            if let Some(ref exc) = exclude_matcher {
+                if exc.matched_path_or_any_parents(Path::new(&rel_path), false).is_ignore() {
+                    continue;
+                }
+            }
 
             visited.insert(rel_path.clone());
 
@@ -168,6 +211,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 hash: String,
                 chunks: Vec<crate::ParsedChunk>,
                 edges: Vec<crate::ImportEdge>,
+                symbols: Vec<crate::symbols::SymbolDef>,
             }
 
             let mut batch_files: Vec<BatchFile<'_>> = Vec::with_capacity(batch.len());
@@ -183,6 +227,13 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                     continue;
                 }
 
+                // Skip binary files: check for null bytes in the first 8KB.
+                let check_len = content.len().min(8192);
+                if content[..check_len].contains(&0u8) {
+                    tracing::debug!(file = %fc.rel_path, "skipping binary file");
+                    continue;
+                }
+
                 let source = String::from_utf8_lossy(&content).to_string();
                 let chunks = match chunker.chunk_file(&fc.rel_path, &source) {
                     Ok(c) => c,
@@ -193,11 +244,16 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                     }
                 };
                 let edges = chunker.extract_edges(&fc.rel_path, &source).unwrap_or_default();
+                let symbols = extract_symbols(&fc.rel_path, &source).unwrap_or_default();
 
-                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges });
+                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols });
             }
 
             if batch_files.is_empty() {
+                // All files in this slice were filtered out (unchanged hash, binary,
+                // or parse fail). Complete the batch so no phantom pending row is left.
+                self.manifest.complete_batch(&run_id, batch_idx)?;
+                batch_idx += 1;
                 continue;
             }
 
@@ -209,46 +265,59 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 self.backend
                     .delete_edges_for_file(&bf.candidate.rel_path)
                     .await?;
+                self.backend
+                    .delete_symbols_for_file(&bf.candidate.rel_path)
+                    .await?;
             }
 
-            // 2c. Collect chunk texts for this batch, embed in sub-batches.
-            let batch_texts: Vec<String> = batch_files
+            // 2c. Build a cross-file pending list of (file_idx, chunk) pairs —
+            //     *without* copying texts — then embed in sub-batches of
+            //     self.batch_size.  This means we never hold a Vec<String> for all
+            //     chunk texts across the whole file batch at once; the text clone
+            //     for each sub-batch is bounded to batch_size entries.
+            //
+            //     Results are distributed into per-file ChunkRecord accumulators.
+            let pending: Vec<(usize, &crate::ParsedChunk)> = batch_files
                 .iter()
-                .flat_map(|bf| bf.chunks.iter().map(|c| c.content.clone()))
+                .enumerate()
+                .flat_map(|(fi, bf)| bf.chunks.iter().map(move |c| (fi, c)))
                 .collect();
 
-            let embeddings: Vec<Vec<f32>> = if batch_texts.is_empty() {
-                vec![]
-            } else {
-                let mut out = Vec::with_capacity(batch_texts.len());
-                for sub in batch_texts.chunks(self.batch_size) {
-                    let mut embs = self.provider.embed_batch(sub.to_vec()).await?;
-                    out.append(&mut embs);
-                }
-                out
-            };
+            let mut chunk_records_per_file: Vec<Vec<ChunkRecord>> =
+                vec![Vec::new(); batch_files.len()];
 
-            // 2d. Upsert files, chunks, and edges; update manifest.
-            let mut emb_iter = embeddings.into_iter();
-
-            for bf in &batch_files {
-                let fc = bf.candidate;
-
-                let chunk_records: Vec<ChunkRecord> = bf
-                    .chunks
-                    .iter()
-                    .map(|c| ChunkRecord {
+            for sub in pending.chunks(self.batch_size) {
+                let texts: Vec<String> = sub.iter().map(|(_, c)| c.content.clone()).collect();
+                let embs = if texts.is_empty() {
+                    vec![]
+                } else {
+                    self.provider.embed_batch(texts).await?
+                };
+                anyhow::ensure!(
+                    embs.len() == sub.len(),
+                    "embedding count mismatch: provider returned {} vectors for {} texts",
+                    embs.len(),
+                    sub.len()
+                );
+                for ((fi, chunk), emb) in sub.iter().zip(embs) {
+                    let fc = batch_files[*fi].candidate;
+                    chunk_records_per_file[*fi].push(ChunkRecord {
                         file_path: fc.rel_path.clone(),
-                        chunk_idx: c.chunk_idx,
-                        content: c.content.clone(),
-                        normalized: c.normalized.clone(),
-                        chunk_type: c.chunk_type.clone(),
-                        start_line: c.start_line,
-                        end_line: c.end_line,
-                        embedding: emb_iter.next(),
-                    })
-                    .collect();
+                        chunk_idx: chunk.chunk_idx,
+                        content: chunk.content.clone(),
+                        normalized: chunk.normalized.clone(),
+                        chunk_type: chunk.chunk_type.clone(),
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        embedding: Some(emb),
+                    });
+                }
+            }
 
+            // 2d. Upsert file, chunks, edges, symbols, and manifest for each file.
+            for (fi, bf) in batch_files.iter().enumerate() {
+                let fc = bf.candidate;
+                let chunk_records = &chunk_records_per_file[fi];
                 let chunk_count = chunk_records.len();
                 result.total_chunks += chunk_count;
 
@@ -263,7 +332,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                     .await?;
 
                 if !chunk_records.is_empty() {
-                    self.backend.upsert_chunks(&chunk_records).await?;
+                    self.backend.upsert_chunks(chunk_records).await?;
                 }
 
                 let edge_records: Vec<EdgeRecord> = bf
@@ -283,13 +352,24 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                     self.backend.upsert_edges(&edge_records).await?;
                 }
 
+                if !bf.symbols.is_empty() {
+                    self.backend.upsert_symbols(&bf.symbols).await?;
+                }
+
                 self.manifest.upsert(&fc.rel_path, fc.mtime, fc.size, &bf.hash)?;
                 result.indexed_files += 1;
             }
-            // batch_files (and all content/embeddings within) drop here.
+            // batch_files and chunk_records_per_file drop here.
 
             self.manifest.complete_batch(&run_id, batch_idx)?;
             batch_idx += 1;
+        }
+
+        // Clean up stale pending rows from crashed prior runs.  Only reached
+        // after all current-run batches have successfully completed, so the
+        // reindexed files are committed before we retire the crash evidence.
+        for batch in &incomplete {
+            self.manifest.delete_batch(&batch.run_id, batch.batch_idx)?;
         }
 
         // Clean up completed batch records for this run.
@@ -305,6 +385,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         for path in &stale {
             self.backend.delete_chunks_for_file(path).await?;
             self.backend.delete_edges_for_file(path).await?;
+            self.backend.delete_symbols_for_file(path).await?;
             self.backend.delete_file(path).await?;
             self.manifest.remove(path)?;
         }

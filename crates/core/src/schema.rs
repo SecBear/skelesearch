@@ -56,7 +56,7 @@ pub struct SearchResult {
     /// Relative quality label: `"high"`, `"moderate"`, or `"low"`.
     /// Set by `Searcher`; empty string until shaped.
     pub match_quality: String,
-    /// Retrieval provenance: `"vector"`, `"fts"`, `"both"`, or `"imports <file>"`.
+    /// Retrieval provenance: `"vector"`, `"fts"`, or `"hybrid"`.
     /// Set by `Searcher`; empty string until shaped.
     pub why: String,
 }
@@ -147,17 +147,22 @@ impl CozoBackend {
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
-    /// Run a script, ignoring "relation already exists" style errors.
-    /// Used for idempotent `:create` and index-creation system commands.
-    fn run_mut_ignore(&self, script: &str, _skip_fragment: &str) -> anyhow::Result<()> {
+    /// Run a script, ignoring errors that indicate idempotent creation (e.g. schema
+    /// already set up). Intentionally narrow: only swallows messages that contain
+    /// "already exists" so we don't accidentally hide real conflicts such as
+    /// dimension mismatches or concurrent-write failures.
+    fn run_mut_ignore(&self, script: &str) -> anyhow::Result<()> {
         match self.run_mut(script, BTreeMap::new()) {
             Ok(_) => Ok(()),
             Err(e) => {
                 let msg = e.to_string().to_lowercase();
-                // CozoDB may say "already exists" or "conflicts with an existing one"
-                // depending on the operation. Both indicate the relation/index is already
-                // created — exactly what we want for idempotent initialization.
-                if msg.contains("already") || msg.contains("conflict") {
+                // Suppress errors that are unambiguously 'already created':
+                // - CozoDB returns "already exists" in some versions
+                // - CozoDB's :create returns "conflicts with an existing one"
+                //   when the relation already exists (e.g. double-initialize).
+                // Do NOT broaden this to a generic 'conflict' — that would hide
+                // real dimension-mismatch or concurrent-write failures.
+                if msg.contains("already exists") || msg.contains("conflicts with an existing one") {
                     Ok(())
                 } else {
                     Err(e)
@@ -232,6 +237,129 @@ impl CozoBackend {
             other => anyhow::bail!("expected Int, got {:?}", other),
         }
     }
+    /// Run FTS only and return raw tuples:
+    /// `(file_path, chunk_idx, bm25_score, content, chunk_type, start_line, end_line)`.
+    /// Results are ordered by bm25 score descending.
+    fn fts_search(
+        &self,
+        query_text: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, usize, f64, String, String, usize, usize)>> {
+        let script = format!(
+            r#"?[file_path, chunk_idx, bm25, content, chunk_type, start_line, end_line] :=
+    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: {limit}, bind_score: bm25 }},
+    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _]
+:order -bm25
+:limit {limit}"#
+        );
+        let mut p = BTreeMap::new();
+        p.insert("qs".into(), Self::dv_str(query_text));
+        let rows = match self.run_imm(&script, p) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no results") || msg.contains("empty") {
+                    return Ok(vec![]);
+                }
+                return Err(e);
+            }
+        };
+        rows.rows
+            .iter()
+            .map(|r| {
+                Ok((
+                    Self::str_col(&r[0])?,
+                    Self::int_col(&r[1])? as usize,
+                    match &r[2] {
+                        DataValue::Num(cozo::Num::Float(f)) => *f,
+                        DataValue::Num(cozo::Num::Int(i)) => *i as f64,
+                        _ => 0.0,
+                    },
+                    Self::str_col(&r[3])?,
+                    Self::str_col(&r[4])?,
+                    Self::int_col(&r[5])? as usize,
+                    Self::int_col(&r[6])? as usize,
+                ))
+            })
+            .collect()
+    }
+
+    /// Run HNSW vector search and return raw tuples:
+    /// `(file_path, chunk_idx, cosine_distance, content, chunk_type, start_line, end_line)`.
+    /// Results are ordered by cosine distance ascending (lower = more similar).
+    fn vector_search(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, usize, f64, String, String, usize, usize)>> {
+        let query_vec_dv: DataValue = {
+            let arr = ndarray::Array1::from(query_vec.to_vec());
+            DataValue::Vec(cozo::Vector::F32(arr))
+        };
+        let script = format!(
+            r#"?[file_path, chunk_idx, dist, content, chunk_type, start_line, end_line] :=
+    ~chunks:semantic{{ file_path, chunk_idx | query: $qv, k: {limit}, ef: 64, bind_distance: dist }},
+    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _]
+:order dist
+:limit {limit}"#
+        );
+        let mut p = BTreeMap::new();
+        p.insert("qv".into(), query_vec_dv);
+        let rows = match self.run_imm(&script, p) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no results") || msg.contains("empty") {
+                    return Ok(vec![]);
+                }
+                return Err(e);
+            }
+        };
+        rows.rows
+            .iter()
+            .map(|r| {
+                Ok((
+                    Self::str_col(&r[0])?,
+                    Self::int_col(&r[1])? as usize,
+                    match &r[2] {
+                        DataValue::Num(cozo::Num::Float(f)) => *f,
+                        DataValue::Num(cozo::Num::Int(i)) => *i as f64,
+                        _ => 0.0,
+                    },
+                    Self::str_col(&r[3])?,
+                    Self::str_col(&r[4])?,
+                    Self::int_col(&r[5])? as usize,
+                    Self::int_col(&r[6])? as usize,
+                ))
+            })
+            .collect()
+    }
+
+    /// FTS-only search fallback for when no embeddings exist.
+    /// Returns `SearchResult` rows with `why = "fts"`.
+    fn fts_only_search(
+        &self,
+        query_text: &str,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        self.fts_search(query_text, top_k)?
+            .into_iter()
+            .map(|(file_path, chunk_idx, score, content, chunk_type, start_line, end_line)| {
+                Ok(SearchResult {
+                    file_path,
+                    chunk_idx,
+                    content,
+                    start_line,
+                    end_line,
+                    chunk_type,
+                    score,
+                    match_quality: String::new(),
+                    why: "fts".to_string(),
+                })
+            })
+            .collect()
+    }
+
 }
 
 #[async_trait]
@@ -241,7 +369,6 @@ impl StorageBackend for CozoBackend {
         // Create the three base relations — idempotent via error message check.
         self.run_mut_ignore(
             ":create files { file_path: String => language: String, last_modified: Int, last_indexed: Int, chunk_count: Int }",
-            "already exists",
         )?;
 
         // The embedding field uses CozoDB's fixed-dimension vector type <F32; dim>.
@@ -249,29 +376,26 @@ impl StorageBackend for CozoBackend {
         let chunks_schema = format!(
             ":create chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
         );
-        self.run_mut_ignore(&chunks_schema, "already exists")?;
+        self.run_mut_ignore(&chunks_schema)?;
 
         self.run_mut_ignore(
             ":create code_edges { from_file: String, from_chunk: Int, to_file: String => edge_type: String, created_at: Int }",
-            "already exists",
         )?;
 
         // Create HNSW vector index — idempotent.
         let hnsw = format!(
-            "::hnsw create chunks:semantic {{ dim: {dim}, dtype: F32, fields: [embedding], distance: Cosine, m: 50, ef_construction: 20 }}"
+            "::hnsw create chunks:semantic {{ dim: {dim}, dtype: F32, fields: [embedding], distance: Cosine, m: 32, ef_construction: 128 }}"
         );
-        self.run_mut_ignore(&hnsw, "already exists")?;
+        self.run_mut_ignore(&hnsw)?;
 
         // Create FTS index — idempotent.
         self.run_mut_ignore(
             "::fts create chunks:text { extractor: normalized, tokenizer: Simple, filters: [Lowercase, AlphaNumOnly] }",
-            "already exists",
         )?;
 
         // Create symbols relation — idempotent.
         self.run_mut_ignore(
             ":create symbols { file_path: String, name: String, start_line: Int => kind: String, end_line: Int }",
-            "already exists",
         )?;
 
         Ok(())
@@ -494,7 +618,7 @@ impl StorageBackend for CozoBackend {
         query_str: &str,
         top_k: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        // Guard: if no chunks exist, HNSW search will fail on empty index.
+        // Guard: if no chunks exist, searches will fail on empty index.
         let count_rows = self.run_imm(
             "?[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]",
             BTreeMap::new(),
@@ -525,85 +649,78 @@ impl StorageBackend for CozoBackend {
             })
             .unwrap_or(0);
 
-        // Build the RRF query.  We use a union of two legs: vector (if embeddings
-        // exist) and FTS.  Results that appear in both legs receive a higher score.
-        let query_vec_dv: DataValue = {
-            let arr = ndarray::Array1::from(query_vec.to_vec());
-            DataValue::Vec(cozo::Vector::F32(arr))
-        };
-
-        let script = if emb_count > 0 {
-            format!(
-                r#"
-vec_scored[file_path, chunk_idx, score] :=
-    ~chunks:semantic{{ file_path, chunk_idx | query: $qv, k: 50, ef: 50, bind_distance: dist }},
-    score = 1.0 / (60.0 + dist * 50.0)
-fts_scored[file_path, chunk_idx, score] :=
-    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: 50, bind_score: bm25 }},
-    score = 1.0 / (60.0 + 1.0 / (bm25 + 0.001))
-rrf[fp, ci, sum(score)] := vec_scored[fp, ci, score]
-rrf[fp, ci, sum(score)] := fts_scored[fp, ci, score]
-?[rrf_score, file_path, chunk_idx, content, start_line, end_line, chunk_type] :=
-    rrf[fp, ci, rrf_score],
-    *chunks[fp, ci, content, _, chunk_type, start_line, end_line, _],
-    file_path = fp, chunk_idx = ci
-    :order -rrf_score
-    :limit {top_k}
-"#
-            )
-        } else {
+        if emb_count == 0 {
             // No embeddings yet — fall back to FTS only.
-            format!(
-                r#"
-fts_scored[file_path, chunk_idx, score] :=
-    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: 50, bind_score: bm25 }},
-    score = 1.0 / (60.0 + 1.0 / (bm25 + 0.001))
-?[rrf_score, file_path, chunk_idx, content, start_line, end_line, chunk_type] :=
-    fts_scored[fp, ci, rrf_score],
-    *chunks[fp, ci, content, _, chunk_type, start_line, end_line, _],
-    file_path = fp, chunk_idx = ci
-    :order -rrf_score
-    :limit {top_k}
-"#
-            )
-        };
+            return self.fts_only_search(query_str, top_k);
+        }
 
-        let mut p = BTreeMap::new();
-        p.insert("qv".into(), query_vec_dv);
-        p.insert("qs".into(), Self::dv_str(query_str));
+        // Fetch extra candidates from each leg so the fusion has material to rank.
+        let fetch_k = (top_k * 2).max(50);
 
-        let rows = match self.run_imm(&script, p) {
-            Ok(r) => r,
-            Err(e) => {
-                // FTS returns no results (not an error in all cozo versions) or
-                // the index is actually empty despite the count above — treat as
-                // empty rather than propagating a confusing error.
-                let msg = e.to_string();
-                if msg.contains("no results") || msg.contains("empty") {
-                    return Ok(vec![]);
-                }
-                return Err(e);
-            }
-        };
+        let fts_results = self.fts_search(query_str, fetch_k)?;
+        let vec_results = self.vector_search(query_vec, fetch_k)?;
 
-        rows.rows
-            .iter()
-            .map(|r| {
+        // Rank maps: (file_path, chunk_idx) -> 1-indexed rank.
+        // FTS: rank 1 = highest bm25 (results arrive score-descending).
+        // Vector: rank 1 = smallest distance (results arrive distance-ascending).
+        use std::collections::HashMap;
+        type ChunkKey = (String, usize);
+        type ChunkMeta = (String, String, usize, usize); // (content, chunk_type, start, end)
+
+        let mut chunk_meta: HashMap<ChunkKey, ChunkMeta> = HashMap::new();
+        let mut fts_rank: HashMap<ChunkKey, usize> = HashMap::new();
+        let mut vec_rank: HashMap<ChunkKey, usize> = HashMap::new();
+
+        for (rank, (fp, ci, _score, content, chunk_type, start_line, end_line)) in
+            fts_results.into_iter().enumerate()
+        {
+            let key = (fp, ci);
+            fts_rank.insert(key.clone(), rank + 1);
+            chunk_meta.entry(key).or_insert((content, chunk_type, start_line, end_line));
+        }
+        for (rank, (fp, ci, _dist, content, chunk_type, start_line, end_line)) in
+            vec_results.into_iter().enumerate()
+        {
+            let key = (fp, ci);
+            vec_rank.insert(key.clone(), rank + 1);
+            chunk_meta.entry(key).or_insert((content, chunk_type, start_line, end_line));
+        }
+
+        // RRF fusion: score = 0.55 / (60 + fts_rank) + 0.45 / (60 + vec_rank).
+        // Chunks absent from one list use sentinel rank 1000.
+        const SENTINEL: usize = 1000;
+
+        let mut scored: Vec<(f64, ChunkKey, ChunkMeta, &'static str)> = chunk_meta
+            .into_iter()
+            .map(|(key, meta)| {
+                let fr = fts_rank.get(&key).copied().unwrap_or(SENTINEL);
+                let vr = vec_rank.get(&key).copied().unwrap_or(SENTINEL);
+                let rrf = 0.55 / (60.0 + fr as f64) + 0.45 / (60.0 + vr as f64);
+                let why = match (fts_rank.contains_key(&key), vec_rank.contains_key(&key)) {
+                    (true, true) => "hybrid",
+                    (true, false) => "fts",
+                    (false, _) => "vector",
+                };
+                (rrf, key, meta, why)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+
+        scored
+            .into_iter()
+            .map(|(rrf, (file_path, chunk_idx), (content, chunk_type, start_line, end_line), why)| {
                 Ok(SearchResult {
-                    score: match &r[0] {
-                        DataValue::Num(cozo::Num::Float(f)) => *f,
-                        DataValue::Num(cozo::Num::Int(i)) => *i as f64,
-                        _ => 0.0,
-                    },
-                    file_path: Self::str_col(&r[1])?,
-                    chunk_idx: Self::int_col(&r[2])? as usize,
-                    content: Self::str_col(&r[3])?,
-                    start_line: Self::int_col(&r[4])? as usize,
-                    end_line: Self::int_col(&r[5])? as usize,
-                    chunk_type: Self::str_col(&r[6])?,
-                    // Filled in by Searcher after backend returns raw results.
+                    file_path,
+                    chunk_idx,
+                    content,
+                    start_line,
+                    end_line,
+                    chunk_type,
+                    score: rrf,
                     match_quality: String::new(),
-                    why: String::new(),
+                    why: why.to_string(),
                 })
             })
             .collect()

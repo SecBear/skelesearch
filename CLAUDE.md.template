@@ -1,6 +1,61 @@
 # Project: {{PROJECT_NAME}}
 
-Search with: `skelesearch search "<query>" --json`
-Results are candidates — read surrounding context before acting on them.
-Index: `skelesearch index .`
-Status: `skelesearch status --json`
+## Code search
+
+This project uses **skelesearch** — AST-aware semantic code search backed by tree-sitter
+chunking and CozoDB HNSW+BM25 hybrid retrieval.
+
+### Search
+
+```
+skelesearch search "<query>" [--limit N] [--json]
+```
+
+Results are **candidates**, not assertions. Always read the surrounding code before
+concluding a function does or does not do something. False positives occur when symbol
+names are similar across files.
+
+### Index
+
+```
+skelesearch index .
+```
+
+Run after a fresh clone, after large merges, or any time search results feel stale.
+The index lives in `.skelesearch/` at the project root.
+
+### Status
+
+```
+skelesearch status --json
+```
+
+Reports `indexed_files`, `total_chunks`, `last_indexed`, `estimated_stale`, and
+`watching` (true when `skelesearch watch` is running. Automatic file-change re-indexing is a v2 feature; in v1, watch mode keeps a sentinel process alive for hook detection).
+
+### When to re-index
+
+- After a fresh clone (no index exists yet).
+- After rebasing or merging large changesets.
+- When `estimated_stale` from `status --json` is high.
+- The `post-edit-reindex` hook handles incremental re-indexing automatically
+  when skelesearch is wired via the Claude Code plugin.
+
+## MCP tools (when running as MCP server)
+
+| Tool | Purpose |
+|------|---------|
+| `search_code` | Hybrid BM25+dense search; returns ranked chunks |
+| `smart_search` | Classifies query and selects best retrieval strategy — prefer this for ambiguous queries |
+| `find_symbol` | Look up function/struct/type definitions by exact or partial name |
+| `index_codebase` | Trigger indexing from within a Claude session |
+| `index_status` | Check whether the index is current |
+| `get_file_context` | Retrieve all chunks and import edges for a specific file |
+
+Start with `smart_search` when you are unsure which strategy fits. Fall back to
+`search_code` with `include_graph: true` to pull in import-graph neighbours.
+
+If the project is not yet indexed, call `index_codebase` with the project root path
+before running any search tool.
+
+For MCP server setup, see `docs/quickstart.md`.

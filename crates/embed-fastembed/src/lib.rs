@@ -89,3 +89,30 @@ impl EmbedProvider for FastEmbedProvider {
         .context("embedding task panicked")?
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Provider factory
+// ---------------------------------------------------------------------------
+
+/// Build a [`FastEmbedProvider`] by name.
+///
+/// Only `"fastembed"` is currently supported.  Unknown names are rejected
+/// immediately with a clear error so callers learn exactly what went wrong
+/// rather than receiving a runtime panic.
+///
+/// # Errors
+/// Returns an error if the name is unrecognized or if the underlying
+/// model fails to initialize (see [`FastEmbedProvider::default`]).
+pub fn provider_from_name(name: &str) -> anyhow::Result<FastEmbedProvider> {
+    match name {
+        "fastembed" => {
+            FastEmbedProvider::default()
+                .map_err(|e| e.context("failed to initialise fastembed provider"))
+        }
+        other => anyhow::bail!(
+            "unknown embedding provider: '{}'. Supported providers: fastembed",
+            other
+        ),
+    }
+}

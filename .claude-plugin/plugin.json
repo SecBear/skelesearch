@@ -7,5 +7,11 @@
     "email": "bear@golden-neuron.dev"
   },
   "homepage": "https://github.com/golden-neuron/skelesearch",
-  "repository": "https://github.com/golden-neuron/skelesearch"
+  "repository": "https://github.com/golden-neuron/skelesearch",
+  "hooks": {
+    "post_file_edit": "hooks/post-edit-reindex"
+  },
+  "setup": {
+    "hint": "See docs/quickstart.md for build, MCP config, and first-run indexing instructions."
+  }
 }

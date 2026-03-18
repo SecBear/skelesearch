@@ -260,6 +260,20 @@ impl ManifestStore {
         Ok(rows)
     }
 
+    /// Delete a single batch row by (run_id, batch_idx), regardless of status.
+    ///
+    /// Used by crash recovery: once a prior crashed run's files have been
+    /// successfully reindexed in a new run, we retire the stale pending row so
+    /// it never shows up in future `find_incomplete_batches` queries.
+    pub fn delete_batch(&self, run_id: &str, batch_idx: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "DELETE FROM index_progress WHERE run_id = ?1 AND batch_idx = ?2",
+            params![run_id, batch_idx],
+        )?;
+        Ok(())
+    }
+
     /// Remove all completed batch records for a run.
     pub fn clear_completed_batches(&self, run_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
