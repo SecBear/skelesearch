@@ -1,23 +1,24 @@
 [workspace]
-members = [
-    "crates/core",
-    "crates/embed-fastembed",
-    "crates/mcp",
-    "crates/cli",
-]
+members = ["crates/core", "crates/embed-fastembed", "crates/mcp", "crates/cli"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+authors = ["bear <bear@golden-neuron.dev>"]
+homepage = "https://github.com/golden-neuron/skelesearch"
+repository = "https://github.com/golden-neuron/skelesearch"
 
 [workspace.dependencies]
 # Storage
 # Default: storage-sqlite (fast compile, persistent, full feature parity for dev)
 # Release: override in crate Cargo.toml with features = ["storage-rocksdb"]
 # or: cargo build --features skelesearch-core/storage-rocksdb
-cozo = { version = "0.7.6", default-features = false, features = ["storage-sqlite", "rayon"] }
+cozo = { version = "0.7.6", default-features = false, features = [
+   "storage-sqlite",
+   "rayon",
+] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Tree-sitter
