@@ -216,6 +216,30 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             .hybrid_search(&query_vec, &bm25_query, top_k)
             .await?;
 
+        // PageRank boost: structurally important files get a mild score uplift.
+        // Log-dampened to prevent hub files from dominating all queries.
+        // Applied before graph augmentation so expanded hits inherit consistent scaling.
+        {
+            let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
+            let ranks = self.backend.get_file_ranks(&file_paths).await.unwrap_or_default();
+            if !ranks.is_empty() {
+                let median = {
+                    let mut vals: Vec<f64> =
+                        ranks.values().copied().filter(|v| *v > 0.0).collect();
+                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    if vals.is_empty() { 1.0 } else { vals[vals.len() / 2] }
+                };
+                for hit in &mut hits {
+                    if let Some(&pr) = ranks.get(&hit.file_path) {
+                        if pr > 0.0 {
+                            let boost = 1.0 + 0.3 * (1.0 + pr / median).ln();
+                            hit.score *= boost;
+                        }
+                    }
+                }
+            }
+        }
+
         if hits.is_empty() {
             return Ok(vec![]);
         }

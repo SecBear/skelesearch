@@ -115,6 +115,13 @@ pub trait StorageBackend: Send + Sync {
     /// Fetch stored embedding vectors for specific chunks.
     /// Returns embeddings in the same order as `keys`. Missing chunks yield a zero vector.
     async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>>;
+
+    /// Compute PageRank over the file-level import graph and store results.
+    async fn compute_pagerank(&self) -> anyhow::Result<()>;
+
+    /// Retrieve PageRank scores for the given file paths.
+    /// Returns a HashMap; files not in the graph get score 0.0.
+    async fn get_file_ranks(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +409,11 @@ impl StorageBackend for CozoBackend {
         // Create symbols relation — idempotent.
         self.run_mut_ignore(
             ":create symbols { file_path: String, name: String, start_line: Int => kind: String, end_line: Int }",
+        )?;
+
+        // Create file_ranks relation for PageRank scores — idempotent.
+        self.run_mut_ignore(
+            ":create file_ranks { file_path: String => pagerank: Float }",
         )?;
 
         Ok(())
@@ -894,6 +906,128 @@ impl StorageBackend for CozoBackend {
         }
         Ok(result)
     }
+
+    async fn compute_pagerank(&self) -> anyhow::Result<()> {
+        // Extract file-level edges from CozoDB, compute PageRank in Rust,
+        // and store results back.  CozoDB's built-in PageRank requires the
+        // `graph-algo` feature which has a broken dependency (graph_builder
+        // vs rayon incompatibility).  This pure-Rust implementation avoids
+        // that while CozoDB development is stalled (see ADR-002).
+
+        // 1. Extract unique directed edges: from_file -> to_file
+        let edge_rows = self.run_imm(
+            "?[f, t] := *code_edges[f, _, t, _, _]",
+            BTreeMap::new(),
+        )?;
+
+        let mut node_to_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut id_to_node: Vec<String> = Vec::new();
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+
+        for row in &edge_rows.rows {
+            if let (DataValue::Str(from), DataValue::Str(to)) = (&row[0], &row[1]) {
+                let from_s = from.to_string();
+                let to_s = to.to_string();
+                let from_id = *node_to_id.entry(from_s.clone()).or_insert_with(|| {
+                    let id = id_to_node.len();
+                    id_to_node.push(from_s);
+                    id
+                });
+                let to_id = *node_to_id.entry(to_s.clone()).or_insert_with(|| {
+                    let id = id_to_node.len();
+                    id_to_node.push(to_s);
+                    id
+                });
+                edges.push((from_id, to_id));
+            }
+        }
+
+        let n = id_to_node.len();
+        if n == 0 {
+            // Empty graph — clear file_ranks and return.
+            let _ = self.run_mut(
+                ":replace file_ranks { file_path => pagerank }",
+                BTreeMap::new(),
+            );
+            return Ok(());
+        }
+
+        // 2. Build adjacency: out_degree[from] and inbound[to] = vec of from nodes.
+        let mut out_degree = vec![0usize; n];
+        let mut inbound: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &(from, to) in &edges {
+            out_degree[from] += 1;
+            inbound[to].push(from);
+        }
+
+        // 3. Power iteration.
+        let damping = 0.85_f64;
+        let epsilon = 0.0001_f64;
+        let max_iter = 20;
+        let n_f = n as f64;
+        let mut rank = vec![1.0 / n_f; n];
+        let mut new_rank = vec![0.0_f64; n];
+
+        for _ in 0..max_iter {
+            let sink_rank: f64 = rank.iter().enumerate()
+                .filter(|(i, _)| out_degree[*i] == 0)
+                .map(|(_, r)| r)
+                .sum();
+
+            for i in 0..n {
+                let mut incoming_sum = 0.0_f64;
+                for &src in &inbound[i] {
+                    incoming_sum += rank[src] / out_degree[src] as f64;
+                }
+                new_rank[i] = (1.0 - damping) / n_f
+                    + damping * (incoming_sum + sink_rank / n_f);
+            }
+
+            let delta: f64 = rank.iter().zip(new_rank.iter())
+                .map(|(old, new)| (old - new).abs())
+                .sum();
+
+            std::mem::swap(&mut rank, &mut new_rank);
+
+            if delta < epsilon {
+                break;
+            }
+        }
+
+        // 4. Store results back into CozoDB.
+        //    Build a single :replace query with all scores.
+        let data_rows: Vec<String> = id_to_node.iter().enumerate()
+            .map(|(i, path)| format!("[\"{}\" , {}]", path.replace('"', "\\\""), rank[i]))
+            .collect();
+        let script = format!(
+            "?[file_path, pagerank] <- [{}]\n:replace file_ranks {{ file_path => pagerank }}",
+            data_rows.join(", ")
+        );
+        self.run_mut(&script, BTreeMap::new())?;
+        Ok(())
+    }
+
+    async fn get_file_ranks(
+        &self,
+        file_paths: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+        if file_paths.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = self.run_imm(
+            "?[file_path, pagerank] := *file_ranks[file_path, pagerank]",
+            BTreeMap::new(),
+        )?;
+        let mut ranks = std::collections::HashMap::new();
+        for row in &rows.rows {
+            if let (DataValue::Str(fp), DataValue::Num(cozo::Num::Float(pr))) =
+                (&row[0], &row[1])
+            {
+                ranks.insert(fp.to_string(), *pr);
+            }
+        }
+        Ok(ranks)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -976,5 +1110,16 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
     }
     async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> {
         (**self).get_chunk_embeddings(keys).await
+    }
+
+    async fn compute_pagerank(&self) -> anyhow::Result<()> {
+        (**self).compute_pagerank().await
+    }
+
+    async fn get_file_ranks(
+        &self,
+        file_paths: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+        (**self).get_file_ranks(file_paths).await
     }
 }
