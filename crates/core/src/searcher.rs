@@ -40,6 +40,29 @@ const STOP_WORDS: &[&str] = &[
 /// Extract significant keywords from a natural language query.
 /// Returns the original query plus deduplicated keywords, giving BM25
 /// more signal for term matching.
+/// Sanitize a query string for CozoDB's FTS mini-language.
+///
+/// The FTS index uses `tokenizer: Simple, filters: [Lowercase, AlphaNumOnly]`,
+/// so indexed tokens are lowercase alphanumeric only.  The query string must
+/// match: strip non-alphanumeric characters (replace with space), collapse
+/// whitespace, and remove FTS reserved keywords (`AND`, `OR`, `NOT`, `NEAR`)
+/// that the LLM expander or user query might inject.
+fn sanitize_fts_query(query: &str) -> String {
+    // Replace non-alphanumeric, non-whitespace chars with space.
+    let cleaned: String = query
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect();
+
+    // Split into tokens, drop FTS reserved keywords and single-char noise.
+    cleaned
+        .split_whitespace()
+        .filter(|t| t.len() > 1)
+        .filter(|t| !matches!(t.to_uppercase().as_str(), "AND" | "OR" | "NOT" | "NEAR"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn expand_query(query: &str) -> String {
     let keywords: Vec<&str> = query
         .split_whitespace()
@@ -141,6 +164,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         if !expanded_keywords.is_empty() {
             bm25_query = format!("{} {}", bm25_query, expanded_keywords.join(" "));
         }
+
+        // Sanitize before sending to CozoDB FTS — strip dots, hyphens, and
+        // other special characters that break the FTS query mini-language.
+        let bm25_query = sanitize_fts_query(&bm25_query);
 
         let mut hits = self
             .backend
@@ -486,7 +513,7 @@ fn is_test_file(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_test_file;
+    use super::{is_test_file, sanitize_fts_query, expand_query};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -538,5 +565,93 @@ mod tests {
         assert!(!is_test_file("README.md"));
         // File named "tester.rs" — stem is "tester", not a match.
         assert!(!is_test_file("src/tester.rs"));
+    }
+
+    // --- sanitize_fts_query tests ---
+
+    #[test]
+    fn sanitize_strips_dots_and_hyphens() {
+        // LLM expansion produces "JSON.stringify" and "key-value" which
+        // break CozoDB FTS query parsing.
+        assert_eq!(
+            sanitize_fts_query("JSON.stringify key-value"),
+            "JSON stringify key value"
+        );
+    }
+
+    #[test]
+    fn sanitize_removes_fts_reserved_keywords() {
+        // "AND", "OR", "NOT" are CozoDB FTS operators.
+        assert_eq!(
+            sanitize_fts_query("hello AND world OR bye NOT gone"),
+            "hello world bye gone"
+        );
+        // Case-insensitive matching of reserved words.
+        assert_eq!(
+            sanitize_fts_query("find and connect or disconnect"),
+            "find connect disconnect"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_queries() {
+        assert_eq!(
+            sanitize_fts_query("error handling middleware"),
+            "error handling middleware"
+        );
+    }
+
+    #[test]
+    fn sanitize_handles_special_chars_from_code() {
+        // Parens, brackets, asterisks, carets, slashes — all FTS syntax.
+        assert_eq!(
+            sanitize_fts_query("foo() => bar[0] + baz*"),
+            "foo bar baz"
+        );
+    }
+
+    #[test]
+    fn sanitize_collapses_whitespace() {
+        assert_eq!(
+            sanitize_fts_query("  hello   world  "),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_single_char_tokens() {
+        // After stripping punctuation, leftover single chars are noise.
+        assert_eq!(
+            sanitize_fts_query("a + b = c"),
+            ""
+        );
+    }
+
+    #[test]
+    fn sanitize_near_with_slash() {
+        // NEAR/3(...) is FTS syntax — slashes and parens stripped,
+        // NEAR removed as reserved.
+        assert_eq!(
+            sanitize_fts_query("NEAR/3(hello world)"),
+            "hello world"
+        );
+    }
+
+    // --- expand_query tests ---
+
+    #[test]
+    fn expand_query_deduplicates_keywords() {
+        let result = expand_query("how does error handling work");
+        // "how", "does", "work" are stop words; only "error" and "handling" extracted.
+        assert!(result.contains("error"));
+        assert!(result.contains("handling"));
+    }
+
+    #[test]
+    fn expand_query_noop_for_all_keywords() {
+        // When every word is already a keyword (no stop words removed),
+        // the query passes through unchanged.
+        let result = expand_query("error handling middleware");
+        assert_eq!(result, "error handling middleware");
     }
 }
