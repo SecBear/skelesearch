@@ -16,6 +16,7 @@ watch = ["skelesearch-core/watch"]
 skelesearch-core = { path = "../core" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 skelesearch-embed-openai = { path = "../embed-openai" }
+skelesearch-rerank-api = { path = "../rerank-api" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

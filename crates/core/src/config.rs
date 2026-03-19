@@ -21,11 +21,36 @@ pub struct IndexConfig {
 #[serde(default)]
 pub struct SearchConfig {
     pub default_top_k: usize,
+    /// Reranker configuration.
+    #[serde(default)]
+    pub reranker: RerankerConfig,
+    /// Query expansion configuration.
+    #[serde(default)]
+    pub expansion: ExpansionConfig,
 }
 
-impl Default for Config {
+/// Reranker configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RerankerConfig {
+    /// Reranker provider: "jina", "cohere", "voyage", or absent for auto-detect.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Environment variable name for the API key (default: auto-detect per provider).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+/// Query expansion configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExpansionConfig {
+    /// Enable LLM query expansion.  Absent = auto-detect from OPENAI_API_KEY.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl Default for SearchConfig {
     fn default() -> Self {
-        Self { index: IndexConfig::default(), search: SearchConfig::default() }
+        Self { default_top_k: 5, reranker: RerankerConfig::default(), expansion: ExpansionConfig::default() }
     }
 }
 
@@ -35,9 +60,9 @@ impl Default for IndexConfig {
     }
 }
 
-impl Default for SearchConfig {
+impl Default for Config {
     fn default() -> Self {
-        Self { default_top_k: 5 }
+        Self { index: IndexConfig::default(), search: SearchConfig::default() }
     }
 }
 

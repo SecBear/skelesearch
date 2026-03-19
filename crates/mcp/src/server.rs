@@ -23,7 +23,7 @@ use rmcp::{
     model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
-use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, Indexer, ManifestStore, QueryStrategy, Searcher, StorageBackend};
+use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, StorageBackend};
 use skelesearch_embed_fastembed::{FastEmbedProvider, provider_from_name};
 
 use crate::tools::{
@@ -197,6 +197,40 @@ impl SkeleSearchServer {
         hasher.finish()
     }
 
+    /// Auto-detect available API keys and configure the search pipeline.
+    /// Called once per search — cheap (just env var lookups), no memoization needed.
+    fn auto_configure_pipeline(&self) -> (Option<Box<dyn QueryExpander>>, Option<Box<dyn Reranker>>) {
+        let expander: Option<Box<dyn QueryExpander>> =
+            std::env::var("OPENAI_API_KEY").ok()
+                .filter(|k| !k.is_empty())
+                .map(|key| -> Box<dyn QueryExpander> {
+                    Box::new(LLMExpander::new(key))
+                });
+
+        // Try reranker keys in order: JINA_API_KEY, COHERE_API_KEY.
+        let reranker: Option<Box<dyn Reranker>> = None
+            .or_else(|| {
+                std::env::var("JINA_API_KEY").ok()
+                    .filter(|k| !k.is_empty())
+                    .and_then(|key| skelesearch_rerank_api::reranker_from_name("jina", key).ok())
+                    .map(|r| -> Box<dyn Reranker> { Box::new(r) })
+            })
+            .or_else(|| {
+                std::env::var("COHERE_API_KEY").ok()
+                    .filter(|k| !k.is_empty())
+                    .and_then(|key| skelesearch_rerank_api::reranker_from_name("cohere", key).ok())
+                    .map(|r| -> Box<dyn Reranker> { Box::new(r) })
+            });
+
+        if expander.is_some() {
+            tracing::info!("query expansion enabled (OPENAI_API_KEY detected)");
+        }
+        if reranker.is_some() {
+            tracing::info!("reranking enabled (API key detected)");
+        }
+
+        (expander, reranker)
+    }
 
     /// Semantic + FTS hybrid search.
     ///
@@ -208,11 +242,15 @@ impl SkeleSearchServer {
     ) -> anyhow::Result<Vec<SearchCodeRow>> {
         let provider = self.prepare_search_provider().await?;
         let searcher = Searcher::new(Arc::clone(&self.backend), provider);
+        let (expander, reranker) = self.auto_configure_pipeline();
+        let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
+        let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
         let top_k = input.top_k.max(1);
+        let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
         let start = std::time::Instant::now();
         let mut results = searcher
-            .search(&input.query, top_k, input.include_graph, max_depth, input.diversity, input.max_tokens)
+            .search(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
             .await?;
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, results = results.len(), "search_code complete");
 
@@ -402,6 +440,7 @@ impl SkeleSearchServer {
         &self,
         input: SmartSearchInput,
     ) -> anyhow::Result<SmartSearchOutput> {
+        let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
         let strategy = classify_query(&input.query);
         let results = match &strategy {
             QueryStrategy::Grep => {
@@ -446,7 +485,7 @@ impl SkeleSearchServer {
                         include_graph: input.include_graph,
                         max_depth: None,
                         diversity: input.diversity,
-                        max_tokens: input.max_tokens,
+                        max_tokens,
                         // branch_scope and session_id are forwarded to search_code
                         branch_scope: input.branch_scope,
                         session_id: input.session_id.clone(),
@@ -532,15 +571,7 @@ impl SkeleSearchServer {
 
 #[tool_router]
 impl SkeleSearchServer {
-    /// Semantic and full-text hybrid search over the indexed codebase.
-    ///
-    /// Requires the codebase to be indexed first via `index_codebase`.
-    /// Results are candidate chunks ranked by relevance — not guaranteed to be
-    /// the exact match, but the closest the index can find.
-    ///
-    /// `include_graph` is accepted but graph augmentation is disabled in v1.2;
-    /// set it to `false` for now.
-    /// Returns an error when the index is empty.
+    /// Hybrid semantic + keyword code search. Returns ranked code blocks.
     #[tool(name = "search_code")]
     async fn mcp_search_code(
         &self,
@@ -552,13 +583,7 @@ impl SkeleSearchServer {
             .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
     }
 
-    /// Index a codebase directory at `path` using the chosen embedding provider.
-    ///
-    /// Walks all source files under `path`, splits them into chunks, embeds each
-    /// chunk, and stores the results in the local index.  The only supported
-    /// provider in v1 is `"fastembed"` (default; runs locally, no API key needed).
-    /// Re-run after large code changes — the index is not updated automatically
-    /// unless the `watch` command is running.
+    /// Index a directory for code search. Run once, updates incrementally.
     #[tool(name = "index_codebase")]
     async fn mcp_index_codebase(
         &self,
@@ -570,11 +595,7 @@ impl SkeleSearchServer {
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Report whether an index exists and provide basic counts.
-    ///
-    /// Returns `indexed_files`, `total_chunks`, an RFC 3339 `last_indexed`
-    /// timestamp (or `null` if never indexed), and `estimated_stale` (v1: always 0).
-    /// Call this before `search_code` to confirm the index is populated.
+    /// Check if the code index exists and is current.
     #[tool(name = "index_status")]
     async fn mcp_index_status(
         &self,
@@ -586,11 +607,7 @@ impl SkeleSearchServer {
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Return indexed chunks, import metadata, and reverse-import metadata for a specific file.
-    ///
-    /// Returns the raw stored chunks for `file_path` plus the list of files it
-    /// imports (`imports`) and the list of files that import it (`imported_by`).
-    /// Returns empty lists when the file is not in the index rather than an error.
+    /// Get all indexed chunks and import graph for a specific file.
     #[tool(name = "get_file_context")]
     async fn mcp_get_file_context(
         &self,
@@ -602,13 +619,7 @@ impl SkeleSearchServer {
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Auto-route the query to grep or semantic search based on its shape.
-    ///
-    /// Keyword-shaped or pattern queries (identifiers, regex-like strings) are
-    /// dispatched to grep for exact matches.  Natural-language queries are sent
-    /// to the semantic search path (equivalent to `search_code`).  The response
-    /// includes a `strategy` field (`"grep"` or `"semantic"`) so callers can
-    /// see which path was taken.
+    /// Find code by concept or keyword. Auto-routes to best search strategy.
     #[tool(name = "smart_search")]
     async fn mcp_smart_search(
         &self,
@@ -620,12 +631,7 @@ impl SkeleSearchServer {
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Exact-name symbol lookup with optional kind filter.
-    ///
-    /// Searches the symbol table for definitions whose name matches `name`
-    /// exactly (case-sensitive).  Supply `kind` (e.g. `"function"`, `"struct"`,
-    /// `"class"`) to narrow results to a specific symbol kind.
-    /// Returns file path, start/end lines, and kind for each match.
+    /// Look up a symbol definition by exact name.
     #[tool(name = "find_symbol")]
     async fn mcp_find_symbol(
         &self,
@@ -643,8 +649,10 @@ impl ServerHandler for SkeleSearchServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "skelesearch — semantic code search. \
-                 Use index_codebase first, then search_code to find relevant code."
+                "skelesearch -- code search for agents. Use smart_search to find code by concept or keyword. \
+                 Results are ranked code blocks with file paths and line numbers. \
+                 Set max_tokens to control output size (default: 8192). \
+                 Set session_id to avoid seeing the same results twice."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

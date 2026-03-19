@@ -214,6 +214,53 @@ async fn run_search(
     backend.initialize(dim).await?;
 
     let searcher = Searcher::new(backend, provider);
+
+    // Load project config (falls back to defaults if .skelesearch.toml absent).
+    let config = Config::load(&root).unwrap_or_default();
+
+    // Auto-configure query expansion: skip if explicitly disabled in config,
+    // otherwise attach LLMExpander when OPENAI_API_KEY is available.
+    let searcher = match config.search.expansion.enabled {
+        Some(false) => searcher,
+        _ => match std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()) {
+            Some(key) => searcher.with_expander(Box::new(skelesearch_core::LLMExpander::new(key))),
+            None => searcher,
+        },
+    };
+
+    // Auto-configure reranker: explicit config wins; fall back to env-var auto-detect.
+    let searcher = if let Some(ref provider_name) = config.search.reranker.provider {
+        let key_env = config.search.reranker.api_key_env.as_deref().unwrap_or(
+            match provider_name.as_str() {
+                "jina"   => "JINA_API_KEY",
+                "cohere" => "COHERE_API_KEY",
+                "voyage" => "VOYAGE_API_KEY",
+                _        => "RERANKER_API_KEY",
+            },
+        );
+        match std::env::var(key_env).ok().filter(|k| !k.is_empty()) {
+            Some(key) => match skelesearch_rerank_api::reranker_from_name(provider_name, key) {
+                Ok(r)  => searcher.with_reranker(Box::new(r)),
+                Err(e) => { tracing::warn!("reranker init failed: {e}"); searcher }
+            },
+            None => {
+                tracing::warn!("reranker configured as '{provider_name}' but {key_env} not set");
+                searcher
+            }
+        }
+    } else {
+        // No explicit config — auto-detect from env vars (Jina first, then Cohere).
+        let auto = std::env::var("JINA_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("jina", k))
+            .or_else(|| std::env::var("COHERE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("cohere", k)));
+        match auto {
+            Some((name, key)) => match skelesearch_rerank_api::reranker_from_name(name, key) {
+                Ok(r)  => searcher.with_reranker(Box::new(r)),
+                Err(_) => searcher,
+            },
+            None => searcher,
+        }
+    };
+
     let start = std::time::Instant::now();
     let mut results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity, max_tokens).await.unwrap_or_default();
     let elapsed = start.elapsed();
