@@ -1,0 +1,219 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://skelesearch/benchmarks/schemas/eval-run.schema.json",
+  "title": "EvalRun",
+  "description": "Normalized artifact produced by one benchmark cell: one tool × one repo × one profile × one eval set.",
+  "type": "object",
+  "required": [
+    "tool",
+    "tool_version",
+    "binary",
+    "repo_id",
+    "repo_path",
+    "profile",
+    "eval_set",
+    "started_at",
+    "duration_ms",
+    "index",
+    "aggregate",
+    "cases",
+    "environment"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "tool": {
+      "type": "string",
+      "description": "Name of the search tool being evaluated.",
+      "examples": ["skelesearch"]
+    },
+    "tool_version": {
+      "type": "string",
+      "description": "Version string for the tool binary. Prefer 'git:<short-sha>' when inside a git repo.",
+      "examples": ["git:3ac6fcd", "0.1.0"]
+    },
+    "binary": {
+      "type": "string",
+      "description": "Path to the binary that was executed.",
+      "examples": ["./target/release/skelesearch"]
+    },
+    "repo_id": {
+      "type": "string",
+      "description": "Logical identifier for the repository (from benchmarks/manifests/repos.toml).",
+      "examples": ["mini-redis", "hono"]
+    },
+    "repo_path": {
+      "type": "string",
+      "description": "Absolute or project-relative path to the repository root.",
+      "examples": ["benchmarks/repos/mini-redis"]
+    },
+    "repo_sha": {
+      "type": ["string", "null"],
+      "description": "Git commit SHA at the HEAD of the repo at run time. Null when not resolvable.",
+      "examples": ["a1b2c3d4e5f6"]
+    },
+    "profile": {
+      "type": "string",
+      "description": "Path to the benchmark profile TOML that was applied.",
+      "examples": ["benchmarks/configs/voyage-full.toml"]
+    },
+    "eval_set": {
+      "type": "string",
+      "description": "Path to the eval set JSON used for this run.",
+      "examples": ["benchmarks/cases/rust/mini-redis.json"]
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp when the run began."
+    },
+    "duration_ms": {
+      "type": "number",
+      "description": "Wall-clock duration of the full run in milliseconds.",
+      "minimum": 0
+    },
+    "index": {
+      "$ref": "#/$defs/IndexStats"
+    },
+    "aggregate": {
+      "$ref": "#/$defs/AggregateMetrics"
+    },
+    "cases": {
+      "type": "array",
+      "description": "Per-query evaluation results.",
+      "items": {
+        "$ref": "#/$defs/CaseResult"
+      }
+    },
+    "environment": {
+      "$ref": "#/$defs/Environment"
+    }
+  },
+  "$defs": {
+    "IndexStats": {
+      "type": "object",
+      "description": "Statistics reported by 'skelesearch status --json' after indexing.",
+      "required": ["indexed_files", "total_chunks"],
+      "additionalProperties": false,
+      "properties": {
+        "indexed_files": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of files indexed."
+        },
+        "total_chunks": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of semantic chunks stored."
+        },
+        "cache_hits": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Embedding cache hits during indexing. Null when not reported by the tool."
+        },
+        "cache_misses": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Embedding cache misses during indexing. Null when not reported by the tool."
+        },
+        "resolved_import_edges": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Number of import graph edges resolved. Null when graph indexing is disabled."
+        }
+      }
+    },
+    "AggregateMetrics": {
+      "type": "object",
+      "description": "Aggregate eval metrics across all cases, mirroring 'skelesearch eval --json' aggregate output.",
+      "required": ["mean_recall_at_5", "mean_recall_at_10", "mean_mrr", "total_cases"],
+      "additionalProperties": false,
+      "properties": {
+        "mean_recall_at_5": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Mean recall at rank 5 across all cases."
+        },
+        "mean_recall_at_10": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Mean recall at rank 10 across all cases."
+        },
+        "mean_mrr": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Mean reciprocal rank across all cases."
+        },
+        "total_cases": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of eval cases evaluated."
+        }
+      }
+    },
+    "CaseResult": {
+      "type": "object",
+      "description": "Per-query result from the eval run.",
+      "required": ["query", "recall_at_5", "recall_at_10", "mrr", "retrieved_files"],
+      "additionalProperties": true,
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The search query string."
+        },
+        "recall_at_5": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "recall_at_10": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "mrr": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "retrieved_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered list of file paths returned by the search."
+        }
+      }
+    },
+    "Environment": {
+      "type": "object",
+      "description": "Pipeline configuration inferred from the profile TOML and CLI flags.",
+      "required": ["provider"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Embedding provider used for indexing and search.",
+          "examples": ["voyage", "fastembed", "openai"]
+        },
+        "reranker": {
+          "type": ["string", "null"],
+          "description": "Reranker provider, or null if reranking is disabled.",
+          "examples": ["voyage", null]
+        },
+        "expansion": {
+          "type": ["boolean", "null"],
+          "description": "Whether LLM query expansion was enabled. Null when not specified in profile."
+        },
+        "graph": {
+          "type": "boolean",
+          "description": "Whether import graph traversal was enabled during search."
+        },
+        "symbol_enrichment": {
+          "type": "boolean",
+          "description": "Whether symbol enrichment was applied during indexing."
+        }
+      }
+    }
+  }
+}

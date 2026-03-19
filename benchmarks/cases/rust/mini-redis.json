@@ -1,0 +1,22 @@
+[
+  {
+    "query": "database storage TTL expiry keys values",
+    "expected_files": [
+      "src/db.rs"
+    ]
+  },
+  {
+    "query": "TCP connection framing reading bytes",
+    "expected_files": [
+      "src/connection.rs",
+      "src/frame.rs"
+    ]
+  },
+  {
+    "query": "graceful shutdown signal listener server",
+    "expected_files": [
+      "src/shutdown.rs",
+      "src/server.rs"
+    ]
+  }
+]
