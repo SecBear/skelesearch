@@ -44,6 +44,33 @@ Initial benchmark repos:
 - Python: `httpx`
 - Go: `cobra`
 
+## Eval case format
+
+Each eval file is a JSON array of cases. Each case has:
+- `query` — natural language search query
+- `expected_files` — ordered or unordered list of defensible target files
+- `category` — rough bucket (`symbol lookup`, `implementation lookup`, etc.)
+- `notes` — why those files are expected
+
+Example:
+
+```json
+[
+  {
+    "query": "How does graceful shutdown propagate from the server listener to active connection handlers",
+    "expected_files": ["src/server.rs", "src/shutdown.rs"],
+    "category": "architecture conceptual lookup",
+    "notes": "server::run creates the broadcast channel and shutdown.rs implements per-handler shutdown reception."
+  }
+]
+```
+
+Case quality rules:
+- validate expected files against the actual cloned repo
+- avoid trivia and purely lexical string-match cases
+- prefer 1-2 expected files; use 3 only when necessary
+- avoid hyphenated query tokens until the current FTS parser bug is fixed
+
 ## Workflow
 
 1. Clone/update repos from `manifests/repos.toml`

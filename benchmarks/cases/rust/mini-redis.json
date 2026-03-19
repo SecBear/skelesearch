@@ -1,22 +1,52 @@
 [
   {
-    "query": "database storage TTL expiry keys values",
+    "query": "Where is the Command enum defined and how are incoming frames dispatched to specific command handlers",
     "expected_files": [
-      "src/db.rs"
-    ]
+      "src/cmd/mod.rs"
+    ],
+    "category": "symbol lookup",
+    "notes": "Command enum and Command::from_frame dispatch logic live in cmd/mod.rs. The match arms delegate parsing to each command's parse_frames method."
   },
   {
-    "query": "TCP connection framing reading bytes",
+    "query": "How does the server handle per connection requests and apply commands to the database",
+    "expected_files": [
+      "src/server.rs"
+    ],
+    "category": "implementation lookup",
+    "notes": "Handler.run reads frames, parses Command via Command::from_frame, then applies it against Db and Connection."
+  },
+  {
+    "query": "How does the shared database store key value entries and expire them with TTLs",
+    "expected_files": [
+      "src/db.rs"
+    ],
+    "category": "implementation lookup",
+    "notes": "Db wraps Arc<Shared>; State holds entries, expirations, pub_sub, and a background purge task."
+  },
+  {
+    "query": "How does the subscribe command manage channel subscriptions and stream messages to the client",
+    "expected_files": [
+      "src/cmd/subscribe.rs"
+    ],
+    "category": "cross file relationship",
+    "notes": "Subscribe.apply builds a StreamMap of subscriptions and multiplexes messages with command handling and shutdown."
+  },
+  {
+    "query": "How does graceful shutdown propagate from the server listener to active connection handlers",
+    "expected_files": [
+      "src/server.rs",
+      "src/shutdown.rs"
+    ],
+    "category": "architecture conceptual lookup",
+    "notes": "server::run creates the broadcast channel; shutdown.rs implements per-handler shutdown reception."
+  },
+  {
+    "query": "How are Redis protocol frames parsed from raw bytes on a TCP connection",
     "expected_files": [
       "src/connection.rs",
       "src/frame.rs"
-    ]
-  },
-  {
-    "query": "graceful shutdown signal listener server",
-    "expected_files": [
-      "src/shutdown.rs",
-      "src/server.rs"
-    ]
+    ],
+    "category": "cross file relationship",
+    "notes": "Connection buffers socket reads and delegates RESP parsing/materialization to Frame."
   }
 ]

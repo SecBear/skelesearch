@@ -1,0 +1,55 @@
+[
+  {
+    "query": "Where is the main parse function implemented and how does it invoke schema validation",
+    "expected_files": [
+      "packages/zod/src/v4/core/parse.ts",
+      "packages/zod/src/v4/classic/parse.ts"
+    ],
+    "category": "implementation lookup",
+    "notes": "Core parse functions call schema._zod.run while classic parse wraps them for public API use."
+  },
+  {
+    "query": "How does zod implement object schema composition like pick omit merge and extend",
+    "expected_files": [
+      "packages/zod/src/v4/core/util.ts",
+      "packages/zod/src/v4/classic/schemas.ts"
+    ],
+    "category": "cross file relationship",
+    "notes": "Core utilities implement composition mechanics; classic schemas wires them into ZodObject methods."
+  },
+  {
+    "query": "Where are ZodError formatting functions like flatten format and treeify defined",
+    "expected_files": [
+      "packages/zod/src/v4/core/errors.ts"
+    ],
+    "category": "symbol lookup",
+    "notes": "The core error helpers are all defined in core/errors.ts."
+  },
+  {
+    "query": "How do optional and nullable wrappers work in the zod type system",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/classic/schemas.ts"
+    ],
+    "category": "implementation lookup",
+    "notes": "Core defines the wrapper schema types; classic exposes the user facing constructors and methods."
+  },
+  {
+    "query": "Where is the transform and pipe schema implemented for chaining validation steps",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/core/api.ts"
+    ],
+    "category": "architecture conceptual lookup",
+    "notes": "Transform, pipe, and codec types live in schemas while API factories build them."
+  },
+  {
+    "query": "How does zod define custom validation with refine and superRefine",
+    "expected_files": [
+      "packages/zod/src/v4/core/api.ts",
+      "packages/zod/src/v4/classic/schemas.ts"
+    ],
+    "category": "cross file relationship",
+    "notes": "Core factory functions implement refine behavior and classic schemas expose instance methods."
+  }
+]

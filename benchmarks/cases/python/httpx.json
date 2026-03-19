@@ -1,0 +1,51 @@
+[
+  {
+    "query": "How does the httpx Client send a request and handle redirects",
+    "expected_files": [
+      "httpx/_client.py"
+    ],
+    "category": "implementation lookup",
+    "notes": "Client.send delegates into the redirect handling loop in _client.py."
+  },
+  {
+    "query": "Where is the transport layer that manages connection pooling in httpx",
+    "expected_files": [
+      "httpx/_transports/default.py"
+    ],
+    "category": "architecture conceptual lookup",
+    "notes": "HTTPTransport and AsyncHTTPTransport wrap httpcore connection pools and proxy transports."
+  },
+  {
+    "query": "How does httpx implement digest authentication",
+    "expected_files": [
+      "httpx/_auth.py"
+    ],
+    "category": "implementation lookup",
+    "notes": "DigestAuth and _DigestAuthChallenge implement the challenge response flow."
+  },
+  {
+    "query": "What is the relationship between sync Client and AsyncClient in httpx",
+    "expected_files": [
+      "httpx/_client.py"
+    ],
+    "category": "cross file relationship",
+    "notes": "Both derive from BaseClient and split primarily at the send path."
+  },
+  {
+    "query": "Where are the Cookies and Request and Response model classes defined in httpx",
+    "expected_files": [
+      "httpx/_models.py"
+    ],
+    "category": "symbol lookup",
+    "notes": "Cookies, Request, and Response are all defined in _models.py."
+  },
+  {
+    "query": "How does httpx configure connection limits and TLS verification",
+    "expected_files": [
+      "httpx/_config.py",
+      "httpx/_transports/default.py"
+    ],
+    "category": "cross file relationship",
+    "notes": "Limits and TLS settings are defined in config and consumed by transport construction."
+  }
+]

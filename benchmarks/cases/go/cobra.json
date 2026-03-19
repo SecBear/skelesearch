@@ -1,0 +1,53 @@
+[
+  {
+    "query": "How does cobra execute a command and resolve subcommands from arguments",
+    "expected_files": [
+      "command.go"
+    ],
+    "category": "implementation lookup",
+    "notes": "ExecuteC is the main command resolution and execution path."
+  },
+  {
+    "query": "Where are persistent flags merged and inherited by child commands",
+    "expected_files": [
+      "command.go"
+    ],
+    "category": "cross file relationship",
+    "notes": "mergePersistentFlags and InheritedFlags implement command tree flag inheritance."
+  },
+  {
+    "query": "How does cobra render help text and usage output for a command",
+    "expected_files": [
+      "command.go",
+      "cobra.go"
+    ],
+    "category": "architecture conceptual lookup",
+    "notes": "command.go provides defaulting chains while cobra.go exposes template functions."
+  },
+  {
+    "query": "What positional argument validators does cobra provide",
+    "expected_files": [
+      "args.go"
+    ],
+    "category": "symbol lookup",
+    "notes": "args.go defines PositionalArgs and the built in validators."
+  },
+  {
+    "query": "How are mutually exclusive and required together flag groups validated",
+    "expected_files": [
+      "flag_groups.go"
+    ],
+    "category": "implementation lookup",
+    "notes": "Flag group annotations and runtime validation live in flag_groups.go."
+  },
+  {
+    "query": "Where is shell completion logic for generating bash and fish scripts",
+    "expected_files": [
+      "bash_completionsV2.go",
+      "fish_completions.go",
+      "completions.go"
+    ],
+    "category": "cross file relationship",
+    "notes": "The core completion engine lives in completions.go and shell specific script generation is split by target shell."
+  }
+]

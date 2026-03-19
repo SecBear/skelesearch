@@ -1,0 +1,54 @@
+[
+  {
+    "query": "Where is the main benchmark execution loop that runs warmup iterations and collects timing samples",
+    "expected_files": [
+      "src/benchmark/mod.rs"
+    ],
+    "category": "implementation lookup",
+    "notes": "Benchmark::run orchestrates warmup, sample collection, stats, and cleanup."
+  },
+  {
+    "query": "How does hyperfine measure wall clock and CPU time for a spawned command",
+    "expected_files": [
+      "src/timer/mod.rs",
+      "src/timer/unix_timer.rs"
+    ],
+    "category": "cross file relationship",
+    "notes": "execute_and_measure coordinates wall and CPU timers; unix_timer.rs implements child CPU timing via getrusage."
+  },
+  {
+    "query": "How does hyperfine detect and report statistical outliers in benchmark results",
+    "expected_files": [
+      "src/outlier_detection.rs",
+      "src/output/warnings.rs"
+    ],
+    "category": "cross file relationship",
+    "notes": "Modified Z score outlier detection feeds warning emission."
+  },
+  {
+    "query": "Where is shell spawning overhead calibrated and subtracted from measurements",
+    "expected_files": [
+      "src/benchmark/executor.rs"
+    ],
+    "category": "implementation lookup",
+    "notes": "ShellExecutor.calibrate measures empty shell cost and subtracts it from command timings."
+  },
+  {
+    "query": "How does parameter scan expand a numeric range into benchmark commands",
+    "expected_files": [
+      "src/parameter/range_step.rs",
+      "src/command.rs"
+    ],
+    "category": "cross file relationship",
+    "notes": "RangeStep validates and iterates values; command expansion builds the cross product into final commands."
+  },
+  {
+    "query": "How are benchmark results exported to JSON format",
+    "expected_files": [
+      "src/export/json.rs",
+      "src/export/mod.rs"
+    ],
+    "category": "architecture conceptual lookup",
+    "notes": "ExportManager registers exporters and JsonExporter serializes pretty JSON."
+  }
+]

@@ -1,0 +1,52 @@
+[
+  {
+    "query": "How does Hono dispatch an incoming request to the matched route handler",
+    "expected_files": [
+      "src/hono-base.ts"
+    ],
+    "category": "implementation lookup",
+    "notes": "The private dispatch method resolves the route, creates Context, and executes the middleware chain."
+  },
+  {
+    "query": "Where is middleware composition implemented and how does it call next",
+    "expected_files": [
+      "src/compose.ts"
+    ],
+    "category": "implementation lookup",
+    "notes": "compose.ts implements koa style recursive dispatch and guards against double next calls."
+  },
+  {
+    "query": "What is the Context class and how does it produce HTTP responses",
+    "expected_files": [
+      "src/context.ts"
+    ],
+    "category": "symbol lookup",
+    "notes": "Context wraps Request and exposes text/json/html/body/redirect/newResponse helpers."
+  },
+  {
+    "query": "How does the SmartRouter select between different router implementations",
+    "expected_files": [
+      "src/router/smart-router/router.ts"
+    ],
+    "category": "architecture lookup",
+    "notes": "SmartRouter tries candidate routers and selects the first that can build the route set."
+  },
+  {
+    "query": "How does the AWS Lambda adapter convert Lambda events to fetch requests",
+    "expected_files": [
+      "src/adapter/aws-lambda/handler.ts",
+      "src/adapter/aws-lambda/types.ts"
+    ],
+    "category": "cross file relationship",
+    "notes": "handler.ts maps API Gateway and related events into Request objects; types.ts defines adapter contracts."
+  },
+  {
+    "query": "How does the HTTPException class integrate with the error handler",
+    "expected_files": [
+      "src/http-exception.ts",
+      "src/hono-base.ts"
+    ],
+    "category": "cross file relationship",
+    "notes": "HTTPException exposes getResponse and the default error handler knows how to use it."
+  }
+]
