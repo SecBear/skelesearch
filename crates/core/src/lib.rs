@@ -31,3 +31,6 @@ pub mod symbols;
 pub use symbols::{extract_symbols, SymbolDef};
 pub mod expander;
 pub use expander::{LLMExpander, NoopExpander, QueryExpander};
+
+pub mod resolve;
+pub use resolve::{extract_import_path, resolver_for_extension, ImportResolver};
