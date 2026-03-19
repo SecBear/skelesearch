@@ -207,6 +207,16 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         let now = chrono::Utc::now().timestamp();
         let mut batch_idx = 0usize;
 
+        // Build the full set of known project-relative paths — current walk
+        // candidates plus files already in the index — so import resolvers can
+        // check membership without performing any filesystem I/O.
+        let indexed_paths = self.backend.list_indexed_paths().await?;
+        let all_files: HashSet<String> = candidates
+            .iter()
+            .map(|c| c.rel_path.clone())
+            .chain(indexed_paths.into_iter())
+            .collect();
+
         for batch in candidates.chunks(FILE_BATCH_SIZE) {
             // Write checkpoint before processing.
             let file_paths: Vec<&str> = batch.iter().map(|f| f.rel_path.as_str()).collect();
@@ -365,6 +375,27 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             // 2d. Upsert file, chunks, edges, symbols, and manifest for each file.
             for (fi, bf) in batch_files.iter().enumerate() {
                 let fc = bf.candidate;
+                // Enrich each chunk's normalized text with the names of symbols
+                // that overlap its line range, so BM25 queries using symbol names
+                // match the relevant chunk even when the name doesn't appear verbatim.
+                for cr in chunk_records_per_file[fi].iter_mut() {
+                    let overlapping: Vec<&crate::symbols::SymbolDef> = bf.symbols.iter()
+                        .filter(|s| !s.name.is_empty()
+                            && s.start_line <= cr.end_line
+                            && s.end_line >= cr.start_line)
+                        .collect();
+                    if !overlapping.is_empty() {
+                        let extra: String = overlapping.iter()
+                            .map(|s| format!("{} {}",
+                                crate::normalize_for_fts(&s.name), s.kind))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !extra.is_empty() {
+                            cr.normalized.push(' ');
+                            cr.normalized.push_str(&extra);
+                        }
+                    }
+                }
                 let chunk_records = &chunk_records_per_file[fi];
                 let chunk_count = chunk_records.len();
                 result.total_chunks += chunk_count;
@@ -383,22 +414,43 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                     self.backend.upsert_chunks(chunk_records).await?;
                 }
 
-                let edge_records: Vec<EdgeRecord> = bf
-                    .edges
-                    .iter()
-                    .map(|e| EdgeRecord {
+                // Resolve raw import captures to canonical project-relative paths.
+                // Unresolvable edges (external deps, unknown languages, parse
+                // failures) are silently dropped — only intra-project edges are stored.
+                let ext = std::path::Path::new(&fc.rel_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let edge_records: Vec<EdgeRecord> = bf.edges.iter().filter_map(|e| {
+                    // Strip language-specific syntax from the raw capture text.
+                    let clean = crate::resolve::extract_import_path(&e.to_file, ext)?;
+                    // Map the bare token to a project-relative path via the
+                    // language-specific resolver; returns None for external deps.
+                    let resolved = match crate::resolve::resolver_for_extension(ext) {
+                        Some(resolver) => {
+                            resolver.resolve(&clean, Path::new(&fc.rel_path), root, &all_files)?
+                        }
+                        None => return None, // no resolver registered for this language
+                    };
+                    Some(EdgeRecord {
                         from_file: e.from_file.clone(),
-                        // ImportEdge doesn't carry a chunk index; use 0 as a
-                        // sentinel — sufficient for v1 graph traversal.
+                        // ImportEdge carries no chunk index; 0 is a sentinel
+                        // sufficient for v1 graph traversal.
                         from_chunk: 0,
-                        to_file: e.to_file.clone(),
+                        to_file: resolved,
                         edge_type: "imports".into(),
                     })
-                    .collect();
+                }).collect();
 
                 if !edge_records.is_empty() {
                     self.backend.upsert_edges(&edge_records).await?;
                 }
+                tracing::info!(
+                    file = %fc.rel_path,
+                    total = bf.edges.len(),
+                    resolved = edge_records.len(),
+                    "import edges"
+                );
 
                 if !bf.symbols.is_empty() {
                     self.backend.upsert_symbols(&bf.symbols).await?;
