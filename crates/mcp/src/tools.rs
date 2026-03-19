@@ -36,6 +36,11 @@ pub struct SearchCodeInput {
     /// When true, scope results to files changed on the current git branch.
     #[serde(default)]
     pub branch_scope: bool,
+    /// Optional session ID for result deduplication across searches.
+    /// When set, results seen in previous searches with the same session ID
+    /// are deprioritized (moved to bottom of results).
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -151,6 +156,11 @@ pub struct SmartSearchInput {
     /// When true, scope results to files changed on the current git branch.
     #[serde(default)]
     pub branch_scope: bool,
+    /// Optional session ID for result deduplication across searches.
+    /// When set, results seen in previous searches with the same session ID
+    /// are deprioritized (moved to bottom of results).
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// A single grep result row returned by `smart_search` on the grep path.

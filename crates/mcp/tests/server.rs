@@ -221,6 +221,7 @@ async fn search_code_output_exposes_spec_fields() -> anyhow::Result<()> {
             diversity: 0.0,
             max_tokens: None,
             branch_scope: false,
+            session_id: None,
         })
         .await?;
     assert!(

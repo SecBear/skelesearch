@@ -52,6 +52,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
 toml = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

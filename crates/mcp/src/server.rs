@@ -13,7 +13,7 @@
 //     public method that tests can call directly.
 //   - Provider selection is explicit: unknown names return a clear error.
 
-use std::{path::PathBuf, sync::{Arc, RwLock}};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{Arc, Mutex, RwLock}};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -84,6 +84,9 @@ pub struct SkeleSearchServer {
     /// successful indexing run without requiring a full server restart.
     provider: Arc<RwLock<ArcProvider>>,
     tool_router: ToolRouter<Self>,
+    /// Tracks content hashes seen per session for dedup.
+    /// TODO: add periodic cleanup for long-running servers (sessions accumulate in memory).
+    sessions: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +117,7 @@ impl SkeleSearchServer {
             manifest_path: Arc::new(manifest_path.into()),
             provider: Arc::new(RwLock::new(ArcProvider::new(provider))),
             tool_router: Self::tool_router(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -166,6 +170,34 @@ impl SkeleSearchServer {
         Ok(arc_provider)
     }
 
+    // -----------------------------------------------------------------------
+    // Session dedup helpers
+    // -----------------------------------------------------------------------
+
+    /// Record that these content hashes were returned in this session.
+    fn record_seen(&self, session_id: &str, hashes: &[u64]) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            let seen = sessions.entry(session_id.to_string()).or_default();
+            seen.extend(hashes);
+        }
+    }
+
+    /// Return the set of content hashes seen so far in this session.
+    fn get_seen(&self, session_id: &str) -> HashSet<u64> {
+        self.sessions.lock()
+            .map(|s| s.get(session_id).cloned().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Stable hash of a chunk's full content string for session dedup.
+    fn content_hash(s: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
+    }
+
+
     /// Semantic + FTS hybrid search.
     ///
     /// Returns an error when the index is empty (via `prepare_search_provider`).
@@ -197,7 +229,7 @@ impl SkeleSearchServer {
             }
         }
 
-        Ok(results
+        let mut rows: Vec<SearchCodeRow> = results
             .into_iter()
             .map(|r| SearchCodeRow {
                 file_path: r.file_path,
@@ -208,7 +240,24 @@ impl SkeleSearchServer {
                 match_quality: r.match_quality,
                 why: r.why,
             })
-            .collect())
+            .collect();
+
+        // Session dedup: deprioritize (not exclude) content seen in prior searches.
+        if let Some(ref sid) = input.session_id {
+            let seen = self.get_seen(sid);
+            // Stable partition preserving score order within each group.
+            let (mut unseen, mut already_seen): (Vec<_>, Vec<_>) = rows
+                .into_iter()
+                .partition(|r| !seen.contains(&Self::content_hash(&r.content)));
+            unseen.append(&mut already_seen);
+            // Record every chunk returned (seen and unseen alike) so they are
+            // deprioritized on the next call in this session.
+            let hashes: Vec<u64> = unseen.iter().map(|r| Self::content_hash(&r.content)).collect();
+            self.record_seen(sid, &hashes);
+            rows = unseen;
+        }
+
+        Ok(rows)
     }
 
     /// Index the codebase at `input.path`.  Returns an error for unknown
@@ -398,8 +447,9 @@ impl SkeleSearchServer {
                         max_depth: None,
                         diversity: input.diversity,
                         max_tokens: input.max_tokens,
-                        // branch_scope is handled inside search_code
+                        // branch_scope and session_id are forwarded to search_code
                         branch_scope: input.branch_scope,
+                        session_id: input.session_id.clone(),
                     })
                     .await?;
                 SmartSearchResults::Semantic(rows)

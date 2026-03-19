@@ -3,8 +3,10 @@ members = [
    "crates/core",
    "crates/embed-fastembed",
    "crates/embed-openai",
+   "crates/embed-voyage",
    "crates/mcp",
    "crates/cli",
+   "crates/rerank-api",
 ]
 resolver = "2"
 

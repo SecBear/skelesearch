@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{reranker::{RerankCandidate, Reranker}, ChunkRecord, EmbedProvider, SearchResult, StorageBackend};
+use crate::{expander::QueryExpander, reranker::{RerankCandidate, Reranker}, ChunkRecord, EmbedProvider, SearchResult, StorageBackend};
 
 // ---------------------------------------------------------------------------
 // Public output types
@@ -70,11 +70,21 @@ pub struct Searcher<B, P> {
     /// Optional cross-encoder reranker applied after MMR and before the token
     /// budget filter.  `None` skips the stage (backwards-compatible default).
     reranker: Option<Box<dyn Reranker>>,
+    /// Optional LLM-based query expander that enriches conceptual queries with
+    /// code-vocabulary keywords before BM25 matching.  `None` skips expansion.
+    expander: Option<Box<dyn QueryExpander>>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     pub fn new(backend: Arc<B>, provider: P) -> Self {
-        Self { backend, provider, reranker: None }
+        Self { backend, provider, reranker: None, expander: None }
+    }
+
+    /// Attach an LLM-based query expander.  Called once at construction time;
+    /// the expander runs before BM25 keyword extraction for semantic queries.
+    pub fn with_expander(mut self, expander: Box<dyn QueryExpander>) -> Self {
+        self.expander = Some(expander);
+        self
     }
 
     /// Attach a cross-encoder reranker.  Called once at construction time;
@@ -112,10 +122,29 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             .next()
             .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
 
-        let expanded = expand_query(query);
+        // LLM-based query expansion for conceptual queries.
+        // Only runs when an expander is configured and the query looks conceptual.
+        // Failures degrade gracefully: expansion is skipped, search proceeds.
+        let expanded_keywords = if let Some(ref expander) = self.expander {
+            use crate::router::{classify_query, QueryStrategy};
+            if classify_query(query) == QueryStrategy::Semantic {
+                expander.expand(query).await.unwrap_or_default()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        // Merge LLM keywords into the BM25 query text.
+        let mut bm25_query = expand_query(query);
+        if !expanded_keywords.is_empty() {
+            bm25_query = format!("{} {}", bm25_query, expanded_keywords.join(" "));
+        }
+
         let mut hits = self
             .backend
-            .hybrid_search(&query_vec, &expanded, top_k)
+            .hybrid_search(&query_vec, &bm25_query, top_k)
             .await?;
 
         if hits.is_empty() {

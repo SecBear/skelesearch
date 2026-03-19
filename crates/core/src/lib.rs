@@ -29,3 +29,5 @@ pub mod router;
 pub use router::{classify_query, QueryStrategy};
 pub mod symbols;
 pub use symbols::{extract_symbols, SymbolDef};
+pub mod expander;
+pub use expander::{LLMExpander, NoopExpander, QueryExpander};
