@@ -22,7 +22,7 @@ pub use schema::{
 pub use searcher::{FileContext, Searcher};
 pub use gc::collect_garbage;
 pub use grep::{grep_codebase, GrepMatch, GrepOptions};
-pub use config::{Config, ExpansionConfig, IndexConfig, RerankerConfig, SearchConfig};
+pub use config::{Config, ExpansionConfig, GraphConfig, IndexConfig, RerankerConfig, SearchConfig};
 pub mod reranker;
 pub use reranker::{NoopReranker, RerankCandidate, Reranker};
 pub mod router;

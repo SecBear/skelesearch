@@ -1,0 +1,8 @@
+# Benchmark profile: disable symbol enrichment to measure its contribution.
+# Re-indexing is required after switching this flag.
+
+[index]
+symbol_enrichment = false
+
+[search.graph]
+enabled = false

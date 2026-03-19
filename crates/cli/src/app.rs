@@ -228,7 +228,8 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     backend.initialize(dim).await?;
 
     let indexer = Indexer::new(backend, manifest, provider)
-        .with_excludes(config.index.exclude.clone());
+        .with_excludes(config.index.exclude.clone())
+        .with_symbol_enrichment(config.index.symbol_enrichment);
     let start = std::time::Instant::now();
     let result = indexer.index_path(&root).await?;
     let elapsed = start.elapsed();
@@ -274,7 +275,15 @@ async fn run_search(
     let searcher = configure_searcher(searcher, &root);
 
     let start = std::time::Instant::now();
-    let mut results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity, max_tokens).await.unwrap_or_default();
+    let config = Config::load(&root).unwrap_or_default();
+    let graph_enabled = graph || config.search.graph.enabled == Some(true);
+    let graph_depth: usize = if graph_enabled {
+        // Prefer an explicit config depth (≥1); fall back to 1 if unset or zero.
+        config.search.graph.max_depth.max(1)
+    } else {
+        0
+    };
+    let mut results = searcher.search(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await.unwrap_or_default();
     let elapsed = start.elapsed();
     tracing::info!(elapsed_ms = elapsed.as_millis() as u64, results = results.len(), "search complete");
 
@@ -479,7 +488,8 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                 eprintln!("skelesearch watch: backend init failed: {e}");
             } else {
                 let indexer = Indexer::new(backend, manifest, provider)
-                    .with_excludes(config.index.exclude.clone());
+                    .with_excludes(config.index.exclude.clone())
+                    .with_symbol_enrichment(config.index.symbol_enrichment);
                 match indexer.index_path(&root).await {
                     Ok(r) => eprintln!(
                         "skelesearch watch: indexed {} file(s) in {}",
@@ -689,8 +699,10 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
     let backend = open_backend(&dir)?;
     backend.initialize(dim).await?;
     let searcher = Searcher::new(backend, provider);
+    let config = Config::load(&root).unwrap_or_default();
     let searcher = configure_searcher(searcher, &root);
-
+    let eval_graph_enabled = config.search.graph.enabled == Some(true);
+    let eval_graph_depth: usize = if eval_graph_enabled { config.search.graph.max_depth.max(1) } else { 0 };
     let eval_data = std::fs::read_to_string(&eval_set_path)
         .with_context(|| format!("failed to read eval set: {}", eval_set_path.display()))?;
     let cases: Vec<eval::EvalCase> = serde_json::from_str(&eval_data)
@@ -703,7 +715,7 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
 
     let mut results = Vec::new();
     for case in &cases {
-        let hits = searcher.search(&case.query, 10, false, 0, 0.0, None).await?;
+        let hits = searcher.search(&case.query, 10, eval_graph_enabled, eval_graph_depth, 0.0, None).await?;
         // Deduplicate file paths (multiple chunks from same file).
         let mut unique_files: Vec<String> = Vec::new();
         for h in &hits {

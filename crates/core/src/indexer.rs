@@ -57,6 +57,9 @@ pub struct Indexer<B, P> {
     batch_size: usize,
     /// Gitignore-style patterns for files/directories to skip during indexing.
     exclude: Vec<String>,
+    /// When `false`, skip appending extracted symbol names to chunk normalised text.
+    /// Allows benchmark profiles to isolate the contribution of symbol enrichment.
+    symbol_enrichment: bool,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
@@ -67,6 +70,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             provider,
             batch_size: 64,
             exclude: vec![],
+            symbol_enrichment: true,
         }
     }
 
@@ -76,6 +80,13 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         &self.provider
     }
 
+
+    /// Control whether extracted symbol names are appended to each chunk's
+    /// normalised text.  Enabled by default; disable to benchmark without.
+    pub fn with_symbol_enrichment(mut self, enabled: bool) -> Self {
+        self.symbol_enrichment = enabled;
+        self
+    }
 
     /// Set gitignore-style path patterns that the indexer will skip.
     ///
@@ -378,21 +389,25 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 // Enrich each chunk's normalized text with the names of symbols
                 // that overlap its line range, so BM25 queries using symbol names
                 // match the relevant chunk even when the name doesn't appear verbatim.
-                for cr in chunk_records_per_file[fi].iter_mut() {
-                    let overlapping: Vec<&crate::symbols::SymbolDef> = bf.symbols.iter()
-                        .filter(|s| !s.name.is_empty()
-                            && s.start_line <= cr.end_line
-                            && s.end_line >= cr.start_line)
-                        .collect();
-                    if !overlapping.is_empty() {
-                        let extra: String = overlapping.iter()
-                            .map(|s| format!("{} {}",
-                                crate::normalize_for_fts(&s.name), s.kind))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if !extra.is_empty() {
-                            cr.normalized.push(' ');
-                            cr.normalized.push_str(&extra);
+                // Enrich each chunk's normalized text with the names of symbols
+                // that overlap its line range only when symbol enrichment is enabled.
+                if self.symbol_enrichment {
+                    for cr in chunk_records_per_file[fi].iter_mut() {
+                        let overlapping: Vec<&crate::symbols::SymbolDef> = bf.symbols.iter()
+                            .filter(|s| !s.name.is_empty()
+                                && s.start_line <= cr.end_line
+                                && s.end_line >= cr.start_line)
+                            .collect();
+                        if !overlapping.is_empty() {
+                            let extra: String = overlapping.iter()
+                                .map(|s| format!("{} {}",
+                                    crate::normalize_for_fts(&s.name), s.kind))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !extra.is_empty() {
+                                cr.normalized.push(' ');
+                                cr.normalized.push_str(&extra);
+                            }
                         }
                     }
                 }

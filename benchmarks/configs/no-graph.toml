@@ -1,0 +1,7 @@
+# Benchmark profile: disable graph search to measure its contribution.
+
+[index]
+symbol_enrichment = true
+
+[search.graph]
+enabled = false

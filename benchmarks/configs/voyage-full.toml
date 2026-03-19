@@ -1,0 +1,15 @@
+# Benchmark profile: full pipeline with Voyage reranker.
+# Requires VOYAGE_API_KEY and OPENAI_API_KEY in the environment.
+
+[index]
+symbol_enrichment = true
+
+[search.reranker]
+provider = "voyage"
+
+[search.expansion]
+enabled = true
+
+[search.graph]
+enabled = true
+max_depth = 1

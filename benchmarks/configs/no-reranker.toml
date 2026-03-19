@@ -1,0 +1,11 @@
+# Benchmark profile: disable reranker to measure its contribution.
+# Expansion is also disabled so the only variable is the reranker.
+
+[index]
+symbol_enrichment = true
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = false

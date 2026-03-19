@@ -1,0 +1,10 @@
+# Benchmark profile: disable LLM query expansion to measure its contribution.
+
+[index]
+symbol_enrichment = true
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = false

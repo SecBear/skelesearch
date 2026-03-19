@@ -15,6 +15,9 @@ pub struct IndexConfig {
     pub batch_size: usize,
     pub exclude: Vec<String>,
     pub index_dir: Option<String>,
+    /// Append extracted symbol names to each chunk's normalised text for BM25.
+    /// Disable to measure the contribution of symbol enrichment in benchmarks.
+    pub symbol_enrichment: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +30,9 @@ pub struct SearchConfig {
     /// Query expansion configuration.
     #[serde(default)]
     pub expansion: ExpansionConfig,
+    /// Graph / import-edge traversal configuration.
+    #[serde(default)]
+    pub graph: GraphConfig,
 }
 
 /// Reranker configuration.
@@ -48,15 +54,44 @@ pub struct ExpansionConfig {
     pub enabled: Option<bool>,
 }
 
+/// Graph search (import-edge traversal) configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GraphConfig {
+    /// Enable graph search.  Absent / `None` means disabled unless the CLI `--graph` flag
+    /// is passed.  Set to `true` to enable for all callers including `eval`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Maximum edge-traversal depth when graph search is active.
+    pub max_depth: usize,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self { enabled: None, max_depth: 1 }
+    }
+}
+
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { default_top_k: 5, reranker: RerankerConfig::default(), expansion: ExpansionConfig::default() }
+        Self {
+            default_top_k: 5,
+            reranker: RerankerConfig::default(),
+            expansion: ExpansionConfig::default(),
+            graph: GraphConfig::default(),
+        }
     }
 }
 
 impl Default for IndexConfig {
     fn default() -> Self {
-        Self { provider: "fastembed".into(), batch_size: 64, exclude: vec![], index_dir: None }
+        Self {
+            provider: "fastembed".into(),
+            batch_size: 64,
+            exclude: vec![],
+            index_dir: None,
+            symbol_enrichment: true,
+        }
     }
 }
 
@@ -83,5 +118,60 @@ impl Config {
         } else {
             Ok(Self::default())
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_preserve_current_behavior() {
+        let cfg = Config::default();
+        assert!(cfg.index.symbol_enrichment, "symbol enrichment must be on by default");
+        assert_eq!(cfg.search.graph.enabled, None, "graph must be disabled by default");
+        assert_eq!(cfg.search.graph.max_depth, 1);
+    }
+
+    #[test]
+    fn parse_graph_config() {
+        let toml = r#"
+[search.graph]
+enabled = true
+max_depth = 2
+"#;
+        let cfg = Config::from_str(toml).unwrap();
+        assert_eq!(cfg.search.graph.enabled, Some(true));
+        assert_eq!(cfg.search.graph.max_depth, 2);
+        // Unspecified index fields should remain at defaults.
+        assert!(cfg.index.symbol_enrichment);
+    }
+
+    #[test]
+    fn parse_symbol_enrichment_false() {
+        let toml = r#"
+[index]
+symbol_enrichment = false
+"#;
+        let cfg = Config::from_str(toml).unwrap();
+        assert!(!cfg.index.symbol_enrichment);
+        // Graph should remain at default.
+        assert_eq!(cfg.search.graph.enabled, None);
+    }
+
+    #[test]
+    fn parse_no_graph_toml() {
+        // Simulates loading benchmarks/configs/no-graph.toml
+        let toml = r#"
+[index]
+symbol_enrichment = true
+
+[search.graph]
+enabled = false
+"#;
+        let cfg = Config::from_str(toml).unwrap();
+        assert!(cfg.index.symbol_enrichment);
+        assert_eq!(cfg.search.graph.enabled, Some(false));
     }
 }
