@@ -1,0 +1,100 @@
+[
+  {
+    "query": "Provider trait for LLM backends",
+    "expected_files": [
+      "turn/skg-turn/src/provider.rs"
+    ]
+  },
+  {
+    "query": "Dispatcher trait and dispatch handle",
+    "expected_files": [
+      "layer0/src/dispatch.rs"
+    ]
+  },
+  {
+    "query": "retry logic with exponential backoff and jitter",
+    "expected_files": [
+      "hooks/skg-hook-retry/src/lib.rs"
+    ]
+  },
+  {
+    "query": "middleware dispatch stack builder with observer transformer guard ordering",
+    "expected_files": [
+      "layer0/src/middleware.rs"
+    ]
+  },
+  {
+    "query": "how does the system prevent runaway costs and infinite loops",
+    "expected_files": [
+      "op/skg-context-engine/src/rules/budget.rs",
+      "layer0/src/operator.rs"
+    ]
+  },
+  {
+    "query": "how does the effect system separate declaration from execution",
+    "expected_files": [
+      "layer0/src/effect.rs",
+      "effects/skg-effects-core/src/lib.rs"
+    ]
+  },
+  {
+    "query": "how do agents remember things across conversations",
+    "expected_files": [
+      "layer0/src/state.rs",
+      "layer0/src/effect.rs"
+    ]
+  },
+  {
+    "query": "how is context assembled and compiled into an inference request",
+    "expected_files": [
+      "op/skg-context-engine/src/compile.rs",
+      "op/skg-context-engine/src/context.rs"
+    ]
+  },
+  {
+    "query": "ExitReason enum and why an operator invocation ended",
+    "expected_files": [
+      "layer0/src/operator.rs"
+    ]
+  },
+  {
+    "query": "human approval flow for tool calls before execution",
+    "expected_files": [
+      "layer0/src/approval.rs"
+    ]
+  },
+  {
+    "query": "prevent secrets from leaking into model responses",
+    "expected_files": [
+      "hooks/skg-hook-security/src/lib.rs",
+      "secret/skg-secret/src/middleware.rs"
+    ]
+  },
+  {
+    "query": "model routing and provider selection across multiple LLM backends",
+    "expected_files": [
+      "provider/skg-provider-router/src/lib.rs",
+      "turn/skg-turn/src/provider.rs"
+    ]
+  },
+  {
+    "query": "ReAct reasoning and acting loop implementation",
+    "expected_files": [
+      "op/skg-context-engine/src/react.rs"
+    ]
+  },
+  {
+    "query": "how does one agent hand off work to another agent",
+    "expected_files": [
+      "layer0/src/dispatch.rs",
+      "layer0/src/effect.rs"
+    ]
+  },
+  {
+    "query": "context window compaction strategies sliding window and policy trim",
+    "expected_files": [
+      "op/skg-context-engine/src/rules/compaction.rs",
+      "op/skg-context-engine/src/context.rs"
+    ]
+  }
+]

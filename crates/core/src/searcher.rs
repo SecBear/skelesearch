@@ -17,6 +17,46 @@ pub struct FileContext {
 }
 
 // ---------------------------------------------------------------------------
+// Query expansion
+// ---------------------------------------------------------------------------
+
+/// Common English stop words that don't help BM25 matching.
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "need", "dare", "ought",
+    "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+    "as", "into", "through", "during", "before", "after", "above", "below",
+    "between", "out", "off", "over", "under", "again", "further", "then",
+    "once", "here", "there", "when", "where", "why", "how", "all", "each",
+    "every", "both", "few", "more", "most", "other", "some", "such", "no",
+    "not", "only", "own", "same", "so", "than", "too", "very", "just",
+    "because", "but", "and", "or", "if", "while", "what", "which", "who",
+    "whom", "this", "that", "these", "those", "i", "me", "my", "we", "our",
+    "you", "your", "he", "him", "his", "she", "her", "it", "its", "they",
+    "them", "their", "about",
+];
+
+/// Extract significant keywords from a natural language query.
+/// Returns the original query plus deduplicated keywords, giving BM25
+/// more signal for term matching.
+fn expand_query(query: &str) -> String {
+    let keywords: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| w.len() > 2)
+        .filter(|w| !STOP_WORDS.contains(&w.to_lowercase().as_str()))
+        .collect();
+
+    if keywords.is_empty() || keywords.len() == query.split_whitespace().count() {
+        // No expansion needed — query is already all keywords or no keywords extracted
+        return query.to_string();
+    }
+
+    // Return original query + extracted keywords (boosts BM25 term frequency)
+    format!("{} {}", query, keywords.join(" "))
+}
+
+// ---------------------------------------------------------------------------
 // Searcher
 // ---------------------------------------------------------------------------
 
@@ -72,9 +112,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             .next()
             .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
 
+        let expanded = expand_query(query);
         let mut hits = self
             .backend
-            .hybrid_search(&query_vec, query, top_k)
+            .hybrid_search(&query_vec, &expanded, top_k)
             .await?;
 
         if hits.is_empty() {

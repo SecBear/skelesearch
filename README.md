@@ -35,11 +35,15 @@ The index lives in `.skelesearch/` at the project root. Add it to `.gitignore`.
    (functions, structs, impl blocks). Unknown languages fall back to a sliding
    window.
 
-2. **Embedding** — each chunk is embedded via
-   [jina-embeddings-v2-base-code](https://huggingface.co/jinaai/jina-embeddings-v2-base-code)
-   (768-dim, code-specialized ONNX model, runs locally via fastembed-rs). An
-   **embedding cache** (SQLite-backed, keyed by content hash) skips
-   re-embedding unchanged chunks on subsequent runs.
+2. **Embedding** — two providers:
+   - **fastembed** (default) — [jina-embeddings-v2-base-code](https://huggingface.co/jinaai/jina-embeddings-v2-base-code)
+     (768-dim, code-specialized ONNX model, runs locally via fastembed-rs)
+   - **openai** — `text-embedding-3-small` via the OpenAI API (`--provider openai`);
+     requires `OPENAI_API_KEY` env var or `~/.pi/agent/auth.json`
+
+   An **embedding cache** (SQLite-backed, keyed by content hash) skips
+   re-embedding unchanged chunks on subsequent runs. The **provider manifest**
+   records which model was used at index time; search auto-detects it.
 
 3. **Storage** — CozoDB stores chunks, embeddings (HNSW index), full-text
    (BM25), import graph edges, and symbol definitions.
@@ -47,14 +51,20 @@ The index lives in `.skelesearch/` at the project root. Add it to `.gitignore`.
 4. **Search** — queries run through both HNSW vector search and BM25 full-text
    search. Results are fused via **Reciprocal Rank Fusion** (RRF), then
    optionally reranked with **Maximal Marginal Relevance** (MMR) for diversity.
+   A **reranker** pipeline stage (cross-encoder, e.g. Jina, Qwen3) is pluggable
+   via the `Reranker` trait and builder — first-party models ship separately.
 
 ## CLI
 
 ```
 skelesearch index <path>              Index a directory
+  --provider fastembed|openai            Embedding backend (default: fastembed)
 skelesearch search <query>            Hybrid semantic + FTS search
   --top-k N                             Max results (default: 5)
   --diversity 0.3                       MMR re-ranking (0=off, 1=max diversity)
+  --max-tokens N                        Cap output to a token budget
+  --branch                              Scope results to files changed on current git branch
+  --provider fastembed|openai            Must match the provider used at index time
   --json                                JSON output
 skelesearch grep <pattern>            Regex search over indexed files
   -i, --ignore-case                     Case insensitive
@@ -63,10 +73,12 @@ skelesearch grep <pattern>            Regex search over indexed files
 skelesearch symbol <name>             Find symbol definitions
   --kind function|struct|class|...      Filter by kind
 skelesearch context <file>            Show chunks + import graph for a file
+skelesearch eval <eval_set.json>      Measure retrieval quality (Recall@5, Recall@10, MRR)
+  --json                                JSON output
 skelesearch status [--json]           Index statistics
 skelesearch gc                        Remove entries for deleted files
 skelesearch clear                     Delete the entire local index
-skelesearch watch <path>              Maintain a watch sentinel (v1: no auto-reindex)
+skelesearch watch <path>              Re-index on file changes (2s debounce)
 ```
 
 ## MCP server
@@ -85,11 +97,11 @@ skelesearch-mcp --http 127.0.0.1:3000
 
 | Tool | Description |
 |------|-------------|
-| `smart_search` | Auto-classifies query → grep or semantic search. **Recommended default.** |
-| `search_code` | Hybrid BM25 + vector search with MMR diversity control |
+| `smart_search` | Auto-classifies query → grep or semantic search. **Recommended default.** Accepts `max_tokens`, `branch_scope`. |
+| `search_code` | Hybrid BM25 + vector search with MMR diversity control. Accepts `max_tokens`, `branch_scope`. |
 | `find_symbol` | Look up definitions by name, optionally filtered by kind |
 | `get_file_context` | All chunks + import edges for a specific file |
-| `index_codebase` | Trigger indexing from within a session |
+| `index_codebase` | Trigger indexing from within a session. Accepts `provider`. |
 | `index_status` | Check whether the index is current |
 
 ### Claude Code config
@@ -117,17 +129,19 @@ Kotlin, Swift, Scala. Unknown extensions use a sliding-window fallback.
 
 ```
 crates/
-  core/           Schema, indexer, searcher, chunker, manifest, GC, grep, symbols
-  embed-fastembed/ FastEmbed ONNX provider (jina-v2-base-code)
-  mcp/            MCP server (stdio + HTTP transport)
-  cli/            CLI binary
+  core/            Schema, indexer, searcher, chunker, manifest, GC, grep, symbols
+  embed-fastembed/  FastEmbed ONNX provider (jina-v2-base-code)
+  embed-openai/     OpenAI API provider (text-embedding-3-small)
+  mcp/             MCP server (stdio + HTTP transport)
+  cli/             CLI binary
 ```
 
 Key design boundaries:
 - `StorageBackend` trait — all CozoDB access is behind this; migration to
   LanceDB+Tantivy is a single-file change
 - `EmbedProvider` trait — swap embedding models without touching indexing logic
-- Manifest (SQLite) — change detection, crash recovery, embedding cache
+- `Reranker` trait — pluggable cross-encoder stage after RRF fusion
+- Manifest (SQLite) — change detection, crash recovery, embedding cache, provider record
 
 ## Observability
 
@@ -153,6 +167,18 @@ exclude = ["target/", "node_modules/", "*.lock"]
 [search]
 top_k = 10
 ```
+
+## Performance
+
+Profiled on skelegent (370 files, 2753 chunks):
+
+| Provider | First index | Re-index (cached) | Search |
+|----------|-------------|-------------------|--------|
+| OpenAI `text-embedding-3-small` | 52.6 s | 0 s | 429 ms |
+| fastembed (local CPU) | 118 s | 0.1 s | 27 ms |
+
+OpenAI cost: ~$0.01 per full index of a medium codebase. The embedding cache
+makes re-indexes essentially free regardless of provider.
 
 ## License
 
