@@ -1,7 +1,7 @@
 [[repo]]
 id = "mini-redis"
 url = "https://github.com/tokio-rs/mini-redis.git"
-rev = "main"
+rev = "master"
 language = "rust"
 license = "MIT"
 tags = ["async", "server", "pubsub"]
