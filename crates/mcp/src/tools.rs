@@ -33,6 +33,9 @@ pub struct SearchCodeInput {
     /// Maximum token budget for results. Omit for unlimited.
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// When true, scope results to files changed on the current git branch.
+    #[serde(default)]
+    pub branch_scope: bool,
 }
 
 fn default_top_k() -> usize {
@@ -145,6 +148,9 @@ pub struct SmartSearchInput {
     /// Maximum token budget for results. Omit for unlimited.
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// When true, scope results to files changed on the current git branch.
+    #[serde(default)]
+    pub branch_scope: bool,
 }
 
 /// A single grep result row returned by `smart_search` on the grep path.

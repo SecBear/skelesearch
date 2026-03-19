@@ -179,10 +179,24 @@ impl SkeleSearchServer {
         let top_k = input.top_k.max(1);
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
         let start = std::time::Instant::now();
-        let results = searcher
+        let mut results = searcher
             .search(&input.query, top_k, input.include_graph, max_depth, input.diversity, input.max_tokens)
             .await?;
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, results = results.len(), "search_code complete");
+
+        // Filter to branch-changed files if requested.
+        if input.branch_scope {
+            // Derive project root from manifest path: .skelesearch/manifest.db -> project_root
+            let root = self.manifest_path
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let changed = skelesearch_core::git::changed_files_on_branch(root)?;
+            if !changed.is_empty() {
+                results.retain(|r| changed.iter().any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)));
+            }
+        }
+
         Ok(results
             .into_iter()
             .map(|r| SearchCodeRow {
@@ -353,16 +367,26 @@ impl SkeleSearchServer {
                     let root = common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"));
                     let opts = GrepOptions { max_results: input.top_k.max(1), case_insensitive: false };
                     let matches = grep_codebase(&root, &input.query, &opts)?;
-                    SmartSearchResults::Grep(
-                        matches
-                            .into_iter()
-                            .map(|m| GrepSearchRow {
-                                file_path: m.file_path,
-                                line_number: m.line_number,
-                                line_content: m.line_content,
-                            })
-                            .collect(),
-                    )
+                    let mut rows: Vec<GrepSearchRow> = matches
+                        .into_iter()
+                        .map(|m| GrepSearchRow {
+                            file_path: m.file_path,
+                            line_number: m.line_number,
+                            line_content: m.line_content,
+                        })
+                        .collect();
+                    // Filter grep results to branch-changed files if requested.
+                    if input.branch_scope {
+                        let proj_root = self.manifest_path
+                            .parent()
+                            .and_then(|p| p.parent())
+                            .unwrap_or_else(|| std::path::Path::new("."));
+                        let changed = skelesearch_core::git::changed_files_on_branch(proj_root)?;
+                        if !changed.is_empty() {
+                            rows.retain(|r| changed.iter().any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)));
+                        }
+                    }
+                    SmartSearchResults::Grep(rows)
                 }
             }
             QueryStrategy::Semantic => {
@@ -374,6 +398,8 @@ impl SkeleSearchServer {
                         max_depth: None,
                         diversity: input.diversity,
                         max_tokens: input.max_tokens,
+                        // branch_scope is handled inside search_code
+                        branch_scope: input.branch_scope,
                     })
                     .await?;
                 SmartSearchResults::Semantic(rows)

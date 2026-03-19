@@ -12,6 +12,7 @@ use skelesearch_core::{
 use skelesearch_embed_fastembed::provider_from_name;
 
 use crate::cli::{Cli, Commands};
+use crate::eval;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -34,8 +35,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,
-        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens } => {
-            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens).await
+        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens, branch } => {
+            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens, branch).await
         }
         Commands::Context { file } => run_context(file).await,
         Commands::Status { path, json } => run_status(path, json).await,
@@ -46,6 +47,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             run_grep(pattern, path, max_results, ignore_case, json).await
         }
         Commands::Symbol { name, kind } => run_symbol(name, kind).await,
+        Commands::Eval { eval_set, provider, json } => run_eval(eval_set, provider, json).await,
     }
 }
 
@@ -191,6 +193,7 @@ async fn run_search(
     diversity: f32,
     provider_name: String,
     max_tokens: Option<usize>,
+    branch_scope: bool,
 ) -> anyhow::Result<()> {
     let root = std::env::current_dir().context("failed to get current directory")?;
     let dir = index_dir(&root);
@@ -212,9 +215,17 @@ async fn run_search(
 
     let searcher = Searcher::new(backend, provider);
     let start = std::time::Instant::now();
-    let results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity, max_tokens).await.unwrap_or_default();
+    let mut results = searcher.search(&query, top_k, graph, if graph { 2 } else { 0 }, diversity, max_tokens).await.unwrap_or_default();
     let elapsed = start.elapsed();
     tracing::info!(elapsed_ms = elapsed.as_millis() as u64, results = results.len(), "search complete");
+
+    // Filter to branch-changed files if requested.
+    if branch_scope {
+        let changed = skelesearch_core::git::changed_files_on_branch(&root)?;
+        if !changed.is_empty() {
+            results.retain(|r| changed.iter().any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)));
+        }
+    }
 
     if json_output {
         let rows: Vec<serde_json::Value> = results
@@ -602,6 +613,87 @@ async fn run_symbol(name: String, kind: Option<String>) -> anyhow::Result<()> {
     }
     for sym in &results {
         println!("{} {} @ {}:{}-{}", sym.kind, sym.name, sym.file_path, sym.start_line, sym.end_line);
+    }
+    Ok(())
+}
+
+async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bool) -> anyhow::Result<()> {
+    let provider = provider_from_name(&provider_name)?;
+    let dim = provider.dim();
+    let root = resolve_root(None)?;
+    let dir = index_dir(&root);
+
+    if !dir.join("index.db").exists() {
+        anyhow::bail!("No index found. Run `skelesearch index <path>` first.");
+    }
+
+    let backend = open_backend(&dir)?;
+    backend.initialize(dim).await?;
+    let searcher = Searcher::new(backend, provider);
+
+    let eval_data = std::fs::read_to_string(&eval_set_path)
+        .with_context(|| format!("failed to read eval set: {}", eval_set_path.display()))?;
+    let cases: Vec<eval::EvalCase> = serde_json::from_str(&eval_data)
+        .context("failed to parse eval set JSON")?;
+
+    if cases.is_empty() {
+        println!("Eval set is empty.");
+        return Ok(());
+    }
+
+    let mut results = Vec::new();
+    for case in &cases {
+        let hits = searcher.search(&case.query, 10, false, 0, 0.0, None).await?;
+        // Deduplicate file paths (multiple chunks from same file).
+        let mut unique_files: Vec<String> = Vec::new();
+        for h in &hits {
+            if !unique_files.contains(&h.file_path) {
+                unique_files.push(h.file_path.clone());
+            }
+        }
+
+        let metrics = eval::CaseMetrics {
+            query: case.query.clone(),
+            recall_at_5: eval::recall_at_k(&unique_files, &case.expected_files, 5),
+            recall_at_10: eval::recall_at_k(&unique_files, &case.expected_files, 10),
+            mrr: eval::mrr(&unique_files, &case.expected_files),
+            retrieved_files: unique_files,
+        };
+
+        if !json_output {
+            println!(
+                "Q: {} | R@5={:.2} R@10={:.2} MRR={:.2}",
+                metrics.query, metrics.recall_at_5, metrics.recall_at_10, metrics.mrr
+            );
+        }
+        results.push(metrics);
+    }
+
+    let agg = eval::aggregate(&results);
+
+    if json_output {
+        let output = serde_json::json!({
+            "cases": results.iter().map(|r| serde_json::json!({
+                "query": r.query,
+                "recall_at_5": r.recall_at_5,
+                "recall_at_10": r.recall_at_10,
+                "mrr": r.mrr,
+                "retrieved_files": r.retrieved_files,
+            })).collect::<Vec<_>>(),
+            "aggregate": {
+                "mean_recall_at_5": agg.mean_recall_at_5,
+                "mean_recall_at_10": agg.mean_recall_at_10,
+                "mean_mrr": agg.mean_mrr,
+                "total_cases": agg.total_cases,
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("\n--- Aggregate ---");
+        println!("Cases:       {}", agg.total_cases);
+        println!("Mean R@5:    {:.3}", agg.mean_recall_at_5);
+        println!("Mean R@10:   {:.3}", agg.mean_recall_at_10);
+        println!("Mean MRR:    {:.3}", agg.mean_mrr);
     }
     Ok(())
 }

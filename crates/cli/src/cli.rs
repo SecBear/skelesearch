@@ -54,6 +54,9 @@ pub enum Commands {
         /// score until the budget is exhausted. Approximate: 1 token ~ 4 chars.
         #[arg(long)]
         max_tokens: Option<usize>,
+        /// Scope results to files changed on the current branch (vs main/master).
+        #[arg(long)]
+        branch: bool,
     },
 
     /// Show all indexed chunks plus import graph for a file.
@@ -125,5 +128,19 @@ pub enum Commands {
         /// Optional kind filter (function, struct, class, method, trait, enum, type).
         #[arg(long)]
         kind: Option<String>,
+    },
+
+    /// Evaluate search quality against a labeled eval set.
+    Eval {
+        /// Path to eval set JSON file.
+        eval_set: std::path::PathBuf,
+
+        /// Embedding provider (must match the provider used during indexing).
+        #[arg(long, default_value = "fastembed")]
+        provider: String,
+
+        /// Output results as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }

@@ -1,3 +1,5 @@
+pub mod git;
+
 pub mod chunker;
 pub mod indexer;
 pub mod manifest;
@@ -21,6 +23,8 @@ pub use searcher::{FileContext, Searcher};
 pub use gc::collect_garbage;
 pub use grep::{grep_codebase, GrepMatch, GrepOptions};
 pub use config::{Config, IndexConfig, SearchConfig};
+pub mod reranker;
+pub use reranker::{NoopReranker, RerankCandidate, Reranker};
 pub mod router;
 pub use router::{classify_query, QueryStrategy};
 pub mod symbols;

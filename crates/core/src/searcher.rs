@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{ChunkRecord, EmbedProvider, SearchResult, StorageBackend};
+use crate::{reranker::{RerankCandidate, Reranker}, ChunkRecord, EmbedProvider, SearchResult, StorageBackend};
 
 // ---------------------------------------------------------------------------
 // Public output types
@@ -27,11 +27,21 @@ pub struct FileContext {
 pub struct Searcher<B, P> {
     backend: Arc<B>,
     provider: P,
+    /// Optional cross-encoder reranker applied after MMR and before the token
+    /// budget filter.  `None` skips the stage (backwards-compatible default).
+    reranker: Option<Box<dyn Reranker>>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     pub fn new(backend: Arc<B>, provider: P) -> Self {
-        Self { backend, provider }
+        Self { backend, provider, reranker: None }
+    }
+
+    /// Attach a cross-encoder reranker.  Called once at construction time;
+    /// the reranker runs after MMR and before the token-budget filter.
+    pub fn with_reranker(mut self, reranker: Box<dyn Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     /// Search the index for `query`.
@@ -97,6 +107,23 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             let result_vecs = self.backend.get_chunk_embeddings(&keys).await?;
             hits = mmr_rerank(hits, &query_vec, &result_vecs, 1.0 - diversity);
         }
+
+        // Optional cross-encoder reranking for precision improvement.
+        // Reranker sees all post-MMR results; it reorders them before the
+        // token-budget filter selects the top slice.
+        let hits = if let Some(ref reranker) = self.reranker {
+            let candidates: Vec<RerankCandidate> = hits
+                .iter()
+                .enumerate()
+                .map(|(i, h)| RerankCandidate { index: i, text: h.content.clone() })
+                .collect();
+            let scores = reranker.rerank(query, candidates).await?;
+            let mut scored: Vec<_> = hits.into_iter().zip(scores).collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.into_iter().map(|(mut hit, score)| { hit.score = score; hit }).collect()
+        } else {
+            hits
+        };
 
         // Apply token budget if specified.  Results are already scored
         // highest-first; greedily include until the budget is exhausted.
