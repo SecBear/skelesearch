@@ -249,9 +249,10 @@ async fn run_search(
             }
         }
     } else {
-        // No explicit config — auto-detect from env vars (Jina first, then Cohere).
+        // No explicit config — auto-detect from env vars (Jina first, then Cohere, then Voyage).
         let auto = std::env::var("JINA_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("jina", k))
-            .or_else(|| std::env::var("COHERE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("cohere", k)));
+            .or_else(|| std::env::var("COHERE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("cohere", k)))
+            .or_else(|| std::env::var("VOYAGE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("voyage", k)));
         match auto {
             Some((name, key)) => match skelesearch_rerank_api::reranker_from_name(name, key) {
                 Ok(r)  => searcher.with_reranker(Box::new(r)),

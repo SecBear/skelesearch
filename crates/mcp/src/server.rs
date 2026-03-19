@@ -207,7 +207,7 @@ impl SkeleSearchServer {
                     Box::new(LLMExpander::new(key))
                 });
 
-        // Try reranker keys in order: JINA_API_KEY, COHERE_API_KEY.
+        // Try reranker keys in order: JINA_API_KEY, COHERE_API_KEY, VOYAGE_API_KEY.
         let reranker: Option<Box<dyn Reranker>> = None
             .or_else(|| {
                 std::env::var("JINA_API_KEY").ok()
@@ -219,6 +219,12 @@ impl SkeleSearchServer {
                 std::env::var("COHERE_API_KEY").ok()
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("cohere", key).ok())
+                    .map(|r| -> Box<dyn Reranker> { Box::new(r) })
+            })
+            .or_else(|| {
+                std::env::var("VOYAGE_API_KEY").ok()
+                    .filter(|k| !k.is_empty())
+                    .and_then(|key| skelesearch_rerank_api::reranker_from_name("voyage", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
             });
 
