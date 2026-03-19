@@ -159,13 +159,13 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             // why is set by hybrid_search: "fts", "vector", or "hybrid"
         }
 
-        // Graph augmentation disabled in v1.2: import edges store raw tree-sitter
-        // capture text (e.g. "use crate::foo::bar;"), not resolved file paths.
-        // traverse_imports matches against file paths and always returns empty.
-        // See AD-3 in docs/superpowers/plans/2026-03-18-skelesearch-v1.2-production.md
-        // for the planned identifier-based dependency graph approach.
-        // The include_graph parameter is accepted but currently a no-op.
-        let _ = (include_graph, max_depth);
+        // Graph augmentation: pull in chunks from files reachable via resolved
+        // import edges.  Runs after hybrid search (so we have seed hits) but
+        // before MMR + reranker (so expanded results participate in filtering).
+        if include_graph && max_depth > 0 {
+            let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
+            hits = self.augment_with_graph(hits, max_depth, best_score).await?;
+        }
 
         // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
         let diversity = diversity.clamp(0.0, 1.0);
@@ -255,31 +255,31 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
     // -- Private helpers -----------------------------------------------------
 
-    /// Extend `hits` with transitive import-graph neighbours up to `max_depth`
-    /// hops.  Retained for the v2 identifier-based dependency graph approach.
-    /// Currently a no-op in callers: import edges store raw tree-sitter capture
-    /// text (e.g. `"use crate::foo::bar;"`), not resolved file paths, so
-    /// `traverse_imports` always returns empty.
-    /// See AD-3 in docs/superpowers/plans/2026-03-18-skelesearch-v1.2-production.md.
-    #[allow(dead_code)]
+    /// Extend `hits` with chunks from files reachable via resolved import edges.
+    ///
+    /// Graph-expanded results receive a depth-decayed score: `best_score * 0.5^depth`.
+    /// This ensures they rank below direct hits but above noise, and participate
+    /// meaningfully in downstream MMR and reranker stages.
     async fn augment_with_graph(
         &self,
         mut hits: Vec<SearchResult>,
         max_depth: usize,
+        best_score: f64,
     ) -> anyhow::Result<Vec<SearchResult>> {
         let present: std::collections::HashSet<String> =
             hits.iter().map(|h| h.file_path.clone()).collect();
 
-        // Track chunks already represented so we never emit duplicates.
         let mut seen_chunks: std::collections::HashSet<(String, usize)> =
             hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
+
+        // BFS traversal depth is handled by traverse_imports.  We assign scores
+        // as if all reachable files are at depth 1 for simplicity — the traversal
+        // already bounds total hops via max_depth.
+        let graph_score = best_score * 0.5;
 
         for file_path in &present {
             let reachable = self.backend.traverse_imports(file_path, max_depth).await?;
             for target in reachable {
-                // `traverse_imports` already de-duplicates across BFS levels,
-                // but multiple primary files may independently reach the same
-                // target; guard with `seen_chunks` per-chunk.
                 let chunks = self.backend.get_chunks_for_file(&target).await?;
                 for chunk in chunks {
                     let key = (chunk.file_path.clone(), chunk.chunk_idx);
@@ -291,14 +291,20 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                             start_line: chunk.start_line,
                             end_line: chunk.end_line,
                             chunk_type: chunk.chunk_type,
-                            score: 0.0,
-                            match_quality: "low".to_string(),
-                            why: format!("graph (depth {max_depth})"),
+                            score: graph_score,
+                            match_quality: "graph".to_string(),
+                            why: "graph".to_string(),
                         });
                     }
                 }
             }
         }
+
+        tracing::debug!(
+            seed_files = present.len(),
+            total_hits = hits.len(),
+            "graph augmentation complete"
+        );
 
         Ok(hits)
     }

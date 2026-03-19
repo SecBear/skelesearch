@@ -1,4 +1,4 @@
-use super::{normalize_path, ImportResolver};
+use super::ImportResolver;
 use std::collections::HashSet;
 use std::path::Path;
 
