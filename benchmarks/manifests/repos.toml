@@ -1,0 +1,53 @@
+[[repo]]
+id = "mini-redis"
+url = "https://github.com/tokio-rs/mini-redis.git"
+rev = "main"
+language = "rust"
+license = "MIT"
+tags = ["async", "server", "pubsub"]
+recommended = true
+
+[[repo]]
+id = "hyperfine"
+url = "https://github.com/sharkdp/hyperfine.git"
+rev = "master"
+language = "rust"
+license = "MIT OR Apache-2.0"
+tags = ["cli", "benchmarking", "process"]
+recommended = true
+
+[[repo]]
+id = "hono"
+url = "https://github.com/honojs/hono.git"
+rev = "main"
+language = "typescript"
+license = "MIT"
+tags = ["router", "middleware", "web"]
+recommended = true
+
+[[repo]]
+id = "zod"
+url = "https://github.com/colinhacks/zod.git"
+rev = "main"
+language = "typescript"
+license = "MIT"
+tags = ["types", "validation", "schema"]
+recommended = true
+
+[[repo]]
+id = "httpx"
+url = "https://github.com/encode/httpx.git"
+rev = "master"
+language = "python"
+license = "BSD-3-Clause"
+tags = ["http", "client", "async"]
+recommended = true
+
+[[repo]]
+id = "cobra"
+url = "https://github.com/spf13/cobra.git"
+rev = "main"
+language = "go"
+license = "Apache-2.0"
+tags = ["cli", "flags", "commands"]
+recommended = true

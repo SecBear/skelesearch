@@ -180,6 +180,13 @@ Profiled on skelegent (370 files, 2753 chunks):
 OpenAI cost: ~$0.01 per full index of a medium codebase. The embedding cache
 makes re-indexes essentially free regardless of provider.
 
+## Benchmarks
+
+The reproducible eval and benchmark framework lives under `benchmarks/`. It
+supports a local corpus of cloned repos, config/profile matrices, version/binary
+comparison, and normalized run artifacts for reporting. Start with
+`benchmarks/README.md` and `benchmarks/manifests/repos.toml`.
+
 ## License
 
 MIT OR Apache-2.0
