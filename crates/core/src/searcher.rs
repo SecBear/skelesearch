@@ -151,6 +151,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             return Ok(vec![]);
         }
 
+        // Downrank test-file results before quality labelling so that labels
+        // reflect the adjusted scores.  Test code is rarely the most useful
+        // answer to a non-test query.
+        for hit in &mut hits {
+            if is_test_file(&hit.file_path) {
+                hit.score *= 0.3;
+            }
+        }
+
         // Label quality using relative thresholds against the top score.
         let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
         let labels = Self::label_match_quality(&scores);
@@ -163,8 +172,16 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // import edges.  Runs after hybrid search (so we have seed hits) but
         // before MMR + reranker (so expanded results participate in filtering).
         if include_graph && max_depth > 0 {
+            // Remember the pre-expansion count so we can apply the test-file
+            // penalty to only the newly added graph chunks below.
+            let pre_graph_len = hits.len();
             let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
             hits = self.augment_with_graph(hits, max_depth, best_score).await?;
+            for hit in hits.iter_mut().skip(pre_graph_len) {
+                if is_test_file(&hit.file_path) {
+                    hit.score *= 0.3;
+                }
+            }
         }
 
         // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
@@ -178,19 +195,59 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             hits = mmr_rerank(hits, &query_vec, &result_vecs, 1.0 - diversity);
         }
 
+        // Strong signal detection: when the top result is already clearly
+        // dominant (high absolute score with a large gap to the runner-up),
+        // the cross-encoder reranker will not change the outcome meaningfully
+        // and adds avoidable latency.  Skip both reranking and blending.
+        let strong_signal = !hits.is_empty()
+            && hits[0].score >= 0.8
+            && (hits.len() < 2 || hits[0].score - hits[1].score >= 0.15);
+
+        if strong_signal {
+            tracing::debug!(
+                top_score = hits[0].score,
+                "strong signal detected, skipping reranker"
+            );
+        }
+
         // Optional cross-encoder reranking for precision improvement.
         // Reranker sees all post-MMR results; it reorders them before the
         // token-budget filter selects the top slice.
-        let hits = if let Some(ref reranker) = self.reranker {
-            let candidates: Vec<RerankCandidate> = hits
-                .iter()
-                .enumerate()
-                .map(|(i, h)| RerankCandidate { index: i, text: h.content.clone() })
-                .collect();
-            let scores = reranker.rerank(query, candidates).await?;
-            let mut scored: Vec<_> = hits.into_iter().zip(scores).collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.into_iter().map(|(mut hit, score)| { hit.score = score; hit }).collect()
+        //
+        // Fusion score and reranker score are blended by rank position:
+        //   positions 0-2  → fusion 25 %, reranker 75 %
+        //   positions 3-9  → fusion 40 %, reranker 60 %
+        //   positions 10+  → fusion 60 %, reranker 40 %
+        // Top results already earned their position via hybrid search, so
+        // we lean on fusion; the tail benefits more from reranker signal.
+        let hits = if !strong_signal {
+            if let Some(ref reranker) = self.reranker {
+                let candidates: Vec<RerankCandidate> = hits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| RerankCandidate { index: i, text: h.content.clone() })
+                    .collect();
+                let scores = reranker.rerank(query, candidates).await?;
+                let mut scored: Vec<_> = hits.into_iter().zip(scores).collect();
+                // Sort by reranker score descending to establish position weights.
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut blended: Vec<SearchResult> = scored
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (mut hit, rerank_score))| {
+                        let fusion_weight =
+                            if i < 3 { 0.25_f64 } else if i < 10 { 0.40 } else { 0.60 };
+                        let rerank_weight = 1.0 - fusion_weight;
+                        hit.score = hit.score * fusion_weight + rerank_score * rerank_weight;
+                        hit
+                    })
+                    .collect();
+                // Re-sort by the blended score so final order reflects both signals.
+                blended.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                blended
+            } else {
+                hits
+            }
         } else {
             hits
         };
@@ -374,4 +431,112 @@ fn mmr_score(
     // When no items have been selected yet, redundancy is -inf; treat as 0.
     let redundancy = if redundancy == f32::NEG_INFINITY { 0.0 } else { redundancy };
     lambda * relevance - (1.0 - lambda) * redundancy
+}
+
+
+// ---------------------------------------------------------------------------
+// Test-file detection
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `path` looks like a test or spec file.
+///
+/// Matches on (case-insensitive):
+/// - Directory components: `/tests/`, `/test/`, `/__tests__/`, `/spec/`,
+///   `/specs/`, `/testing/`, `/testutil/`, `/test_utils/`, `/testdata/`
+/// - File stem ending in `.test`, `.spec`, `_test`, or `_spec` before
+///   the final extension (e.g. `foo.test.ts`, `bar_spec.rb`).
+/// - Exact file names: `test.rs`, `test.py`, `test.go`, `test.ts`, `test.js`.
+fn is_test_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Normalise separators so Windows paths work too.
+    let norm = lower.replace('\\', "/");
+
+    // Directory-based patterns.
+    const TEST_DIRS: &[&str] = &[
+        "/tests/", "/test/", "/__tests__/", "/spec/", "/specs/",
+        "/testing/", "/testutil/", "/test_utils/", "/testdata/",
+    ];
+    if TEST_DIRS.iter().any(|d| norm.contains(d)) {
+        return true;
+    }
+
+    // Isolate the file name (everything after the last '/').
+    let file_name = norm.rsplit('/').next().unwrap_or(&norm);
+
+    // Exact file names that are test entry-points by convention.
+    const EXACT_NAMES: &[&str] = &[
+        "test.rs", "test.py", "test.go", "test.ts", "test.js",
+    ];
+    if EXACT_NAMES.contains(&file_name) {
+        return true;
+    }
+
+    // Stem-based patterns: strip the final extension (after last '.')
+    // and check if the remainder ends with a test/spec suffix.
+    // E.g. "foo.test.ts" → stem = "foo.test"; "bar_spec.rb" → "bar_spec".
+    let stem = match file_name.rfind('.') {
+        Some(dot) => &file_name[..dot],
+        None => file_name,
+    };
+    stem.ends_with(".test")
+        || stem.ends_with(".spec")
+        || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_test_file;
+
+    #[test]
+    fn test_is_test_file_positive_dir_patterns() {
+        // Directory segment matches.
+        assert!(is_test_file("src/tests/foo.rs"));
+        assert!(is_test_file("src/test/bar.py"));
+        assert!(is_test_file("src/__tests__/baz.ts"));
+        assert!(is_test_file("src/spec/qux.rb"));
+        assert!(is_test_file("src/specs/qux.rb"));
+        assert!(is_test_file("src/testing/helpers.go"));
+        assert!(is_test_file("src/testutil/mock.go"));
+        assert!(is_test_file("src/test_utils/fixtures.py"));
+        assert!(is_test_file("src/testdata/sample.json"));
+    }
+
+    #[test]
+    fn test_is_test_file_positive_exact_names() {
+        // Exact file names.
+        assert!(is_test_file("src/test.rs"));
+        assert!(is_test_file("src/test.py"));
+        assert!(is_test_file("src/test.go"));
+        assert!(is_test_file("src/test.ts"));
+        assert!(is_test_file("src/test.js"));
+        // Case-insensitive.
+        assert!(is_test_file("src/TEST.RS"));
+    }
+
+    #[test]
+    fn test_is_test_file_positive_stem_suffixes() {
+        // Stem-based patterns.
+        assert!(is_test_file("src/foo.test.ts"));
+        assert!(is_test_file("src/foo.spec.ts"));
+        assert!(is_test_file("src/bar_test.go"));
+        assert!(is_test_file("src/bar_spec.rb"));
+        assert!(is_test_file("src/baz.test.js"));
+        // Case-insensitive stem.
+        assert!(is_test_file("src/Foo.Test.Ts"));
+    }
+
+    #[test]
+    fn test_is_test_file_negative() {
+        // Production files that merely contain the word "test" in the path
+        // but not as a directory component or stem suffix.
+        assert!(!is_test_file("src/contest/rules.rs"));
+        assert!(!is_test_file("src/attestation.rs"));
+        assert!(!is_test_file("src/latest/version.ts"));
+        assert!(!is_test_file("src/searcher.rs"));
+        assert!(!is_test_file("src/router.rs"));
+        assert!(!is_test_file("README.md"));
+        // File named "tester.rs" — stem is "tester", not a match.
+        assert!(!is_test_file("src/tester.rs"));
+    }
 }
