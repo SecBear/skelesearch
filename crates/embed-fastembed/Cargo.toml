@@ -6,8 +6,9 @@ license.workspace = true
 description = "fastembed-rs EmbedProvider for skelesearch (jina-v2-base-code default)"
 
 [features]
-default = ["openai"]
+default = ["openai", "voyage"]
 openai = ["dep:skelesearch-embed-openai"]
+voyage = ["dep:skelesearch-embed-voyage"]
 
 [dependencies]
 skelesearch-core = { path = "../core" }
@@ -18,6 +19,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 skelesearch-embed-openai = { path = "../embed-openai", optional = true }
+skelesearch-embed-voyage = { path = "../embed-voyage", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

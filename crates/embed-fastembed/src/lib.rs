@@ -117,9 +117,13 @@ pub fn provider_from_name(name: &str) -> anyhow::Result<Box<dyn skelesearch_core
         }
         #[cfg(feature = "openai")]
         "openai" => Ok(Box::new(skelesearch_embed_openai::OpenAIProvider::new()?)),
-        other => anyhow::bail!(
-            "unknown embedding provider: '{}'. Supported: fastembed, openai",
-            other
-        ),
+        #[cfg(feature = "voyage")]
+        "voyage" => Ok(Box::new(skelesearch_embed_voyage::provider_voyage()?)),
+        other => {
+            let mut supported = vec!["fastembed"];
+            #[cfg(feature = "openai")] supported.push("openai");
+            #[cfg(feature = "voyage")] supported.push("voyage");
+            anyhow::bail!("unknown embedding provider: '{}'. Supported: {}", other, supported.join(", "))
+        }
     }
 }
