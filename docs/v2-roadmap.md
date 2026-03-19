@@ -3,255 +3,230 @@
 > Goal: The definitive open-source semantic code search engine for agentic systems.
 > No competitor has all of these. We will.
 
-## Current state (v1.2)
+## Current state (v1.3)
 
-**What we have:**
+**Shipped:**
 - Tree-sitter AST chunking (15 languages + sliding-window fallback)
 - Hybrid BM25 + vector search with Reciprocal Rank Fusion
 - MMR diversity reranking
 - Embedding cache (content-hash keyed, SQLite-backed)
+- Multi-query expansion (keyword extraction for BM25 boost)
 - Local ONNX embeddings (jina-v2-base-code, 768-dim)
 - Cloud embeddings (OpenAI text-embedding-3-small, 1536-dim)
-- MCP server (stdio + HTTP transport) with smart_search, search_code, find_symbol, get_file_context
-- CLI with full index/search/grep/symbol/context/status/gc/watch/clear commands
+- MCP server (stdio + HTTP transport)
+- CLI with index/search/grep/symbol/context/status/gc/watch/clear/eval
 - Production observability (#[instrument] spans, timing, cache counters)
+- File watcher re-indexing (notify, 2s debounce)
+- Token-budget-aware retrieval (--max-tokens)
+- Diff-aware branch-scoped search (--branch)
+- Provider manifest (stores which model indexed, auto-detect on search)
+- Reranker trait + pipeline stage (NoopReranker, ready for concrete impl)
+- Eval framework (Recall@5, Recall@10, MRR)
 - Post-edit hooks for automatic background re-indexing
-- CozoDB single-DB for both HNSW vector and BM25 FTS
 
-**What's missing (competitive gaps):**
-- No file-watcher re-indexing (watch is a PID stub)
-- No cross-encoder reranker
-- No eval framework
-- No token-budget-aware output
-- No query decomposition/expansion
-- No provider name stored in manifest
-- No diff-aware branch-scoped retrieval
+**Eval baseline (skelegent, 370 files, 2753 chunks, OpenAI embeddings):**
+- R@5=0.567, R@10=0.600, MRR=0.454 (15 cases)
+- Perfect on symbol/keyword queries, zero on vocabulary-mismatch conceptual queries
+
+**Root cause of failures:** Not embedding quality — vocabulary mismatch between
+natural language ("remember things") and code identifiers (`StateStore`). Needs
+query expansion at the architecture level, not a model swap.
 
 ---
 
-## Phase 1: Production Polish (1-2 days)
-*Close the gaps that make dogfooding painful.*
+## Implementation Queue (priority order)
 
-### 1.1 Store provider/model in manifest
-- Add `metadata` table to ManifestStore: `key TEXT PRIMARY KEY, value TEXT`
-- On index: store `provider_name`, `model_name`, `dim` in metadata
-- On search: read metadata, auto-select provider (fallback to fastembed)
-- Eliminates "indexed with openai, searched with fastembed" dimension mismatch
-- **Files:** `manifest.rs`, `indexer.rs`, `app.rs`, `server.rs`
+### P0: LLM Query Expansion (2 days) — estimated +20-30% R@5
+The single highest-impact change. Bridges the vocabulary gap that causes all 4 eval failures.
 
-### 1.2 File watcher re-indexing
-- Replace the `watch` PID-only stub with actual `notify`-based file watching
-- On `Modify`/`Create`/`Remove` events: debounce (2s), run `index_path` on changed files
-- Use `notify-debouncer-full` (already in workspace deps)
-- GC on file removal (already implemented as `gc::collect_garbage`)
-- **Files:** `app.rs` (run_watch), possibly extract to `crates/core/src/watcher.rs`
+**What:**
+- `QueryExpander` trait in `crates/core/src/expander.rs`
+- Query classifier (10-line heuristic: camelCase/snake_case → symbol, stop words + >3 words → conceptual)
+- `LLMQueryExpander` implementation using OpenAI completions (or any configured LLM)
+- Prompt: "Given this code search query, list 3-5 code identifiers/keywords that might appear in relevant source files. Query: {query}. Keywords:"
+- Gate: symbol queries skip expansion entirely, only conceptual queries get LLM call
+- Search with both original embedding AND expanded-keyword BM25
 
-### 1.3 Token-budget-aware retrieval
-- Add `--max-tokens` flag to CLI search and MCP search_code/smart_search
-- Greedy selection: sort by score, accumulate token counts (approximate via `content.len() / 4`), stop at budget
-- Return `truncated: bool` in output so agent knows budget was hit
-- Default: unlimited (backwards compatible). Recommended: 8192 for agent use.
-- **Files:** `searcher.rs`, `cli.rs`, `app.rs`, `tools.rs`, `server.rs`
+**Evidence:** QECK paper: +64% precision for code search via keyword expansion. Jina benchmarks: +1.5 to +6.5 NDCG.
 
----
+**Files:** `crates/core/src/expander.rs` (new), `crates/core/src/searcher.rs`, `crates/core/src/lib.rs`, `crates/mcp/src/server.rs` (smart_search path), `crates/cli/src/app.rs`
 
-## Phase 2: Retrieval Quality (1 week)
-*Match Cursor/Copilot retrieval quality.*
+### P1: Jina Reranker API (2 days) — estimated +5-15% nDCG
+Concrete implementation of the Reranker trait using Jina's code-specific reranker.
 
-### 2.1 Cross-encoder reranker
-- Add `crates/rerank/` crate with `Reranker` trait
-- Implement `JinaReranker` using Jina Reranker v3 (ONNX, 0.6B params) or Qwen3-Reranker (Apache 2.0)
-- Pipeline: initial retrieval (top-50) → reranker scores all 50 → return top-K
-- Add `--rerank` flag to CLI, `rerank: bool` to MCP (default: true when reranker available)
-- **Expected impact:** 5-15% nDCG@10 improvement. Distinguishes "similar function" from "correct function."
+**What:**
+- `crates/rerank-api/` crate implementing `Reranker` trait
+- Jina reranker-v2-base-multilingual (code-specific, free 10M tokens)
+- Unified REST client covering Jina/Cohere/Voyage (nearly identical APIs)
+- Config: `[search.reranker]` in .skelesearch.toml
+- CLI: `--reranker jina` (default: none)
+- MCP: auto-enable when configured
 
-### 2.2 Multi-query expansion
-- When `smart_search` receives a NL query, generate 2-3 variant queries:
-  - Original NL query → embed for vector search
-  - Extract keywords → use for BM25 (already done)
-  - Generate a "hypothetical code snippet" prompt → embed for vector search (HyDE-lite)
-- Merge results from all queries via RRF
-- No LLM required for basic expansion (keyword extraction + synonym mapping)
-- **Files:** `searcher.rs` (add `multi_query_search`), `server.rs` (smart_search path)
+**API format (shared across all 3 providers):**
+```
+POST https://api.jina.ai/v1/rerank
+{ "model": "jina-reranker-v2-base-multilingual", "query": "...", "documents": [...], "top_n": 10 }
+→ { "results": [{ "index": 0, "relevance_score": 0.84 }] }
+```
 
-### 2.3 Diff-aware branch-scoped retrieval
-- Add `--branch` flag: scope search to files changed on current branch
-- Implementation: `git diff --name-only HEAD...$(git merge-base HEAD main)`
-- Filter HNSW and FTS results to only include chunks from changed files
-- Massive precision improvement for agent tasks on feature branches
-- **Files:** `searcher.rs`, `cli.rs`, `app.rs`, `tools.rs`
+**Evidence:** Dedicated rerankers beat LLM-as-reranker by 12-15% NDCG at 25-60x lower cost.
 
----
+**Pricing:**
+| Provider | Free Tier | Paid | Code-specific |
+|---|---|---|---|
+| Jina | 10M tokens | $0.02/1M tok | **yes** (v2) |
+| Voyage | 200M tokens | $0.05/1M tok | no |
+| Cohere | 1K calls/mo | $2/1K searches | no |
 
-## Phase 3: Late Interaction / ColBERT (2-3 weeks)
-*Leapfrog bi-encoder quality. No competitor in our space has this.*
+### P2: voyage-code-3 Embedding Provider (1 day) — estimated +5-10% R@5
+Best-in-class code embedding model. 13.8% better than OpenAI on code retrieval.
 
-### 3.1 LateOn-Code integration
-- Add `crates/embed-lateon/` crate implementing a new `ColBERTProvider` trait
-- LateOn-Code models (17M and 130M params) run via ONNX locally
-- Each chunk produces N vectors (one per token) instead of one vector
-- Storage: multi-vector column in CozoDB or separate SQLite table
-- **Key challenge:** CozoDB's HNSW is designed for single-vector. Options:
-  - Store mean-pooled single vector for HNSW coarse search, then late-interaction rerank on top-100
-  - Or use Next-Plaid (LightOn's Rust multi-vector DB) alongside CozoDB
-- ColBERT MaxSim scoring: `score = sum(max(q_i · d_j for all j) for all i)`
-- **Expected impact:** 70% win rate vs pure grep (ColGrep benchmark). Best retrieval quality for code.
+**What:**
+- `crates/embed-voyage/` crate implementing `EmbedProvider`
+- voyage-code-3: 1024-dim, 32K context, 300+ programming languages
+- API: `POST https://api.voyageai.com/v1/embeddings`
+- Auth: `VOYAGE_API_KEY` env var
+- CLI: `--provider voyage`
 
-### 3.2 Hybrid regex + semantic search
-- When query contains regex-like patterns (`/pattern/`, `func_name`, `ClassName`), split into:
-  - Regex component → fast grep filter
-  - Semantic component → embedding search on grep-filtered candidates
-- This is what ColGrep does and it's the most novel approach in the space
-- Subsumes traditional grep rather than replacing it
-- **Files:** `searcher.rs` (add `hybrid_regex_semantic_search`), `cli.rs`, `tools.rs`
+**Evidence:** Voyage AI's 32-dataset suite: 92.12% vs OpenAI 78.48%.
 
----
+### P3: Session Dedup (1 day) — DX improvement
+Prevent agents from re-reading the same code across multiple searches in one session.
 
-## Phase 4: Eval Framework (3-5 days)
-*Can't improve what you can't measure. No open-source competitor has this.*
+**What:**
+- Add `session_id: Option<String>` to SearchCodeInput and SmartSearchInput
+- Server-side `HashMap<String, HashSet<u64>>` tracking content hashes per session
+- After ranking, deprioritize (not exclude) already-seen results
+- CLI: `--session <id>` flag
 
-### 4.1 Morph Labs-style auto-eval
-- Given a repo + set of resolved GitHub issues/PRs:
-  - Extract the files/functions modified in each fix
-  - Generate NL queries from issue titles/descriptions
-  - Ground truth: the files/functions that were actually modified
-- Measure: Recall@5, Recall@10, MRR, NDCG@10
-- **Output:** `skelesearch eval --repo . --issues issues.json`
+**Evidence:** Only Probe has this. Agents run 3-4 rapid searches; without dedup they
+waste context on repeated code blocks. Server-side tracking survives context compaction.
 
-### 4.2 CoIR benchmark runner
-- Implement CoIR (Code Information Retrieval) benchmark evaluation
-- Measures our embedding model + retrieval pipeline against standard datasets
-- Publish results in README to establish credibility
-- **Crate:** `github.com/CoIR-team/coir` (Python, but we can wrap)
+### P4: Expand Eval to 100+ Cases (2 days) — measurement quality
+Current 15-case eval has enormous confidence intervals. Need reliable measurement
+before optimizing further.
 
-### 4.3 RepoBench-R evaluation
-- Cross-file snippet retrieval within a repo — closest to our actual use case
-- Use as regression test: any change to retrieval pipeline must not regress RepoBench-R scores
+**What:**
+- Auto-generate eval cases from resolved GitHub issues (Morph Labs methodology)
+- Cover 3+ repos (skelegent, skelesearch itself, a well-known OSS project)
+- Mix: 30% symbol, 30% implementation, 20% architectural, 20% hard conceptual
+- Run against CodeSearchNet subset for external benchmark comparability
+- Publish results in README
 
----
+### P5: LanceDB+Tantivy Backend (1 week) — perf + maintainability
+Feature-gated alternative to CozoDB. Don't remove CozoDB — let both coexist.
 
-## Phase 5: Advanced Features (2-4 weeks)
-*Market leadership. Things nobody else has.*
+**What:**
+- `crates/core/src/lance_backend.rs` implementing `StorageBackend` (16 methods)
+- LanceDB for vector storage (IVF+PQ, columnar, metadata filtering)
+- Tantivy for BM25 FTS (3x faster than Elasticsearch, 14.7K stars)
+- `open_backend()` selects based on `.skelesearch.toml` config or `--backend` flag
+- Manual BFS for `traverse_imports` (replaces CozoDB Datalog recursive query)
 
-### 5.1 Matryoshka adaptive dimensions
-- Support MRL-compatible models (nomic-embed-text-v1.5, Jina v3)
-- Two-phase retrieval: coarse search at 128 dims over full index, then full-dim rerank top-100
-- 4-8x storage reduction with <5% quality loss
-- Store both truncated and full embeddings, or just full and truncate at query time
-- **Expected impact:** Faster search, lower memory, enables larger repos
+**Blast radius:** 1 new file + 2 construction sites. Everything else is behind the trait.
 
-### 5.2 Call graph extraction
-- Extract function call edges from tree-sitter ASTs
-- Store as `edge_type: "calls"` in CozoDB `code_edges` relation
-- Post-retrieval expansion: found function X → also pull callers/callees of X
-- **Expected impact:** Answers "how is this function used?" without separate LSP
-- **Files:** `chunker/`, `schema.rs`
+**Evidence:** CozoDB last release v0.7.6 (Dec 2023). Tantivy actively maintained (14.7K stars).
+LanceDB: 9.5K stars, 2000+ commits, Rust-native.
 
-### 5.3 Retrieval feedback loop (lightweight)
-- Log `(query, retrieved_chunks, session_id)` to `~/.skelesearch/feedback.db`
-- Track which results the agent actually used (MCP can see tool call sequences)
-- Monthly: analyze unused results as hard negatives, surface precision problems
-- No model retraining — just adjust RRF weights (vector_weight vs fts_weight) per-repo
-- **Files:** `searcher.rs`, `server.rs`, new `feedback.rs`
+### P6: ColBERT/LateOn-Code (2-3 weeks) — estimated +15-25% R@5
+Late interaction retrieval. No OSS MCP code search tool has this. The moat.
 
-### 5.4 Multi-repo indexing
-- Allow indexing multiple repos into a single searchable namespace
-- Use case: monorepo with multiple packages, or related repos
-- Implementation: prefix file paths with repo name, add `--repo` filter to search
-- **Files:** `indexer.rs`, `searcher.rs`, `cli.rs`
+**What:**
+- `crates/embed-lateon/` crate using `next-plaid` + `next-plaid-onnx`
+- LateOn-Code 130M (ONNX, Apache-2.0, ModernBERT-based)
+- PLAID algorithm for multi-vector storage (product quantization, mmap, SIMD MaxSim)
+- Architecture: next-plaid alongside CozoDB/LanceDB, fuse ColBERT + BM25 scores
+- rusqlite 0.38 upgrade already done (unblocks next-plaid dependency)
 
-### 5.5 Streaming index updates via MCP
-- Add `index_file` MCP tool: index a single file without full project scan
-- Agent can call this after writing a file to immediately update the index
-- Faster than post-edit hook (no process spawn, no disk walk)
-- **Files:** `server.rs`, `tools.rs`
+**Evidence:** ColGrep benchmark: 70% win rate vs grep, 15.7% average token savings.
 
----
+### P7: Distribution (3 days) — adoption
+Zero-friction install for every agent platform.
 
-## Phase 6: Ecosystem (ongoing)
-*Distribution and adoption.*
-
-### 6.1 Package distribution
-- Homebrew formula (tap or core)
+**What:**
+- npm package wrapping native binary (esbuild/turbo pattern: postinstall downloads platform binary)
+- `npx -y @skelesearch/mcp` one-liner for Claude Code, Codex, OMP
+- Homebrew tap: `brew install skelesearch`
+- GitHub Releases with prebuilt binaries (Linux x86_64, macOS arm64/x86_64)
 - cargo install from crates.io
-- Nix flake (already exists)
-- Pre-built binaries for Linux x86_64, macOS arm64/x86_64, Windows
 
-### 6.2 IDE integrations
-- VS Code extension (MCP client that connects to skelesearch-mcp)
-- Neovim plugin (MCP client)
-- JetBrains plugin
+### P8: Lite Mode (2 days) — zero-config DX
+BM25-only search with no API keys, no model downloads, no indexing wait.
 
-### 6.3 Agent framework integrations
-- Claude Code: MCP config + hooks (already done)
-- Codex: MCP config
-- Cursor: MCP config
-- Windsurf: MCP config
-- OMP/OpenClaw: MCP config + integration docs (already done)
-- Continue.dev: context provider plugin
-- Aider: custom command integration
+**What:**
+- `skelesearch search "query" .` works with BM25 + AST chunking only
+- No embedding provider needed — tree-sitter chunks stored in CozoDB/LanceDB FTS
+- Instant first run (index on first search, incremental thereafter)
+- Add `--provider fastembed|openai|voyage|none` where `none` = BM25-only
+- Quality degrades gracefully; configure a provider for semantic upgrade
 
-### 6.4 Documentation
-- Architecture deep-dive (how hybrid search works)
-- Embedding model comparison guide (local vs cloud, quality vs cost)
-- Benchmarking your own repo guide
-- Contributing guide for adding languages/providers
+**Evidence:** Probe wins adoption with zero-config (`npx` one-liner). Our moat is
+quality, but users need to try it first.
+
+### P9: Advanced (ongoing)
+- Call graph extraction (tree-sitter → function call edges)
+- Matryoshka adaptive dimensions (CodeSage v2, nomic-embed-text-v1.5)
+- Retrieval feedback loop (log query→used_results, tune RRF weights per-repo)
+- Multi-repo indexing
+- Streaming index via MCP (`index_file` tool for single-file updates)
+- cAST dynamic chunk sizing (ChunkHound algorithm)
+- VS Code extension
 
 ---
 
 ## Priority Matrix
 
-| Feature | Effort | Impact | Competitors Have It | Priority |
-|---------|--------|--------|-------------------|----------|
-| Provider in manifest | 1 day | high | N/A (our bug) | P0 |
-| File watcher reindex | 2 days | high | grepai, cocoindex | P0 |
-| Token-budget output | 1 day | high | Probe, ColGrep | P0 |
-| Cross-encoder reranker | 3 days | high | DeepContext, Cursor | P1 |
-| Multi-query expansion | 2 days | medium | Cursor, Cody | P1 |
-| Diff-aware retrieval | 2 days | high | Cursor, Copilot | P1 |
-| Eval framework | 3 days | critical | Claude Context | P1 |
-| LateOn-Code / ColBERT | 2-3 weeks | very high | **nobody in our space** | P1 |
-| Hybrid regex+semantic | 3 days | high | ColGrep only | P2 |
-| Matryoshka dimensions | 2 days | medium | Copilot | P2 |
-| Call graph extraction | 2 weeks | medium | grepai | P2 |
-| Feedback loop | 2 weeks | medium | nobody OSS | P3 |
-| Multi-repo | 1 week | medium | Kit | P3 |
-| Streaming index via MCP | 2 days | medium | nobody | P3 |
-| Homebrew/crates.io | 2 days | critical (adoption) | grepai, Probe | P1 |
-| VS Code extension | 1 week | high (adoption) | Claude Context | P2 |
+| # | Feature | Effort | R@5 Impact | DX Impact | Competitors Have It |
+|---|---|---|---|---|---|
+| P0 | LLM query expansion | 2d | **+20-30%** | medium | Cursor (proprietary) |
+| P1 | Jina reranker | 2d | **+5-15%** | medium | Continue.dev only |
+| P2 | voyage-code-3 | 1d | +5-10% | none | Continue.dev |
+| P3 | Session dedup | 1d | none | **high** | Probe only |
+| P4 | Expand eval | 2d | measurement | none | Claude Context |
+| P5 | LanceDB backend | 1w | perf | none | nobody (novel) |
+| P6 | ColBERT | 2-3w | **+15-25%** | none | **nobody in MCP** |
+| P7 | npm distribution | 3d | none | **critical** | Probe, grepai |
+| P8 | Lite mode | 2d | none | **critical** | Probe |
+| P9 | Advanced features | ongoing | varies | varies | varies |
+
+## Target Metrics
+
+| Metric | Current | After P0-P1 | After P0-P6 | Best-in-class (Cursor) |
+|---|---|---|---|---|
+| R@5 | 0.567 | 0.80-0.85 | 0.90+ | ~0.90 (estimated) |
+| R@10 | 0.600 | 0.85-0.90 | 0.95+ | ~0.95 |
+| MRR | 0.454 | 0.70-0.80 | 0.85+ | ~0.85 |
 
 ---
 
 ## What Makes This "Can't Live Without"
 
-The thesis: **agents spend 60%+ of their first turn finding context** (Claude Code's own data). Every token wasted on search is a token not spent on reasoning. skelesearch cuts that to near-zero with:
+Your agent spends half its tokens LOOKING for code. skelesearch finds it in one shot.
 
-1. **Instant concept search** — "find retry logic" works even when the code uses `with_backoff` and `attempt_loop`
-2. **Precision over recall** — token-budget-aware output + MMR diversity + reranking = only relevant results
-3. **Zero maintenance** — file watcher keeps index fresh, embedding cache makes re-index instant
-4. **Universal agent compatibility** — MCP server works with every major agent (Claude Code, Codex, Cursor, Windsurf, OMP)
-5. **Best-in-class retrieval** — late interaction (ColBERT) + hybrid BM25+vector + reranking = quality that matches Cursor's internal pipeline, as an open-source standalone tool
-
-The moat: nobody else combines late-interaction retrieval + hybrid search + local+cloud embeddings + MCP + production quality in one open-source package. Cursor has the quality but it's proprietary and locked to their IDE. We make that quality available to every agent.
-
----
+- **97% token reduction** vs grep-only workflows (grepai benchmark on 155K LOC)
+- **12.5% higher accuracy** vs grep (Cursor's own A/B test)
+- **Zero context pollution** — token budget + session dedup + precision-first ranking
+- **Universal** — works with Claude Code, Codex, OMP, Cursor, Windsurf via MCP
+- **Private** — local-first, your code never leaves your machine (unless you choose cloud embeddings)
+- **Modular** — swap embedding models, rerankers, and storage backends independently
 
 ## Technical Decisions Log
 
 | Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Vector DB | CozoDB (HNSW + FTS in one DB) | Single dependency. Migration path to LanceDB+Tantivy documented. |
-| Chunking | tree-sitter AST | Consensus approach. 15 languages. Sliding-window fallback. |
-| Fusion | RRF (Reciprocal Rank Fusion) | Proven, parameter-free. DBSF considered for v2. |
-| Default embedding | jina-v2-base-code (local) | Code-specialized, 768-dim, fast ONNX. |
-| Cloud embedding | OpenAI text-embedding-3-small | Cheapest, widest adoption. voyage-code-3 for quality. |
-| Reranker (planned) | Qwen3-Reranker (Apache-2.0) | Open license. Jina v3 is CC BY-NC. |
-| Late interaction (planned) | LateOn-Code 130M | Best code ColBERT. ONNX. MIT license. |
+|---|---|---|
+| Default storage | CozoDB (HNSW + FTS) | Single dependency. LanceDB+Tantivy as feature-gated alternative. |
+| Chunking | tree-sitter AST | Consensus. 15 languages. Sliding-window fallback. |
+| Fusion | RRF | Proven, parameter-free. DBSF considered for v2. |
+| Default local embedding | jina-v2-base-code | Code-specialized, 768-dim, fast ONNX. Upgrade to CodeRankEmbed planned. |
+| Cloud embedding | OpenAI text-embedding-3-small | Cheapest. voyage-code-3 for quality (P2). |
+| Reranker | Jina API (code-specific, free tier) | Best code reranker. Cohere/Voyage as alternatives. |
+| Late interaction | LateOn-Code 130M via next-plaid | Best code ColBERT. ONNX. Apache-2.0. PLAID storage. |
+| Query expansion | LLM keyword extraction, gated by query classifier | QECK: +64% precision. HyDE rejected (Continue.dev removed it). |
 | Language | Rust | Performance, single binary, no runtime deps. |
-| Interface | MCP + CLI | MCP for agents, CLI for humans. HTTP for non-subprocess consumers. |
+| Interface | MCP + CLI | MCP for agents, CLI for humans. HTTP for non-subprocess. |
+| Distribution | npm-wrapped native binary | `npx -y @skelesearch/mcp` one-liner. Homebrew + cargo install as alternatives. |
 
 ---
 
-*Last updated: 2026-03-18*
-*Sources: Parallel deep research across academic papers, competitor repos, pricing pages, and blog posts.*
-*Companion: `docs/competitive-landscape.md`, `docs/future-improvements.md`*
+*Last updated: 2026-03-19. Revised from original roadmap based on consolidated research
+from 6 internal research tasks, 1 external analysis, and eval data from 15-case skelegent benchmark.*
