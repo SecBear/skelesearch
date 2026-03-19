@@ -63,19 +63,61 @@ fn sanitize_fts_query(query: &str) -> String {
         .join(" ")
 }
 
+/// Split camelCase/PascalCase tokens into constituent words.
+///
+/// Returns the original token plus the split parts.  "superRefine" becomes
+/// `["superRefine", "super", "Refine"]`.  Pure-lowercase or pure-uppercase
+/// tokens pass through unchanged (returns just the original).
+fn split_camel_case(token: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let chars: Vec<char> = token.chars().collect();
+    for i in 1..chars.len() {
+        // Split on lowercase→uppercase boundary (camelCase) or a run of
+        // uppercase followed by a lowercase (e.g. "HTTPClient" → "HTTP", "Client").
+        let split = chars[i].is_uppercase() && (
+            chars[i - 1].is_lowercase()
+            || (i + 1 < chars.len() && chars[i + 1].is_lowercase() && chars[i - 1].is_uppercase())
+        );
+        if split {
+            let part: String = chars[start..i].iter().collect();
+            if part.len() > 1 {
+                parts.push(part);
+            }
+            start = i;
+        }
+    }
+    let tail: String = chars[start..].iter().collect();
+    if tail.len() > 1 {
+        parts.push(tail);
+    }
+    if parts.len() <= 1 {
+        // No split occurred or single part — just return the original.
+        return vec![token.to_string()];
+    }
+    let mut result = vec![token.to_string()];
+    result.extend(parts);
+    result
+}
+
 fn expand_query(query: &str) -> String {
-    let keywords: Vec<&str> = query
-        .split_whitespace()
-        .filter(|w| w.len() > 2)
-        .filter(|w| !STOP_WORDS.contains(&w.to_lowercase().as_str()))
-        .collect();
+    let mut keywords: Vec<String> = Vec::new();
+    for word in query.split_whitespace() {
+        if word.len() <= 2 || STOP_WORDS.contains(&word.to_lowercase().as_str()) {
+            continue;
+        }
+        // Split camelCase/PascalCase tokens so BM25 can match individual parts.
+        for part in split_camel_case(word) {
+            if !keywords.contains(&part) {
+                keywords.push(part);
+            }
+        }
+    }
 
     if keywords.is_empty() || keywords.len() == query.split_whitespace().count() {
-        // No expansion needed — query is already all keywords or no keywords extracted
         return query.to_string();
     }
 
-    // Return original query + extracted keywords (boosts BM25 term frequency)
     format!("{} {}", query, keywords.join(" "))
 }
 
@@ -178,37 +220,12 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             return Ok(vec![]);
         }
 
-        // Downrank test-file results before quality labelling so that labels
-        // reflect the adjusted scores.  Test code is rarely the most useful
-        // answer to a non-test query.
-        for hit in &mut hits {
-            if is_test_file(&hit.file_path) {
-                hit.score *= 0.3;
-            }
-        }
-
-        // Label quality using relative thresholds against the top score.
-        let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
-        let labels = Self::label_match_quality(&scores);
-        for (hit, label) in hits.iter_mut().zip(labels) {
-            hit.match_quality = label;
-            // why is set by hybrid_search: "fts", "vector", or "hybrid"
-        }
-
         // Graph augmentation: pull in chunks from files reachable via resolved
         // import edges.  Runs after hybrid search (so we have seed hits) but
         // before MMR + reranker (so expanded results participate in filtering).
         if include_graph && max_depth > 0 {
-            // Remember the pre-expansion count so we can apply the test-file
-            // penalty to only the newly added graph chunks below.
-            let pre_graph_len = hits.len();
             let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
             hits = self.augment_with_graph(hits, max_depth, best_score).await?;
-            for hit in hits.iter_mut().skip(pre_graph_len) {
-                if is_test_file(&hit.file_path) {
-                    hit.score *= 0.3;
-                }
-            }
         }
 
         // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
@@ -278,6 +295,28 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         } else {
             hits
         };
+
+        // Source-type penalties applied AFTER reranker blending so that the
+        // reranker's relevance signal isn't overriding these structural priors.
+        // Test files rarely answer non-test queries; doc/prose files match NL
+        // queries deceptively well but aren't "the implementation".
+        let mut hits = hits;
+        for hit in &mut hits {
+            if is_test_file(&hit.file_path) {
+                hit.score *= 0.3;
+            } else if is_doc_file(&hit.file_path) {
+                hit.score *= 0.5;
+            }
+        }
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Label quality using relative thresholds against the post-penalty
+        // top score so labels reflect final ranking.
+        let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
+        let labels = Self::label_match_quality(&scores);
+        for (hit, label) in hits.iter_mut().zip(labels) {
+            hit.match_quality = label;
+        }
 
         // Apply token budget if specified.  Results are already scored
         // highest-first; greedily include until the budget is exhausted.
@@ -462,7 +501,7 @@ fn mmr_score(
 
 
 // ---------------------------------------------------------------------------
-// Test-file detection
+// File-type detection (test, doc/prose)
 // ---------------------------------------------------------------------------
 
 /// Returns `true` when `path` looks like a test or spec file.
@@ -511,9 +550,38 @@ fn is_test_file(path: &str) -> bool {
         || stem.ends_with("_spec")
 }
 
+/// Returns `true` when `path` looks like a documentation or prose file.
+///
+/// Matches on (case-insensitive):
+/// - Extensions: `.md`, `.mdx`, `.rst`, `.adoc`, `.txt`, `.org`
+/// - Exact file names (stem): `README`, `CHANGELOG`, `CHANGES`,
+///   `HISTORY`, `NEWS`, `AUTHORS`, `CONTRIBUTORS`, `LICENSE`, `LICENCE`
+fn is_doc_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let norm = lower.replace('\\', "/");
+
+    // Extension-based patterns.
+    const DOC_EXTS: &[&str] = &[".md", ".mdx", ".rst", ".adoc", ".txt", ".org"];
+    if DOC_EXTS.iter().any(|e| norm.ends_with(e)) {
+        return true;
+    }
+
+    // Well-known prose filenames (with or without extension).
+    let file_name = norm.rsplit('/').next().unwrap_or(&norm);
+    let stem = match file_name.rfind('.') {
+        Some(dot) => &file_name[..dot],
+        None => file_name,
+    };
+    matches!(
+        stem,
+        "readme" | "changelog" | "changes" | "history" | "news"
+            | "authors" | "contributors" | "license" | "licence"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, sanitize_fts_query, expand_query};
+    use super::{is_test_file, is_doc_file, sanitize_fts_query, expand_query, split_camel_case};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -653,5 +721,98 @@ mod tests {
         // the query passes through unchanged.
         let result = expand_query("error handling middleware");
         assert_eq!(result, "error handling middleware");
+    }
+
+    #[test]
+    fn expand_query_splits_camel_case() {
+        let result = expand_query("find superRefine usage");
+        assert!(result.contains("superRefine"), "should keep original token");
+        assert!(result.contains("super"), "should split camelCase");
+        assert!(result.contains("Refine"), "should split camelCase");
+    }
+
+    #[test]
+    fn expand_query_splits_pascal_case() {
+        let result = expand_query("what is AsyncClient");
+        assert!(result.contains("AsyncClient"));
+        assert!(result.contains("Async"));
+        assert!(result.contains("Client"));
+    }
+
+    // --- split_camel_case tests ---
+
+    #[test]
+    fn split_camel_case_simple() {
+        assert_eq!(split_camel_case("superRefine"), vec!["superRefine", "super", "Refine"]);
+    }
+
+    #[test]
+    fn split_camel_case_pascal() {
+        assert_eq!(split_camel_case("AsyncClient"), vec!["AsyncClient", "Async", "Client"]);
+    }
+
+    #[test]
+    fn split_camel_case_acronym() {
+        assert_eq!(split_camel_case("HTTPClient"), vec!["HTTPClient", "HTTP", "Client"]);
+    }
+
+    #[test]
+    fn split_camel_case_all_lower() {
+        // No split — returns just the original.
+        assert_eq!(split_camel_case("hello"), vec!["hello"]);
+    }
+
+    #[test]
+    fn split_camel_case_all_upper() {
+        assert_eq!(split_camel_case("HTTP"), vec!["HTTP"]);
+    }
+
+    #[test]
+    fn split_camel_case_three_parts() {
+        assert_eq!(
+            split_camel_case("getFileContext"),
+            vec!["getFileContext", "get", "File", "Context"]
+        );
+    }
+
+    // --- is_doc_file tests ---
+
+    #[test]
+    fn doc_file_markdown() {
+        assert!(is_doc_file("README.md"));
+        assert!(is_doc_file("docs/api.md"));
+        assert!(is_doc_file("CHANGELOG.md"));
+        assert!(is_doc_file("src/docs/guide.mdx"));
+    }
+
+    #[test]
+    fn doc_file_in_docs_dir_still_needs_doc_extension() {
+        // A .py file in docs/ is code, not prose — should NOT be penalized.
+        assert!(!is_doc_file("docs/tutorial.py"));
+        assert!(!is_doc_file("doc/reference.rs"));
+        // But markdown in docs/ IS a doc file.
+        assert!(is_doc_file("docs/guide.md"));
+        assert!(is_doc_file("doc/api.rst"));
+    }
+
+    #[test]
+    fn doc_file_well_known_stems() {
+        assert!(is_doc_file("README"));
+        assert!(is_doc_file("CHANGELOG"));
+        assert!(is_doc_file("LICENSE"));
+        assert!(is_doc_file("AUTHORS.txt"));
+        assert!(is_doc_file("CONTRIBUTORS.md"));
+    }
+
+    #[test]
+    fn doc_file_negative() {
+        // Source code is not a doc file.
+        assert!(!is_doc_file("src/parser.rs"));
+        assert!(!is_doc_file("src/index.ts"));
+        assert!(!is_doc_file("httpx/_client.py"));
+        // Test files are not doc files.
+        assert!(!is_doc_file("tests/test_auth.py"));
+        // File with 'doc' in the name but not in a docs/ directory.
+        assert!(!is_doc_file("src/docstring.rs"));
     }
 }

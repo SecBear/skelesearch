@@ -49,5 +49,72 @@
     ],
     "category": "cross file relationship",
     "notes": "The core completion engine lives in completions.go and shell specific script generation is split by target shell."
+  },
+  {
+    "query": "How does cobra generate zsh shell completion scripts with directive handling",
+    "expected_files": [
+      "zsh_completions.go"
+    ]
+  },
+  {
+    "query": "How does cobra generate PowerShell completion scripts supporting multiple completion modes",
+    "expected_files": [
+      "powershell_completions.go"
+    ]
+  },
+  {
+    "query": "How does cobra suggest corrections for mistyped command names",
+    "expected_files": [
+      "command.go",
+      "cobra.go"
+    ]
+  },
+  {
+    "query": "How does cobra generate man pages from command definitions",
+    "expected_files": [
+      "doc/man_docs.go",
+      "doc/util.go"
+    ]
+  },
+  {
+    "query": "How does cobra generate markdown documentation for the command tree",
+    "expected_files": [
+      "doc/md_docs.go",
+      "doc/util.go"
+    ]
+  },
+  {
+    "query": "How does the ActiveHelp system provide real-time help during shell completion",
+    "expected_files": [
+      "active_help.go",
+      "completions.go"
+    ]
+  },
+  {
+    "query": "What is the command execution lifecycle order including persistent pre and post run hooks",
+    "expected_files": [
+      "command.go",
+      "cobra.go"
+    ]
+  },
+  {
+    "query": "How does cobra handle the Windows mousetrap for CLI programs launched from Explorer",
+    "expected_files": [
+      "command_win.go",
+      "command_notwin.go"
+    ]
+  },
+  {
+    "query": "How does cobra mark flags as required or restrict them to filename and directory completion",
+    "expected_files": [
+      "shell_completions.go",
+      "completions.go"
+    ]
+  },
+  {
+    "query": "How does the completion engine resolve flag value completions and ValidArgsFunction callbacks",
+    "expected_files": [
+      "completions.go"
+    ]
   }
 ]

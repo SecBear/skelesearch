@@ -48,5 +48,73 @@
     ],
     "category": "cross file relationship",
     "notes": "HTTPException exposes getResponse and the default error handler knows how to use it."
+  },
+  {
+    "query": "How does the trie router match URL paths and extract named parameters",
+    "expected_files": [
+      "src/router/trie-router/router.ts",
+      "src/router/trie-router/node.ts"
+    ]
+  },
+  {
+    "query": "How does the RegExp router compile a trie into a single regular expression for route matching",
+    "expected_files": [
+      "src/router/reg-exp-router/router.ts",
+      "src/router/reg-exp-router/trie.ts",
+      "src/router/reg-exp-router/matcher.ts"
+    ]
+  },
+  {
+    "query": "How does the request validator extract and validate data from JSON form query and header targets",
+    "expected_files": [
+      "src/validator/validator.ts"
+    ]
+  },
+  {
+    "query": "How does the CORS middleware handle preflight OPTIONS requests and origin matching",
+    "expected_files": [
+      "src/middleware/cors/index.ts"
+    ]
+  },
+  {
+    "query": "How does JWT token verification work with both Authorization header and cookie sources",
+    "expected_files": [
+      "src/middleware/jwt/jwt.ts"
+    ]
+  },
+  {
+    "query": "How does basic auth implement timing-safe password comparison",
+    "expected_files": [
+      "src/middleware/basic-auth/index.ts",
+      "src/utils/buffer.ts"
+    ]
+  },
+  {
+    "query": "How does the server-sent events streaming helper format and send SSE messages",
+    "expected_files": [
+      "src/helper/streaming/sse.ts",
+      "src/helper/streaming/stream.ts"
+    ]
+  },
+  {
+    "query": "How do the middleware combinators some every and except compose multiple middleware functions",
+    "expected_files": [
+      "src/middleware/combine/index.ts",
+      "src/compose.ts"
+    ]
+  },
+  {
+    "query": "How does the typed RPC client use JavaScript Proxy to build type-safe API calls",
+    "expected_files": [
+      "src/client/client.ts",
+      "src/client/types.ts"
+    ]
+  },
+  {
+    "query": "How does the secure headers middleware generate CSP nonces and configure permissions policy",
+    "expected_files": [
+      "src/middleware/secure-headers/secure-headers.ts",
+      "src/middleware/secure-headers/permissions-policy.ts"
+    ]
   }
 ]

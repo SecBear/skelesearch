@@ -353,7 +353,8 @@ impl SkeleSearchServer {
                 let manifest = Arc::new(ManifestStore::open(manifest_path.as_path())?);
                 let config = Config::load(&path).context("load .skelesearch.toml")?;
                 let indexer = Indexer::new(backend, manifest, provider_for_closure)
-                    .with_excludes(config.index.exclude.clone());
+                    .with_excludes(config.index.exclude.clone())
+                    .with_include_extensions(config.index.include_extensions.clone());
                 indexer.index_path(&path).await
             })
         })

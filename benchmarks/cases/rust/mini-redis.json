@@ -48,5 +48,68 @@
     ],
     "category": "cross file relationship",
     "notes": "Connection buffers socket reads and delegates RESP parsing/materialization to Frame."
+  },
+  {
+    "query": "How does the Parse utility extract typed values from a frame and what errors can it produce",
+    "expected_files": [
+      "src/parse.rs"
+    ]
+  },
+  {
+    "query": "How does the SET command parse optional expiration arguments like EX and PX from the protocol frame",
+    "expected_files": [
+      "src/cmd/set.rs"
+    ]
+  },
+  {
+    "query": "How does the publish command broadcast a message and how does the database route it to subscribers",
+    "expected_files": [
+      "src/cmd/publish.rs",
+      "src/db.rs"
+    ]
+  },
+  {
+    "query": "How does the blocking client wrap the async client to provide synchronous Redis operations",
+    "expected_files": [
+      "src/clients/blocking_client.rs"
+    ]
+  },
+  {
+    "query": "How does the BufferedClient use channels and message passing to allow multiple tasks to share a single Redis connection",
+    "expected_files": [
+      "src/clients/buffered_client.rs"
+    ]
+  },
+  {
+    "query": "How does the async Client validate server responses and convert error frames into Rust errors",
+    "expected_files": [
+      "src/clients/client.rs"
+    ]
+  },
+  {
+    "query": "How does the server limit concurrent connections and implement exponential backoff on accept errors",
+    "expected_files": [
+      "src/server.rs"
+    ]
+  },
+  {
+    "query": "How does the CLI binary parse command-line arguments and dispatch to the async client methods",
+    "expected_files": [
+      "src/bin/cli.rs"
+    ]
+  },
+  {
+    "query": "How does the Unknown command type handle unrecognized Redis commands",
+    "expected_files": [
+      "src/cmd/unknown.rs",
+      "src/cmd/mod.rs"
+    ]
+  },
+  {
+    "query": "What is the public API surface exported by the library crate and how are modules organized",
+    "expected_files": [
+      "src/lib.rs",
+      "src/clients/mod.rs"
+    ]
   }
 ]

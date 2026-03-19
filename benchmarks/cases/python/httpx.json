@@ -47,5 +47,74 @@
     ],
     "category": "cross file relationship",
     "notes": "Limits and TLS settings are defined in config and consumed by transport construction."
+  },
+  {
+    "query": "How does httpx parse and validate URLs with percent-encoding and IDNA hostname normalization",
+    "expected_files": [
+      "httpx/_urlparse.py",
+      "httpx/_urls.py"
+    ]
+  },
+  {
+    "query": "How does httpx encode multipart form data and guess MIME types for file uploads",
+    "expected_files": [
+      "httpx/_multipart.py"
+    ]
+  },
+  {
+    "query": "What is the exception hierarchy in httpx and how are httpcore transport errors mapped",
+    "expected_files": [
+      "httpx/_exceptions.py",
+      "httpx/_transports/default.py"
+    ]
+  },
+  {
+    "query": "How does httpx decompress response bodies with gzip brotli deflate and zstandard content-encoding",
+    "expected_files": [
+      "httpx/_decoders.py"
+    ]
+  },
+  {
+    "query": "How does httpx support streaming responses with iter_bytes iter_text and iter_lines",
+    "expected_files": [
+      "httpx/_models.py",
+      "httpx/_decoders.py"
+    ]
+  },
+  {
+    "query": "How does httpx configure and route requests through HTTP and SOCKS proxies",
+    "expected_files": [
+      "httpx/_config.py",
+      "httpx/_utils.py",
+      "httpx/_client.py"
+    ]
+  },
+  {
+    "query": "How does httpx implement the transport layer abstraction with BaseTransport and WSGI/ASGI transports",
+    "expected_files": [
+      "httpx/_transports/base.py",
+      "httpx/_transports/default.py",
+      "httpx/_transports/wsgi.py",
+      "httpx/_transports/asgi.py"
+    ]
+  },
+  {
+    "query": "How does httpx handle request body content encoding for JSON form data and raw bytes",
+    "expected_files": [
+      "httpx/_content.py",
+      "httpx/_multipart.py"
+    ]
+  },
+  {
+    "query": "What type aliases does httpx define for headers cookies auth timeout and file parameters",
+    "expected_files": [
+      "httpx/_types.py"
+    ]
+  },
+  {
+    "query": "How do the top-level httpx.get httpx.post convenience functions create and manage client instances",
+    "expected_files": [
+      "httpx/_api.py"
+    ]
   }
 ]

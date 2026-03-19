@@ -50,5 +50,72 @@
     ],
     "category": "architecture conceptual lookup",
     "notes": "ExportManager registers exporters and JsonExporter serializes pretty JSON."
+  },
+  {
+    "query": "How does hyperfine parse command-line arguments like warmup runs min/max runs and shell selection",
+    "expected_files": [
+      "src/cli.rs",
+      "src/options.rs"
+    ]
+  },
+  {
+    "query": "What error types does hyperfine define for parameter scanning and option validation",
+    "expected_files": [
+      "src/error.rs"
+    ]
+  },
+  {
+    "query": "How does hyperfine compute relative speed ratios and uncertainty propagation between benchmarks",
+    "expected_files": [
+      "src/benchmark/relative_speed.rs"
+    ]
+  },
+  {
+    "query": "How does hyperfine automatically select time units and format durations as seconds milliseconds or microseconds",
+    "expected_files": [
+      "src/output/format.rs",
+      "src/util/units.rs"
+    ]
+  },
+  {
+    "query": "How does hyperfine measure CPU time on Windows using job objects and NtResumeProcess",
+    "expected_files": [
+      "src/timer/windows_timer.rs"
+    ]
+  },
+  {
+    "query": "How does hyperfine handle non-zero exit codes during benchmark runs including ignore-failure mode",
+    "expected_files": [
+      "src/benchmark/executor.rs",
+      "src/options.rs"
+    ]
+  },
+  {
+    "query": "What executor types does hyperfine support and how do RawExecutor and ShellExecutor differ in calibration",
+    "expected_files": [
+      "src/benchmark/executor.rs"
+    ]
+  },
+  {
+    "query": "How does the MarkupExporter trait provide shared table rendering for markdown asciidoc and orgmode",
+    "expected_files": [
+      "src/export/markup.rs",
+      "src/export/markdown.rs",
+      "src/export/asciidoc.rs",
+      "src/export/orgmode.rs"
+    ]
+  },
+  {
+    "query": "How does hyperfine tokenize comma-separated parameter values with backslash escape handling",
+    "expected_files": [
+      "src/parameter/tokenize.rs"
+    ]
+  },
+  {
+    "query": "How does hyperfine use randomized environment variable padding to counteract memory layout effects on benchmarks",
+    "expected_files": [
+      "src/util/randomized_environment_offset.rs",
+      "src/benchmark/executor.rs"
+    ]
   }
 ]

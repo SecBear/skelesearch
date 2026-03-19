@@ -51,5 +51,78 @@
     ],
     "category": "cross file relationship",
     "notes": "Core factory functions implement refine behavior and classic schemas expose instance methods."
+  },
+  {
+    "query": "How does zod validate string formats like email UUID and IPv4 using regex patterns",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/core/regexes.ts",
+      "packages/zod/src/v4/core/checks.ts"
+    ]
+  },
+  {
+    "query": "How does the discriminated union use a Map-based fast path to dispatch to the correct schema option",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/core/api.ts"
+    ]
+  },
+  {
+    "query": "How does the coercion system convert input values before validation",
+    "expected_files": [
+      "packages/zod/src/v4/classic/coerce.ts",
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/core/api.ts"
+    ]
+  },
+  {
+    "query": "How does the template literal schema build regex patterns from concatenated parts",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/core/api.ts"
+    ]
+  },
+  {
+    "query": "How does the registry and metadata system use WeakMap for schema-attached metadata with id-based lookup",
+    "expected_files": [
+      "packages/zod/src/v4/core/registries.ts",
+      "packages/zod/src/v4/core/to-json-schema.ts"
+    ]
+  },
+  {
+    "query": "How does zod generate JSON Schema from zod schemas supporting multiple draft versions",
+    "expected_files": [
+      "packages/zod/src/v4/core/to-json-schema.ts",
+      "packages/zod/src/v4/core/json-schema-processors.ts",
+      "packages/zod/src/v4/core/json-schema.ts"
+    ]
+  },
+  {
+    "query": "How does zod convert a JSON Schema document back into zod schemas",
+    "expected_files": [
+      "packages/zod/src/v4/classic/from-json-schema.ts"
+    ]
+  },
+  {
+    "query": "How does the internationalization system provide locale-specific error messages",
+    "expected_files": [
+      "packages/zod/src/v4/locales/en.ts",
+      "packages/zod/src/v4/core/config.ts",
+      "packages/zod/src/v4/core/errors.ts"
+    ]
+  },
+  {
+    "query": "How does the tuple schema validate fixed-length arrays with optional rest elements",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/core/api.ts"
+    ]
+  },
+  {
+    "query": "How does the record schema handle strict vs loose key validation and numeric string keys",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/core/api.ts"
+    ]
   }
 ]

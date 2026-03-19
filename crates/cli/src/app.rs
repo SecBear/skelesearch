@@ -229,6 +229,7 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
 
     let indexer = Indexer::new(backend, manifest, provider)
         .with_excludes(config.index.exclude.clone())
+        .with_include_extensions(config.index.include_extensions.clone())
         .with_symbol_enrichment(config.index.symbol_enrichment);
     let start = std::time::Instant::now();
     let result = indexer.index_path(&root).await?;
@@ -489,6 +490,7 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
             } else {
                 let indexer = Indexer::new(backend, manifest, provider)
                     .with_excludes(config.index.exclude.clone())
+                    .with_include_extensions(config.index.include_extensions.clone())
                     .with_symbol_enrichment(config.index.symbol_enrichment);
                 match indexer.index_path(&root).await {
                     Ok(r) => eprintln!(
@@ -563,7 +565,8 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                                     eprintln!("skelesearch watch: re-index backend init failed: {e}");
                                 } else {
                                     let indexer = Indexer::new(backend, manifest, provider)
-                                        .with_excludes(config.index.exclude.clone());
+                                        .with_excludes(config.index.exclude.clone())
+                                        .with_include_extensions(config.index.include_extensions.clone());
                                     match indexer.index_path(&root).await {
                                         Ok(r) => eprintln!(
                                             "skelesearch watch: re-indexed {} file(s), {} chunk(s)",

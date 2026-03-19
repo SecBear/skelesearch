@@ -60,6 +60,9 @@ pub struct Indexer<B, P> {
     /// When `false`, skip appending extracted symbol names to chunk normalised text.
     /// Allows benchmark profiles to isolate the contribution of symbol enrichment.
     symbol_enrichment: bool,
+    /// Extension allowlist. `None` → use `default_include_extensions()`.
+    /// `Some(set)` → only index files whose lowercased extension is in the set.
+    include_extensions: Option<HashSet<String>>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
@@ -71,6 +74,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             batch_size: 64,
             exclude: vec![],
             symbol_enrichment: true,
+            include_extensions: None,
         }
     }
 
@@ -95,6 +99,15 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
     /// glob wildcards (`*.lock`, `**/*.min.js`).
     pub fn with_excludes(mut self, exclude: Vec<String>) -> Self {
         self.exclude = exclude;
+        self
+    }
+
+    /// Override the default extension allowlist.  Pass `None` to use the
+    /// built-in list; pass `Some(extensions)` to replace it entirely.
+    pub fn with_include_extensions(mut self, extensions: Option<Vec<String>>) -> Self {
+        self.include_extensions = extensions.map(|exts| {
+            exts.into_iter().map(|e| e.to_lowercase()).collect()
+        });
         self
     }
     /// Walk `root`, detect changed files via the manifest, chunk and embed
@@ -165,6 +178,25 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             }
         };
 
+        // Build the effective extension allowlist.  The closure captures a
+        // reference so we pay the set-construction cost once, not per file.
+        let effective_exts: HashSet<String> = match &self.include_extensions {
+            Some(exts) => exts.clone(),
+            None => default_include_extensions(),
+        };
+        let extension_allowed = |path: &Path| -> bool {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Permit known extensionless files regardless of the allowlist.
+            if is_known_extensionless(name) {
+                return true;
+            }
+            match path.extension().and_then(|e| e.to_str()) {
+                Some(ext) => effective_exts.contains(&ext.to_lowercase()),
+                // No extension: skip by default.
+                None => false,
+            }
+        };
+
         let walker = ignore::WalkBuilder::new(root).build();
         for entry in walker {
             let entry = entry.context("directory walk entry error")?;
@@ -177,6 +209,14 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 .unwrap_or(&abs_path)
                 .to_string_lossy()
                 .to_string();
+
+            // Extension allowlist: skip files whose extension is not permitted.
+            // Checked before the exclude matcher so binary/media files never
+            // reach the gitignore logic — a small but measurable win on large repos.
+            if !extension_allowed(&abs_path) {
+                tracing::trace!(file = %rel_path, "skipping: extension not in allowlist");
+                continue;
+            }
 
             // Skip files matching any exclude pattern before adding to `visited` so
             // previously-indexed excluded files are reconciled out on the next run.
@@ -551,4 +591,48 @@ fn language_for(rel_path: &str) -> String {
         _ => "unknown",
     }
     .to_string()
+}
+
+/// The default set of file extensions that the indexer will process.
+///
+/// Any extension not in this set is silently skipped unless the caller
+/// provides an override via `Indexer::with_include_extensions`.
+/// The list is lower-cased; comparisons use `ext.to_lowercase()`.
+///
+/// **To add a new extension**, insert it here and into the relevant
+/// category comment.  Do NOT add binary/asset formats here.
+pub(crate) fn default_include_extensions() -> HashSet<String> {
+    // Keep sorted within each category for ease of review.
+    let exts: &[&str] = &[
+        // --- Programming languages ---
+        "astro", "bash", "bat", "c", "cc", "clj", "cljs", "cljc",
+        "cmd", "cpp", "cs", "cxx", "dart", "dhall", "el", "erl",
+        "ex", "exs", "fish", "fs", "fsi", "fsx", "go", "graphql",
+        "gql", "h", "hcl", "hpp", "hrl", "hs", "java", "jl",
+        "js", "jsx", "kt", "kts", "lua", "mjs", "cjs", "ml", "mli",
+        "nim", "nix", "php", "proto", "ps1", "py", "r", "rb",
+        "rs", "scala", "sh", "sql", "svelte", "swift", "tf", "thrift",
+        "ts", "tsx", "v", "vim", "vue", "zig", "zsh",
+        // --- Markup / documentation ---
+        "adoc", "html", "md", "mdx", "org", "rst", "txt",
+        // --- Styles ---
+        "css", "less", "sass", "scss",
+        // --- Data / config ---
+        "cfg", "cmake", "conf", "env", "gradle", "hcl", "ini",
+        "json", "makefile", "properties", "toml", "xml", "yaml", "yml",
+    ];
+    exts.iter().map(|s| s.to_string()).collect()
+}
+
+/// Files with no extension that should still be indexed.
+///
+/// `.gitignore`, `.env`, and other dot-files are intentionally excluded —
+/// they contain no indexable code and would bloat the search index.
+fn is_known_extensionless(filename: &str) -> bool {
+    matches!(
+        filename,
+        "Makefile" | "Dockerfile" | "Rakefile" | "Gemfile"
+            | "Justfile" | "Taskfile" | "Containerfile"
+            | "Vagrantfile" | "Brewfile" | "Procfile"
+    )
 }

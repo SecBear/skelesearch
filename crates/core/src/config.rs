@@ -18,6 +18,10 @@ pub struct IndexConfig {
     /// Append extracted symbol names to each chunk's normalised text for BM25.
     /// Disable to measure the contribution of symbol enrichment in benchmarks.
     pub symbol_enrichment: bool,
+    /// Override the default file-extension allowlist.  When set, only files
+    /// whose extension appears in this list are indexed.  When absent, the
+    /// built-in allowlist in `indexer.rs` is used.
+    pub include_extensions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +95,7 @@ impl Default for IndexConfig {
             exclude: vec![],
             index_dir: None,
             symbol_enrichment: true,
+            include_extensions: None,
         }
     }
 }
