@@ -360,12 +360,20 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 let cached = self.manifest.get_cached_embeddings(&hashes)?;
 
                 // Partition into hits and misses; track original sub-indices.
+                // For cache-miss texts, prepend file path context so the embedding
+                // model sees where this chunk lives in the codebase.  This is the
+                // Anthropic Contextual Retrieval pattern: -49% retrieval failure.
                 let mut miss_indices: Vec<usize> = Vec::new();
                 let mut miss_texts: Vec<String> = Vec::new();
                 for (i, hit) in cached.iter().enumerate() {
                     if hit.is_none() {
                         miss_indices.push(i);
-                        miss_texts.push(sub[i].1.content.clone());
+                        let (fi, chunk) = &sub[i];
+                        let rel_path = &batch_files[*fi].candidate.rel_path;
+                        miss_texts.push(format!(
+                            "{} {}\n{}",
+                            rel_path, chunk.chunk_type, chunk.content
+                        ));
                     }
                 }
 

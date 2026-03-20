@@ -317,9 +317,8 @@ async fn concurrent_index_and_search_does_not_panic() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Provider that maps text content to one of two clusters:
-/// text containing "near" → [1,0,0,0], anything else → [0,1,0,0].
-/// Both vectors are already unit-length (L2 norm = 1).
-/// This gives us a fully controlled similarity structure for MMR testing.
+/// text containing "cluster_a" → [1,0,0,0], anything else → [0,1,0,0].
+/// Both vectors are unit-length (L2 norm = 1).
 #[derive(Clone)]
 struct ClusterProvider;
 
@@ -328,7 +327,7 @@ impl EmbedProvider for ClusterProvider {
     fn dim(&self) -> usize { 4 }
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| {
-            if t.to_lowercase().contains("near") {
+            if t.contains("cluster_a") {
                 vec![1.0_f32, 0.0, 0.0, 0.0]
             } else {
                 vec![0.0_f32, 1.0, 0.0, 0.0]
@@ -339,17 +338,14 @@ impl EmbedProvider for ClusterProvider {
 
 #[tokio::test]
 async fn mmr_reranking_diversifies_results() -> anyhow::Result<()> {
-    // Two "near" files have identical stored embeddings [1,0,0,0].
-    // One "far" file has orthogonal stored embedding [0,1,0,0].
-    // Query "near_alpha" also maps to [1,0,0,0].
+    // Two files contain "cluster_a" in source → stored embeddings [1,0,0,0].
+    // One file does NOT → stored embedding [0,1,0,0].
+    // All three files share identical BM25 vocabulary ("handle request") so
+    // BM25 scores are roughly equal and only vector similarity differentiates.
     //
-    // Without MMR: near1, near2, far (by RRF relevance order).
-    // With MMR (diversity=0.7, lambda=0.3):
-    //   - Pick near1 (or near2) first (highest relevance = 1.0).
-    //   - near2 now has redundancy=cos([1,0,0,0],[1,0,0,0])=1.0 → mmr=-0.4
-    //   - far has redundancy=cos([0,1,0,0],[1,0,0,0])=0.0  → mmr=0.0
-    //   - far wins → order: [near1, far, near2]
-    // So the orderings differ.
+    // Query "cluster_a handle request" also maps to [1,0,0,0].
+    // Without MMR: dup1, dup2, other (by RRF relevance).
+    // With MMR: other promoted because dup2 is redundant with dup1.
     let dir = tempfile::tempdir()?;
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
@@ -358,21 +354,22 @@ async fn mmr_reranking_diversifies_results() -> anyhow::Result<()> {
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
     backend.initialize(4).await?;
 
-    // Write 3 small Rust source files with clearly differentiated content.
+    // Write 3 small Rust source files.  Content must contain "near" for
+    // ClusterProvider to map them correctly.  Use near/far in the actual
+    // source content (not just filenames) since embeddings come from content.
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo)?;
-    std::fs::write(repo.join("near1.rs"), "fn near_alpha() {}\n")?;
-    std::fs::write(repo.join("near2.rs"), "fn near_beta() {}\n")?;
-    std::fs::write(repo.join("far.rs"),   "fn far_omega() {}\n")?;
+    std::fs::write(repo.join("dup1.rs"),  "pub fn cluster_a_handle() { request_process() }\n")?;
+    std::fs::write(repo.join("dup2.rs"),  "pub fn cluster_a_dispatch() { request_route() }\n")?;
+    std::fs::write(repo.join("other.rs"), "pub fn cluster_b_handle() { request_serve() }\n")?;
 
     let indexer = Indexer::new(backend.clone(), manifest, ClusterProvider);
     indexer.index_path(&repo).await?;
 
     let searcher = Searcher::new(backend.clone(), ClusterProvider);
 
-    // Fetch all 3 chunks so the MMR has material to reorder.
-    let no_mmr   = searcher.search("near_alpha", 3, false, 0, 0.0, None).await?;
-    let with_mmr = searcher.search("near_alpha", 3, false, 0, 0.7, None).await?;
+    let no_mmr   = searcher.search("cluster_a handle request", 3, false, 0, 0.0, None).await?;
+    let with_mmr = searcher.search("cluster_a handle request", 3, false, 0, 0.7, None).await?;
 
     // Both searches must succeed and return at least one result.
     assert!(!no_mmr.is_empty(),   "no-MMR search must return results");
@@ -381,12 +378,16 @@ async fn mmr_reranking_diversifies_results() -> anyhow::Result<()> {
     // If the index returned all 3 chunks, the MMR ordering must differ:
     // MMR should promote the orthogonal "far" chunk ahead of the redundant "near" clone.
     if no_mmr.len() == 3 && with_mmr.len() == 3 {
-        let no_mmr_files: Vec<_>   = no_mmr.iter().map(|r| r.file_path.as_str()).collect();
         let with_mmr_files: Vec<_> = with_mmr.iter().map(|r| r.file_path.as_str()).collect();
-        assert_ne!(
-            no_mmr_files, with_mmr_files,
-            "MMR must reorder results when near-duplicate embeddings are present; \
-             no_mmr={no_mmr_files:?} with_mmr={with_mmr_files:?}"
+        // With high diversity, the two near-duplicate "cluster_a" files (dup1, dup2)
+        // must NOT be adjacent at positions 0 and 1.  MMR should interleave the
+        // orthogonal "other" file between them.
+        let cluster_a_files = ["dup1.rs", "dup2.rs"];
+        let both_first = cluster_a_files.contains(&with_mmr_files[0])
+            && cluster_a_files.contains(&with_mmr_files[1]);
+        assert!(
+            !both_first,
+            "MMR must not place both near-duplicate files at top 2; got {with_mmr_files:?}"
         );
     }
 

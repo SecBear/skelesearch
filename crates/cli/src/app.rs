@@ -731,14 +731,16 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
             query: case.query.clone(),
             recall_at_5: eval::recall_at_k(&unique_files, &case.expected_files, 5),
             recall_at_10: eval::recall_at_k(&unique_files, &case.expected_files, 10),
+            precision_at_5: eval::precision_at_k(&unique_files, &case.expected_files, 5),
             mrr: eval::mrr(&unique_files, &case.expected_files),
             retrieved_files: unique_files,
+            category: case.category.clone(),
         };
 
         if !json_output {
             println!(
-                "Q: {} | R@5={:.2} R@10={:.2} MRR={:.2}",
-                metrics.query, metrics.recall_at_5, metrics.recall_at_10, metrics.mrr
+                "Q: {} | R@5={:.2} R@10={:.2} P@5={:.2} MRR={:.2}",
+                metrics.query, metrics.recall_at_5, metrics.recall_at_10, metrics.precision_at_5, metrics.mrr
             );
         }
         results.push(metrics);
@@ -752,12 +754,15 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
                 "query": r.query,
                 "recall_at_5": r.recall_at_5,
                 "recall_at_10": r.recall_at_10,
+                "precision_at_5": r.precision_at_5,
                 "mrr": r.mrr,
                 "retrieved_files": r.retrieved_files,
+                "category": r.category,
             })).collect::<Vec<_>>(),
             "aggregate": {
                 "mean_recall_at_5": agg.mean_recall_at_5,
                 "mean_recall_at_10": agg.mean_recall_at_10,
+                "mean_precision_at_5": agg.mean_precision_at_5,
                 "mean_mrr": agg.mean_mrr,
                 "total_cases": agg.total_cases,
             }
@@ -768,6 +773,7 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
         println!("Cases:       {}", agg.total_cases);
         println!("Mean R@5:    {:.3}", agg.mean_recall_at_5);
         println!("Mean R@10:   {:.3}", agg.mean_recall_at_10);
+        println!("Mean P@5:    {:.3}", agg.mean_precision_at_5);
         println!("Mean MRR:    {:.3}", agg.mean_mrr);
     }
     Ok(())

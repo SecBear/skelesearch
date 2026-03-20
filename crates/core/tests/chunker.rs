@@ -82,3 +82,32 @@ fn normalize_fts_examples() {
     assert_eq!(normalize_for_fts("foo_bar_baz"), "foo bar baz");
     assert_eq!(normalize_for_fts("getHTTPSUrl"), "get https url");
 }
+
+#[test]
+fn normalized_field_has_path_and_type_prefix() -> anyhow::Result<()> {
+    // Tier 1 (Rust) — prefix should be "<rel_path> code <fts_text>"
+    let chunks = Chunker::default().chunk_file(
+        "src/lib.rs",
+        "fn greet() { println!(\"hello\"); }",
+    )?;
+    assert!(!chunks.is_empty());
+    for chunk in &chunks {
+        assert!(
+            chunk.normalized.starts_with("src/lib.rs code "),
+            "expected normalized to start with 'src/lib.rs code ', got: {:?}",
+            chunk.normalized
+        );
+        // content must be unchanged — embeddings come from content, not normalized
+        assert!(chunk.content.contains("greet"));
+    }
+
+    // Tier 2 (plain text) — prefix should be "<rel_path> text <fts_text>"
+    let txt_chunks = Chunker::default().chunk_file("docs/notes.txt", "hello world")?;
+    assert!(!txt_chunks.is_empty());
+    assert!(
+        txt_chunks[0].normalized.starts_with("docs/notes.txt text "),
+        "expected normalized to start with 'docs/notes.txt text ', got: {:?}",
+        txt_chunks[0].normalized
+    );
+    Ok(())
+}

@@ -16,6 +16,7 @@ cozo = { workspace = true }
 rusqlite = { workspace = true }
 
 tree-sitter = { workspace = true }
+tree-sitter-tags = { workspace = true }
 streaming-iterator = "0.1"
 tree-sitter-rust = { workspace = true }
 tree-sitter-nix = { workspace = true }

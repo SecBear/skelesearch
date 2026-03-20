@@ -330,6 +330,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 hit.score *= 0.3;
             } else if is_doc_file(&hit.file_path) {
                 hit.score *= 0.5;
+            } else if is_barrel_file(&hit.file_path) {
+                hit.score *= 0.4;
             }
         }
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -603,9 +605,30 @@ fn is_doc_file(path: &str) -> bool {
     )
 }
 
+/// Returns `true` when `path` looks like a barrel/re-export file.
+///
+/// Barrel files primarily re-export symbols from other modules without
+/// adding implementation. They contain every public symbol name, giving
+/// them artificially high BM25 keyword density.
+///
+/// Matches on (case-insensitive):
+/// - File names: `index.ts`, `index.js`, `index.mjs`, `mod.rs`, `__init__.py`
+/// - File stems: `barrel`, `exports`
+fn is_barrel_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let norm = lower.replace('\\', "/");
+    let file_name = norm.rsplit('/').next().unwrap_or(&norm);
+    matches!(
+        file_name,
+        "index.ts" | "index.js" | "index.jsx" | "index.tsx" | "index.mjs" | "index.cjs"
+            | "mod.rs" | "__init__.py"
+            | "barrel.ts" | "barrel.js" | "exports.ts" | "exports.js"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_doc_file, sanitize_fts_query, expand_query, split_camel_case};
+    use super::{is_test_file, is_doc_file, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -838,5 +861,25 @@ mod tests {
         assert!(!is_doc_file("tests/test_auth.py"));
         // File with 'doc' in the name but not in a docs/ directory.
         assert!(!is_doc_file("src/docstring.rs"));
+    }
+
+    // --- is_barrel_file tests ---
+
+    #[test]
+    fn barrel_file_positive() {
+        assert!(is_barrel_file("src/index.ts"));
+        assert!(is_barrel_file("src/index.js"));
+        assert!(is_barrel_file("src/mod.rs"));
+        assert!(is_barrel_file("httpx/__init__.py"));
+        assert!(is_barrel_file("src/barrel.ts"));
+        assert!(is_barrel_file("src/exports.js"));
+    }
+
+    #[test]
+    fn barrel_file_negative() {
+        assert!(!is_barrel_file("src/index.html"));
+        assert!(!is_barrel_file("src/main.rs"));
+        assert!(!is_barrel_file("src/client.ts"));
+        assert!(!is_barrel_file("src/models.py"));
     }
 }

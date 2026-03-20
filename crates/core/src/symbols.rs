@@ -1,5 +1,6 @@
 use crate::chunker::languages::config_for_extension;
-use tree_sitter::Parser;
+use tree_sitter::Language;
+use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -24,23 +25,44 @@ pub struct SymbolDef {
 /// Extract named symbol definitions from `source` by parsing it with the
 /// tree-sitter grammar inferred from `filename`'s extension.
 ///
+/// Attempts to use tree-sitter-tags for richer extraction; falls back to the
+/// manual AST traversal when no tags query is available for the language or
+/// when `TagsConfiguration` fails to compile.
+///
 /// Returns an empty `Vec` for unknown extensions or source that yields no
-/// top-level named nodes — not an error.  Only nodes that carry a `name`
-/// field in the grammar are emitted; anonymous nodes (e.g. bare `impl`
-/// blocks with no associated name field) are silently skipped per spec.
+/// top-level named nodes — not an error.
 pub fn extract_symbols(filename: &str, source: &str) -> anyhow::Result<Vec<SymbolDef>> {
     let ext = std::path::Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
 
+    // Unknown extension: spec says return empty, not an error.
     let cfg = match config_for_extension(ext) {
         Some(c) => c,
-        // Unknown extension: spec says return empty, not an error.
         None => return Ok(vec![]),
     };
 
-    let mut parser = Parser::new();
+    // Try the tree-sitter-tags path first.
+    if let Some((tags_query, lang)) = tags_info_for_extension(ext) {
+        match TagsConfiguration::new(lang, tags_query, "") {
+            Ok(tags_cfg) => {
+                return extract_via_tags(&tags_cfg, source, filename);
+            }
+            Err(e) => {
+                // The tags query failed to compile for this language version;
+                // log at debug and fall through to the manual path.
+                tracing::debug!(
+                    ext,
+                    error = %e,
+                    "tree-sitter-tags config failed; falling back to manual traversal"
+                );
+            }
+        }
+    }
+
+    // Manual fallback: walk the AST looking for chunk-level nodes.
+    let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&cfg.language())
         .map_err(|e| anyhow::anyhow!("set_language: {e}"))?;
@@ -61,7 +83,133 @@ pub fn extract_symbols(filename: &str, source: &str) -> anyhow::Result<Vec<Symbo
 }
 
 // ---------------------------------------------------------------------------
-// AST traversal
+// tree-sitter-tags extraction
+// ---------------------------------------------------------------------------
+
+/// Returns the tags query string and the correct `Language` for `ext`, or
+/// `None` if the language crate does not expose a `TAGS_QUERY` constant.
+///
+/// Note: tsx gets `LANGUAGE_TSX` (not `LANGUAGE_TYPESCRIPT`) so the correct
+/// grammar is used; both share the same `tags.scm`.
+/// Languages without a committed tags query (c-sharp, kotlin-sg, scala, nix)
+/// return `None` and fall through to the manual traversal.
+fn tags_info_for_extension(ext: &str) -> Option<(&'static str, Language)> {
+    match ext {
+        "rs" => Some((
+            tree_sitter_rust::TAGS_QUERY,
+            tree_sitter_rust::LANGUAGE.into(),
+        )),
+        "py" => Some((
+            tree_sitter_python::TAGS_QUERY,
+            tree_sitter_python::LANGUAGE.into(),
+        )),
+        // ts and tsx share the same tags.scm but use different grammars.
+        "ts" => Some((
+            tree_sitter_typescript::TAGS_QUERY,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        )),
+        "tsx" => Some((
+            tree_sitter_typescript::TAGS_QUERY,
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+        )),
+        "js" | "jsx" | "mjs" | "cjs" => Some((
+            tree_sitter_javascript::TAGS_QUERY,
+            tree_sitter_javascript::LANGUAGE.into(),
+        )),
+        "go" => Some((
+            tree_sitter_go::TAGS_QUERY,
+            tree_sitter_go::LANGUAGE.into(),
+        )),
+        "java" => Some((
+            tree_sitter_java::TAGS_QUERY,
+            tree_sitter_java::LANGUAGE.into(),
+        )),
+        "c" | "h" => Some((
+            tree_sitter_c::TAGS_QUERY,
+            tree_sitter_c::LANGUAGE.into(),
+        )),
+        "cpp" | "cc" | "cxx" | "hpp" => Some((
+            tree_sitter_cpp::TAGS_QUERY,
+            tree_sitter_cpp::LANGUAGE.into(),
+        )),
+        "rb" => Some((
+            tree_sitter_ruby::TAGS_QUERY,
+            tree_sitter_ruby::LANGUAGE.into(),
+        )),
+        "php" => Some((
+            tree_sitter_php::TAGS_QUERY,
+            tree_sitter_php::LANGUAGE_PHP.into(),
+        )),
+        "swift" => Some((
+            tree_sitter_swift::TAGS_QUERY,
+            tree_sitter_swift::LANGUAGE.into(),
+        )),
+        // c-sharp: TAGS_QUERY is commented out in the crate — no tags query.
+        // kotlin-sg: TAGS_QUERY is commented out in the crate — no tags query.
+        // scala: no TAGS_QUERY in the crate.
+        // nix: TAGS_QUERY is commented out in the crate — no tags query.
+        _ => None,
+    }
+}
+
+fn extract_via_tags(
+    config: &TagsConfiguration,
+    source: &str,
+    filename: &str,
+) -> anyhow::Result<Vec<SymbolDef>> {
+    let mut ctx = TagsContext::new();
+    let source_bytes = source.as_bytes();
+
+    // generate_tags returns (iterator, cancelled_bool). We pass no cancellation
+    // flag, so the bool is always false; ignore it.
+    let (iter, _cancelled) = ctx
+        .generate_tags(config, source_bytes, None)
+        .map_err(|e| anyhow::anyhow!("generate_tags: {e}"))?;
+
+    let mut symbols = Vec::new();
+    for result in iter {
+        let tag = match result {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping tag error");
+                continue;
+            }
+        };
+
+        // Only emit definitions; skip references.
+        if !tag.is_definition {
+            continue;
+        }
+
+        // Skip tags with empty name ranges (anonymous constructs).
+        if tag.name_range.is_empty() {
+            continue;
+        }
+
+        // Extract the name from the byte range into source.
+        let name = match std::str::from_utf8(&source_bytes[tag.name_range.clone()]) {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+
+        // syntax_type_name already strips the "definition." prefix — it returns
+        // just the suffix: "function", "class", "method", etc.
+        let kind = config.syntax_type_name(tag.syntax_type_id).to_string();
+
+        symbols.push(SymbolDef {
+            file_path: filename.to_string(),
+            name,
+            kind,
+            start_line: tag.span.start.row + 1, // 0-indexed → 1-indexed
+            end_line: tag.span.end.row + 1,
+        });
+    }
+
+    Ok(symbols)
+}
+
+// ---------------------------------------------------------------------------
+// Fallback: manual AST traversal
 // ---------------------------------------------------------------------------
 
 fn collect_symbols(
@@ -95,7 +243,7 @@ fn collect_symbols(
 }
 
 // ---------------------------------------------------------------------------
-// Kind normalisation
+// Kind normalisation (fallback path only)
 // ---------------------------------------------------------------------------
 
 /// Map raw tree-sitter node kinds to a small, stable vocabulary.

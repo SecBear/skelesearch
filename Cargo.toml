@@ -31,6 +31,7 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 
 # Tree-sitter
 tree-sitter = "0.26"
+tree-sitter-tags = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-nix = "0.3"
 tree-sitter-python = "0.23"
