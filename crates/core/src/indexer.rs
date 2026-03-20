@@ -357,7 +357,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 // --- embedding cache lookup ---
                 let hashes: Vec<String> =
                     sub.iter().map(|(_, c)| content_hash(&c.content)).collect();
-                let cached = self.manifest.get_cached_embeddings(&hashes)?;
+                let cached = self.manifest.get_cached_embeddings(&hashes, dim)?;
 
                 // Partition into hits and misses; track original sub-indices.
                 // For cache-miss texts, prepend file path context so the embedding

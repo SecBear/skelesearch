@@ -317,29 +317,41 @@ impl ManifestStore {
         Ok(())
     }
 
-    /// Look up cached embeddings by content hash.
+    /// Look up cached embeddings by content hash, validating vector dimension.
     ///
-    /// Returns `None` for cache misses, `Some(vec)` for hits.
+    /// Returns `None` for cache misses *or* for entries whose stored dimension
+    /// does not match `expected_dim` (i.e. stale vectors from a different
+    /// provider or model).  Returns `Some(vec)` only for confirmed hits.
     /// Embedding is stored as packed little-endian f32 bytes.
     #[tracing::instrument(skip_all, fields(count = hashes.len()))]
-    pub fn get_cached_embeddings(&self, hashes: &[String]) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
+    pub fn get_cached_embeddings(
+        &self,
+        hashes: &[String],
+        expected_dim: usize,
+    ) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
         hashes
             .iter()
             .map(|hash| {
-                let result: Option<Vec<u8>> = conn
+                let result: Option<(i64, Vec<u8>)> = conn
                     .query_row(
-                        "SELECT embedding FROM embedding_cache WHERE content_hash = ?1",
+                        "SELECT dim, embedding FROM embedding_cache WHERE content_hash = ?1",
                         params![hash],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
-                Ok(result.map(|bytes| {
+                Ok(result.and_then(|(dim, bytes)| {
+                    // Reject entries from a different provider/model dimension.
+                    if dim as usize != expected_dim {
+                        return None;
+                    }
                     // BLOB is packed little-endian f32 bytes; 4 bytes per float.
-                    bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect()
+                    Some(
+                        bytes
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect(),
+                    )
                 }))
             })
             .collect()

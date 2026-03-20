@@ -284,7 +284,7 @@ async fn run_search(
     } else {
         0
     };
-    let mut results = searcher.search(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await.unwrap_or_default();
+    let mut results = searcher.search(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await?;
     let elapsed = start.elapsed();
     tracing::info!(elapsed_ms = elapsed.as_millis() as u64, results = results.len(), "search complete");
 

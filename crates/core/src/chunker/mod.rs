@@ -53,8 +53,8 @@ impl Chunker {
     pub fn chunk_file(&self, rel_path: &str, source: &str) -> anyhow::Result<Vec<ParsedChunk>> {
         let ext = extension_of(rel_path);
         match config_for_extension(ext) {
-            Some(cfg) => self.chunk_tier1(cfg.as_ref(), rel_path, source),
-            None => self.chunk_tier2(rel_path, source),
+            Some(cfg) => self.chunk_tier1(cfg.as_ref(), source),
+            None => self.chunk_tier2(source),
         }
     }
 
@@ -127,7 +127,6 @@ impl Chunker {
     fn chunk_tier1(
         &self,
         cfg: &dyn languages::LanguageConfig,
-        rel_path: &str,
         source: &str,
     ) -> anyhow::Result<Vec<ParsedChunk>> {
         let language = cfg.language();
@@ -167,7 +166,7 @@ impl Chunker {
         Ok(chunks)
     }
 
-    fn chunk_tier2(&self, rel_path: &str, source: &str) -> anyhow::Result<Vec<ParsedChunk>> {
+    fn chunk_tier2(&self, source: &str) -> anyhow::Result<Vec<ParsedChunk>> {
         let splitter = TextSplitter::new(CHUNK_BUDGET);
         let chunks: Vec<ParsedChunk> = splitter
             .chunks(source)

@@ -311,8 +311,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // the cross-encoder reranker will not change the outcome meaningfully
         // and adds avoidable latency.  Skip both reranking and blending.
         let strong_signal = !hits.is_empty()
-            && hits[0].score >= 0.8
-            && (hits.len() < 2 || hits[0].score - hits[1].score >= 0.15);
+            && hits[0].score >= 0.016
+            && (hits.len() < 2 || hits[0].score - hits[1].score >= 0.003);
 
         if strong_signal {
             tracing::debug!(
@@ -449,9 +449,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
     /// Extend `hits` with chunks from files reachable via resolved import edges.
     ///
-    /// Graph-expanded results receive a depth-decayed score: `best_score * 0.5^depth`.
+    /// Graph-expanded results receive a flat score of `best_score * 0.5`.
     /// This ensures they rank below direct hits but above noise, and participate
     /// meaningfully in downstream MMR and reranker stages.
+    /// (Depth-decay `0.5^depth` is deferred until `traverse_imports` returns
+    /// per-hop depth information.)
     async fn augment_with_graph(
         &self,
         mut hits: Vec<SearchResult>,
@@ -464,9 +466,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let mut seen_chunks: std::collections::HashSet<(String, usize)> =
             hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
 
-        // BFS traversal depth is handled by traverse_imports.  We assign scores
-        // as if all reachable files are at depth 1 for simplicity — the traversal
-        // already bounds total hops via max_depth.
+        // BFS traversal depth is handled by traverse_imports.  All reachable
+        // files are scored identically at 0.5× the best direct-hit score.
+        // Depth-decay (0.5^depth) is deferred until traverse_imports returns
+        // per-hop depth info.
         let graph_score = best_score * 0.5;
 
         for file_path in &present {
@@ -592,6 +595,10 @@ fn is_test_file(path: &str) -> bool {
         "/testing/", "/testutil/", "/test_utils/", "/testdata/",
     ];
     if TEST_DIRS.iter().any(|d| norm.contains(d)) {
+        return true;
+    }
+    // Root-level test directories: strip leading '/' and check starts_with.
+    if TEST_DIRS.iter().any(|d| norm.starts_with(d.trim_start_matches('/'))) {
         return true;
     }
 

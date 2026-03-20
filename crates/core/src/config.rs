@@ -108,9 +108,12 @@ impl Default for Config {
 
 impl Config {
     /// Parse a `Config` from a TOML string.  Returns an error on invalid TOML;
-    /// unknown keys are ignored (serde `#[serde(default)]`).
+    /// unknown keys are ignored (serde `#[serde(default)]`).  `batch_size = 0`
+    /// is clamped to 1 so callers never receive a zero-sized batch.
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(s)?)
+        let mut cfg: Self = toml::from_str(s)?;
+        cfg.index.batch_size = cfg.index.batch_size.max(1);
+        Ok(cfg)
     }
 
     /// Load config from `<project_root>/.skelesearch.toml`, returning defaults

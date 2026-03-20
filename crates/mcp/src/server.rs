@@ -543,6 +543,7 @@ impl SkeleSearchServer {
             .collect();
 
         let transitive: Vec<ImpactEntry> = all_importers.iter()
+            .filter(|(_, d)| *d > 1)
             .map(|(f, d)| ImpactEntry { file_path: f.clone(), depth: *d })
             .collect();
 

@@ -1026,16 +1026,20 @@ impl StorageBackend for CozoBackend {
             }
         }
 
-        // 4. Store results back into CozoDB.
-        //    Build a single :replace query with all scores.
-        let data_rows: Vec<String> = id_to_node.iter().enumerate()
-            .map(|(i, path)| format!("[\"{}\" , {}]", path.replace('"', "\\\""), rank[i]))
+        // 4. Store results back into CozoDB via parameterised upsert to avoid
+        //    injection from file paths containing `"`, `\n`, or `]`.
+        let rows_dv: Vec<DataValue> = id_to_node
+            .iter()
+            .enumerate()
+            .map(|(i, path)| DataValue::List(vec![Self::dv_str(path), Self::dv_float(rank[i])]))
             .collect();
-        let script = format!(
-            "?[file_path, pagerank] <- [{}]\n:replace file_ranks {{ file_path => pagerank }}",
-            data_rows.join(", ")
-        );
-        self.run_mut(&script, BTreeMap::new())?;
+        let data = DataValue::List(rows_dv);
+        let mut p = BTreeMap::new();
+        p.insert("rows".into(), data);
+        self.run_mut(
+            "?[file_path, pagerank] <- $rows\n:replace file_ranks { file_path => pagerank }",
+            p,
+        )?;
         Ok(())
     }
 
@@ -1043,12 +1047,21 @@ impl StorageBackend for CozoBackend {
         &self,
         file_paths: &[&str],
     ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+        // When file_paths is empty there are no result files to boost — return
+        // an empty map rather than pulling the entire table for nothing.
         if file_paths.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        // Filter to only the requested paths so callers get per-query data,
+        // not the global rank distribution.
+        let fps_dv = DataValue::List(
+            file_paths.iter().map(|fp| Self::dv_str(fp)).collect(),
+        );
+        let mut p = BTreeMap::new();
+        p.insert("fps".into(), fps_dv);
         let rows = self.run_imm(
-            "?[file_path, pagerank] := *file_ranks[file_path, pagerank]",
-            BTreeMap::new(),
+            "?[file_path, pagerank] := *file_ranks[file_path, pagerank], is_in(file_path, $fps)",
+            p,
         )?;
         let mut ranks = std::collections::HashMap::new();
         for row in &rows.rows {
