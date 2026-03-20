@@ -206,3 +206,50 @@ pub struct SymbolRow {
     pub start_line: usize,
     pub end_line: usize,
 }
+
+/// Input for the `find_impact_set` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindImpactSetInput {
+    /// File path to analyze impact for.
+    pub file_path: String,
+    /// Maximum traversal depth (default: 3, capped at 5).
+    pub max_depth: Option<usize>,
+}
+
+/// A single entry in the transitive importer list.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ImpactEntry {
+    pub file_path: String,
+    pub depth: usize,
+}
+
+/// Output of the `find_impact_set` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ImpactSetOutput {
+    /// The file being analyzed.
+    pub file_path: String,
+    /// Files that directly import this file (depth == 1).
+    pub direct_importers: Vec<String>,
+    /// Files that transitively import this file, grouped by depth.
+    pub transitive_importers: Vec<ImpactEntry>,
+    /// Test files that (transitively) import this file.
+    pub affected_tests: Vec<String>,
+}
+
+/// Input for the `find_test_context` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindTestContextInput {
+    /// File path to find tests for.
+    pub file_path: String,
+}
+
+/// Output of the `find_test_context` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TestContextOutput {
+    /// The source file.
+    pub file_path: String,
+    /// Test files that directly import this file.
+    pub test_files: Vec<String>,
+    /// Test files in the same directory or a sibling test directory.
+    pub colocated_tests: Vec<String>,
+}

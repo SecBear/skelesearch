@@ -190,7 +190,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // LLM-based query expansion for conceptual queries.
         // Only runs when an expander is configured and the query looks conceptual.
         // Failures degrade gracefully: expansion is skipped, search proceeds.
-        let expanded_keywords = if let Some(ref expander) = self.expander {
+        let expanded_keywords_raw = if let Some(ref expander) = self.expander {
             use crate::router::{classify_query, QueryStrategy};
             if classify_query(query) == QueryStrategy::Semantic {
                 expander.expand(query).await.unwrap_or_default()
@@ -201,10 +201,53 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             vec![]
         };
 
+        // Filter expansion keywords that have no lexical overlap with the
+        // original query — prevents semantic drift from LLM hallucination.
+        let query_terms: std::collections::HashSet<String> = query
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+        let raw_len = expanded_keywords_raw.len();
+        let expanded_keywords: Vec<String> = expanded_keywords_raw
+            .into_iter()
+            .filter(|kw| {
+                // Keep keyword if any of its subwords overlap with query terms,
+                // or if it's a camelCase/snake_case identifier (likely a real code symbol).
+                let kw_lower = kw.to_lowercase();
+                let has_overlap = kw_lower.split_whitespace()
+                    .any(|part| query_terms.iter().any(|qt| {
+                        part.contains(qt.as_str()) || qt.contains(part)
+                    }));
+                let is_identifier = kw.contains('_') || kw.chars().any(|c| c.is_uppercase());
+                has_overlap || is_identifier
+            })
+            .collect();
+        if expanded_keywords.len() < raw_len {
+            tracing::debug!(
+                dropped = raw_len - expanded_keywords.len(),
+                "filtered expansion keywords with no query overlap"
+            );
+        }
+
         // Merge LLM keywords into the BM25 query text.
+        // Original query terms appear first and get natural BM25 term frequency.
+        // Expansion keywords are appended once (lower weight than the original
+        // query which may have terms repeated from expand_query()).
         let mut bm25_query = expand_query(query);
         if !expanded_keywords.is_empty() {
-            bm25_query = format!("{} {}", bm25_query, expanded_keywords.join(" "));
+            // Only append keywords not already present in the query
+            let existing: std::collections::HashSet<String> = bm25_query
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .collect();
+            let novel: Vec<&str> = expanded_keywords
+                .iter()
+                .filter(|kw| !existing.contains(&kw.to_lowercase()))
+                .map(|s| s.as_str())
+                .collect();
+            if !novel.is_empty() {
+                bm25_query = format!("{} {}", bm25_query, novel.join(" "));
+            }
         }
 
         // Sanitize before sending to CozoDB FTS — strip dots, hyphens, and

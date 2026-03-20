@@ -27,10 +27,10 @@ use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, Embed
 use skelesearch_embed_fastembed::{FastEmbedProvider, provider_from_name};
 
 use crate::tools::{
-    ChunkInfo, FileContextOutput, FindSymbolInput, GetFileContextInput, GrepSearchRow,
-    IndexCodebaseInput, IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput,
-    SearchCodeInput, SearchCodeRow, SmartSearchInput, SmartSearchOutput, SmartSearchResults,
-    SymbolRow,
+    ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
+    GetFileContextInput, GrepSearchRow, ImpactEntry, ImpactSetOutput, IndexCodebaseInput,
+    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeRow,
+    SmartSearchInput, SmartSearchOutput, SmartSearchResults, SymbolRow, TestContextOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -526,6 +526,83 @@ impl SkeleSearchServer {
             .collect())
     }
 
+    pub async fn find_impact_set(
+        &self,
+        input: FindImpactSetInput,
+    ) -> anyhow::Result<ImpactSetOutput> {
+        let max_depth = input.max_depth.unwrap_or(3).min(5);
+        let all_importers = match self.backend.traverse_importers(&input.file_path, max_depth).await {
+            Ok(v) => v,
+            Err(ref e) if is_uninitialized_index_error(e) => vec![],
+            Err(e) => return Err(e),
+        };
+
+        let direct: Vec<String> = all_importers.iter()
+            .filter(|(_, d)| *d == 1)
+            .map(|(f, _)| f.clone())
+            .collect();
+
+        let transitive: Vec<ImpactEntry> = all_importers.iter()
+            .map(|(f, d)| ImpactEntry { file_path: f.clone(), depth: *d })
+            .collect();
+
+        let tests: Vec<String> = all_importers.iter()
+            .filter(|(f, _)| is_test_file_path(f))
+            .map(|(f, _)| f.clone())
+            .collect();
+
+        Ok(ImpactSetOutput {
+            file_path: input.file_path,
+            direct_importers: direct,
+            transitive_importers: transitive,
+            affected_tests: tests,
+        })
+    }
+
+    pub async fn find_test_context(
+        &self,
+        input: FindTestContextInput,
+    ) -> anyhow::Result<TestContextOutput> {
+        let importers = match self.backend.get_importers(&input.file_path).await {
+            Ok(v) => v,
+            Err(ref e) if is_uninitialized_index_error(e) => vec![],
+            Err(e) => return Err(e),
+        };
+        let test_importers: Vec<String> = importers.into_iter()
+            .filter(|f| is_test_file_path(f))
+            .collect();
+
+        let dir = std::path::Path::new(&input.file_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stem = std::path::Path::new(&input.file_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let all_files = match self.backend.list_indexed_paths().await {
+            Ok(v) => v,
+            Err(ref e) if is_uninitialized_index_error(e) => vec![],
+            Err(e) => return Err(e),
+        };
+        let colocated: Vec<String> = all_files.into_iter()
+            .filter(|f| {
+                is_test_file_path(f)
+                    && (f.starts_with(&dir)
+                        || f.contains(&format!("/tests/{}", stem))
+                        || f.contains(&format!("/__tests__/{}", stem)))
+            })
+            .filter(|f| !test_importers.contains(f))
+            .collect();
+
+        Ok(TestContextOutput {
+            file_path: input.file_path,
+            test_files: test_importers,
+            colocated_tests: colocated,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // MCP transport entry points
     // -----------------------------------------------------------------------
@@ -649,6 +726,32 @@ impl SkeleSearchServer {
             .map_err(|e| e.to_string())
             .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
     }
+
+    /// Find all files affected by changes to a given file. Returns direct importers,
+    /// transitive importers by depth, and affected test files.
+    #[tool(name = "find_impact_set")]
+    async fn mcp_find_impact_set(
+        &self,
+        Parameters(input): Parameters<FindImpactSetInput>,
+    ) -> Result<String, String> {
+        self.find_impact_set(input)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
+    }
+
+    /// Find test files covering a source file. Returns test files that import it
+    /// and colocated test files.
+    #[tool(name = "find_test_context")]
+    async fn mcp_find_test_context(
+        &self,
+        Parameters(input): Parameters<FindTestContextInput>,
+    ) -> Result<String, String> {
+        self.find_test_context(input)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -676,6 +779,29 @@ impl ServerHandler for SkeleSearchServer {
 // ---------------------------------------------------------------------------
 // Path utilities
 // ---------------------------------------------------------------------------
+
+/// Returns true when `path` looks like a test file based on common naming conventions.
+/// This is a heuristic — it covers Go, Rust, JS/TS, Ruby, and directory-based conventions.
+fn is_test_file_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+        || lower.contains("/spec/")
+        || lower.contains("/specs/")
+        || lower.ends_with("_test.go")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".test.tsx")
+        || lower.ends_with(".test.jsx")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".spec.js")
+        || lower.ends_with(".spec.tsx")
+        || lower.ends_with(".spec.jsx")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_spec.rb")
+}
+
 
 /// Return the deepest common ancestor directory for a slice of absolute file paths.
 ///

@@ -99,6 +99,15 @@ pub trait StorageBackend: Send + Sync {
     /// node).  Cycles are handled by the visited set.
     async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>>;
 
+    /// Reverse BFS: find all files that (transitively) import `file_path`,
+    /// up to `max_depth` hops. Returns files grouped by distance.
+    /// Cycles are handled by the visited set.
+    async fn traverse_importers(
+        &self,
+        file_path: &str,
+        max_depth: usize,
+    ) -> anyhow::Result<Vec<(String, usize)>>; // (file_path, depth)
+
     async fn hybrid_search(
         &self,
         query_vec: &[f32],
@@ -630,6 +639,29 @@ impl StorageBackend for CozoBackend {
         Ok(result)
     }
 
+    async fn traverse_importers(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<(String, usize)>> {
+        let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(file_path.to_string());
+        let mut frontier = vec![file_path.to_string()];
+
+        for depth in 1..=max_depth {
+            let mut next_frontier = Vec::new();
+            for f in &frontier {
+                let importers = self.get_importers(f).await?;
+                for imp in importers {
+                    if visited.insert(imp.clone()) {
+                        result.push((imp.clone(), depth));
+                        next_frontier.push(imp);
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() { break; }
+        }
+        Ok(result)
+    }
+
     #[tracing::instrument(skip_all, fields(top_k))]
     async fn hybrid_search(
         &self,
@@ -1082,6 +1114,10 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
 
     async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>> {
         (**self).traverse_imports(file_path, max_depth).await
+    }
+
+    async fn traverse_importers(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<(String, usize)>> {
+        (**self).traverse_importers(file_path, max_depth).await
     }
 
     async fn hybrid_search(
