@@ -4,7 +4,7 @@
     "expected_files": [
       "src/cmd/mod.rs"
     ],
-    "category": "symbol lookup",
+    "category": "symbol_lookup",
     "notes": "Command enum and Command::from_frame dispatch logic live in cmd/mod.rs. The match arms delegate parsing to each command's parse_frames method."
   },
   {
@@ -12,7 +12,7 @@
     "expected_files": [
       "src/server.rs"
     ],
-    "category": "implementation lookup",
+    "category": "implementation",
     "notes": "Handler.run reads frames, parses Command via Command::from_frame, then applies it against Db and Connection."
   },
   {
@@ -20,7 +20,7 @@
     "expected_files": [
       "src/db.rs"
     ],
-    "category": "implementation lookup",
+    "category": "implementation",
     "notes": "Db wraps Arc<Shared>; State holds entries, expirations, pub_sub, and a background purge task."
   },
   {
@@ -28,7 +28,7 @@
     "expected_files": [
       "src/cmd/subscribe.rs"
     ],
-    "category": "cross file relationship",
+    "category": "implementation",
     "notes": "Subscribe.apply builds a StreamMap of subscriptions and multiplexes messages with command handling and shutdown."
   },
   {
@@ -37,7 +37,7 @@
       "src/server.rs",
       "src/shutdown.rs"
     ],
-    "category": "architecture conceptual lookup",
+    "category": "cross_file",
     "notes": "server::run creates the broadcast channel; shutdown.rs implements per-handler shutdown reception."
   },
   {
@@ -46,70 +46,255 @@
       "src/connection.rs",
       "src/frame.rs"
     ],
-    "category": "cross file relationship",
+    "category": "cross_file",
     "notes": "Connection buffers socket reads and delegates RESP parsing/materialization to Frame."
   },
   {
     "query": "How does the Parse utility extract typed values from a frame and what errors can it produce",
     "expected_files": [
       "src/parse.rs"
-    ]
+    ],
+    "category": "utility_helper"
   },
   {
     "query": "How does the SET command parse optional expiration arguments like EX and PX from the protocol frame",
     "expected_files": [
       "src/cmd/set.rs"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the publish command broadcast a message and how does the database route it to subscribers",
     "expected_files": [
       "src/cmd/publish.rs",
       "src/db.rs"
-    ]
+    ],
+    "category": "cross_file"
   },
   {
     "query": "How does the blocking client wrap the async client to provide synchronous Redis operations",
     "expected_files": [
       "src/clients/blocking_client.rs"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the BufferedClient use channels and message passing to allow multiple tasks to share a single Redis connection",
     "expected_files": [
       "src/clients/buffered_client.rs"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the async Client validate server responses and convert error frames into Rust errors",
     "expected_files": [
       "src/clients/client.rs"
-    ]
+    ],
+    "category": "error_handling"
   },
   {
     "query": "How does the server limit concurrent connections and implement exponential backoff on accept errors",
     "expected_files": [
       "src/server.rs"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the CLI binary parse command-line arguments and dispatch to the async client methods",
     "expected_files": [
       "src/bin/cli.rs"
-    ]
+    ],
+    "category": "config_init"
   },
   {
     "query": "How does the Unknown command type handle unrecognized Redis commands",
     "expected_files": [
       "src/cmd/unknown.rs",
       "src/cmd/mod.rs"
-    ]
+    ],
+    "category": "error_handling"
   },
   {
     "query": "What is the public API surface exported by the library crate and how are modules organized",
     "expected_files": [
       "src/lib.rs",
       "src/clients/mod.rs"
-    ]
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "Where is the Ping struct defined and what optional message field does it carry",
+    "expected_files": [
+      "src/cmd/ping.rs"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "Where is the Get struct defined and what key field does it expose",
+    "expected_files": [
+      "src/cmd/get.rs"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "Where is the DEFAULT_PORT constant defined in mini-redis",
+    "expected_files": [
+      "src/lib.rs"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "How does the PING command handle an optional message and return PONG or echo it back to the client",
+    "expected_files": [
+      "src/cmd/ping.rs"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does the GET command retrieve a key from the database and return null when the key is missing",
+    "expected_files": [
+      "src/cmd/get.rs"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does Connection buffer incoming bytes and detect when a complete RESP frame is ready to read",
+    "expected_files": [
+      "src/connection.rs"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does Frame check whether enough bytes are present to parse a complete message without consuming input",
+    "expected_files": [
+      "src/frame.rs"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does the server binary configure tracing and logging before starting the TCP listener",
+    "expected_files": [
+      "src/bin/server.rs"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does the SET command apply itself to the shared database including writing a value with an optional TTL",
+    "expected_files": [
+      "src/cmd/set.rs",
+      "src/db.rs"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does the GET command coordinate between Parse, Db, and Connection to serve a key lookup request",
+    "expected_files": [
+      "src/cmd/get.rs",
+      "src/db.rs"
+    ],
+    "category": "cross_file"
+  },
+  {
+    "query": "How does the server binary bind the configured port and hand off the accepted listener to server::run",
+    "expected_files": [
+      "src/bin/server.rs",
+      "src/server.rs"
+    ],
+    "category": "cross_file"
+  },
+  {
+    "query": "How does the blocking client use a dedicated Tokio runtime to wrap async client calls synchronously",
+    "expected_files": [
+      "src/clients/blocking_client.rs",
+      "src/clients/client.rs"
+    ],
+    "category": "cross_file"
+  },
+  {
+    "query": "How are all supported Redis command types enumerated and dispatched in the cmd module",
+    "expected_files": [
+      "src/cmd/mod.rs"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How are client types organized across the clients submodule and what does lib.rs re-export",
+    "expected_files": [
+      "src/clients/mod.rs",
+      "src/lib.rs"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "What is the Error type alias and how is the Result type defined for mini-redis operations",
+    "expected_files": [
+      "src/lib.rs"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does the async client convert a Frame::Error response from the server into a Rust error",
+    "expected_files": [
+      "src/frame.rs",
+      "src/clients/client.rs"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does Connection surface a peer disconnect or EOF condition to the caller",
+    "expected_files": [
+      "src/connection.rs"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does the server binary use clap to accept an optional port argument at startup",
+    "expected_files": [
+      "src/bin/server.rs"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "How does the async client establish a TCP connection and initialize its internal send and receive buffer state",
+    "expected_files": [
+      "src/clients/client.rs"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "How do I broadcast a message to all clients subscribed to a named channel",
+    "expected_files": [
+      "src/cmd/publish.rs",
+      "src/db.rs"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "How does mini-redis prevent a large number of simultaneous client connections from overloading the server",
+    "expected_files": [
+      "src/server.rs"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "How are expired cache entries cleaned up without blocking active command processing",
+    "expected_files": [
+      "src/db.rs"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "How does the Parse cursor step through frame fields one at a time and signal when input is exhausted",
+    "expected_files": [
+      "src/parse.rs"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does Frame encode values into the RESP wire byte format for transmission to a client or server",
+    "expected_files": [
+      "src/frame.rs"
+    ],
+    "category": "utility_helper"
   }
 ]

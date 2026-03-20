@@ -4,7 +4,7 @@
     "expected_files": [
       "src/hono-base.ts"
     ],
-    "category": "implementation lookup",
+    "category": "implementation",
     "notes": "The private dispatch method resolves the route, creates Context, and executes the middleware chain."
   },
   {
@@ -12,7 +12,7 @@
     "expected_files": [
       "src/compose.ts"
     ],
-    "category": "implementation lookup",
+    "category": "implementation",
     "notes": "compose.ts implements koa style recursive dispatch and guards against double next calls."
   },
   {
@@ -20,7 +20,7 @@
     "expected_files": [
       "src/context.ts"
     ],
-    "category": "symbol lookup",
+    "category": "symbol_lookup",
     "notes": "Context wraps Request and exposes text/json/html/body/redirect/newResponse helpers."
   },
   {
@@ -28,7 +28,7 @@
     "expected_files": [
       "src/router/smart-router/router.ts"
     ],
-    "category": "architecture lookup",
+    "category": "architecture",
     "notes": "SmartRouter tries candidate routers and selects the first that can build the route set."
   },
   {
@@ -37,7 +37,7 @@
       "src/adapter/aws-lambda/handler.ts",
       "src/adapter/aws-lambda/types.ts"
     ],
-    "category": "cross file relationship",
+    "category": "cross_file",
     "notes": "handler.ts maps API Gateway and related events into Request objects; types.ts defines adapter contracts."
   },
   {
@@ -46,7 +46,7 @@
       "src/http-exception.ts",
       "src/hono-base.ts"
     ],
-    "category": "cross file relationship",
+    "category": "error_handling",
     "notes": "HTTPException exposes getResponse and the default error handler knows how to use it."
   },
   {
@@ -54,7 +54,8 @@
     "expected_files": [
       "src/router/trie-router/router.ts",
       "src/router/trie-router/node.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the RegExp router compile a trie into a single regular expression for route matching",
@@ -62,59 +63,241 @@
       "src/router/reg-exp-router/router.ts",
       "src/router/reg-exp-router/trie.ts",
       "src/router/reg-exp-router/matcher.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the request validator extract and validate data from JSON form query and header targets",
     "expected_files": [
       "src/validator/validator.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the CORS middleware handle preflight OPTIONS requests and origin matching",
     "expected_files": [
       "src/middleware/cors/index.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does JWT token verification work with both Authorization header and cookie sources",
     "expected_files": [
       "src/middleware/jwt/jwt.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does basic auth implement timing-safe password comparison",
     "expected_files": [
       "src/middleware/basic-auth/index.ts",
       "src/utils/buffer.ts"
-    ]
+    ],
+    "category": "cross_file"
   },
   {
     "query": "How does the server-sent events streaming helper format and send SSE messages",
     "expected_files": [
       "src/helper/streaming/sse.ts",
       "src/helper/streaming/stream.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How do the middleware combinators some every and except compose multiple middleware functions",
     "expected_files": [
       "src/middleware/combine/index.ts",
       "src/compose.ts"
-    ]
+    ],
+    "category": "cross_file"
   },
   {
     "query": "How does the typed RPC client use JavaScript Proxy to build type-safe API calls",
     "expected_files": [
       "src/client/client.ts",
       "src/client/types.ts"
-    ]
+    ],
+    "category": "cross_file"
   },
   {
     "query": "How does the secure headers middleware generate CSP nonces and configure permissions policy",
     "expected_files": [
       "src/middleware/secure-headers/secure-headers.ts",
       "src/middleware/secure-headers/permissions-policy.ts"
-    ]
+    ],
+    "category": "cross_file"
+  },
+  {
+    "query": "What does the HonoRequest class expose compared to the native Request object",
+    "expected_files": [
+      "src/request.ts"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "What functions does the html utility expose for escaping and tagging template literals",
+    "expected_files": [
+      "src/utils/html.ts"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "What types does types.ts export for defining Hono route handlers and middleware",
+    "expected_files": [
+      "src/types.ts"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "What is the LinearRouter and how does it differ from the TrieRouter for route matching",
+    "expected_files": [
+      "src/router/linear-router/router.ts"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "How does Hono support multiple runtime targets through its adapter-based architecture",
+    "expected_files": [
+      "src/adapter/cloudflare-workers/index.ts",
+      "src/adapter/bun/index.ts",
+      "src/adapter/deno/index.ts"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How does the factory helper create typed route groups with shared middleware and environment",
+    "expected_files": [
+      "src/helper/factory/index.ts"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How does the preset system compose routers and middleware for quick and tiny Hono builds",
+    "expected_files": [
+      "src/preset/quick.ts",
+      "src/preset/tiny.ts"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How does the pattern router match routes using an ordered list of patterns without a trie",
+    "expected_files": [
+      "src/router/pattern-router/router.ts"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How does the body-limit middleware enforce request size limits and abort oversized uploads",
+    "expected_files": [
+      "src/middleware/body-limit/index.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does the ip-restriction middleware block requests from forbidden IP addresses",
+    "expected_files": [
+      "src/middleware/ip-restriction/index.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does the timeout middleware cancel long-running handlers and return a 408 response",
+    "expected_files": [
+      "src/middleware/timeout/index.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does the cache middleware determine TTL and decide which responses to store",
+    "expected_files": [
+      "src/middleware/cache/index.ts"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "How does the CSRF middleware validate tokens and configure which HTTP methods require protection",
+    "expected_files": [
+      "src/middleware/csrf/index.ts"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "How does the language middleware detect the preferred client locale from Accept-Language headers",
+    "expected_files": [
+      "src/middleware/language/index.ts"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "What is context storage in Hono and how does it let middleware share data without prop drilling",
+    "expected_files": [
+      "src/middleware/context-storage/index.ts"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "What is the ETag middleware and how does it compute and compare entity tags for caching",
+    "expected_files": [
+      "src/middleware/etag/index.ts",
+      "src/middleware/etag/digest.ts"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "What is a Hono app's fetch handler and how do runtimes invoke it as a web-standard entry point",
+    "expected_files": [
+      "src/hono-base.ts"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "How does the cookie utility parse and serialize Set-Cookie header attributes including SameSite and Secure",
+    "expected_files": [
+      "src/utils/cookie.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does the compress middleware select between gzip and deflate encoding based on Accept-Encoding",
+    "expected_files": [
+      "src/middleware/compress/index.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does the SSG helper generate static HTML files by crawling Hono route handlers",
+    "expected_files": [
+      "src/helper/ssg/ssg.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does the proxy helper forward requests upstream and rewrite response headers",
+    "expected_files": [
+      "src/helper/proxy/index.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does bearer auth middleware extract and validate tokens from the Authorization header",
+    "expected_files": [
+      "src/middleware/bearer-auth/index.ts"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does the Cloudflare Pages adapter handle function routing and serve the Hono app",
+    "expected_files": [
+      "src/adapter/cloudflare-pages/handler.ts"
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does the Vercel adapter bridge Hono responses to Vercel edge function response format",
+    "expected_files": [
+      "src/adapter/vercel/handler.ts",
+      "src/adapter/vercel/conninfo.ts"
+    ],
+    "category": "cross_file"
   }
 ]

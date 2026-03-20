@@ -5,7 +5,7 @@
       "packages/zod/src/v4/core/parse.ts",
       "packages/zod/src/v4/classic/parse.ts"
     ],
-    "category": "implementation lookup",
+    "category": "implementation",
     "notes": "Core parse functions call schema._zod.run while classic parse wraps them for public API use."
   },
   {
@@ -14,7 +14,7 @@
       "packages/zod/src/v4/core/util.ts",
       "packages/zod/src/v4/classic/schemas.ts"
     ],
-    "category": "cross file relationship",
+    "category": "cross_file",
     "notes": "Core utilities implement composition mechanics; classic schemas wires them into ZodObject methods."
   },
   {
@@ -22,7 +22,7 @@
     "expected_files": [
       "packages/zod/src/v4/core/errors.ts"
     ],
-    "category": "symbol lookup",
+    "category": "symbol_lookup",
     "notes": "The core error helpers are all defined in core/errors.ts."
   },
   {
@@ -31,7 +31,7 @@
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/classic/schemas.ts"
     ],
-    "category": "implementation lookup",
+    "category": "implementation",
     "notes": "Core defines the wrapper schema types; classic exposes the user facing constructors and methods."
   },
   {
@@ -40,7 +40,7 @@
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/core/api.ts"
     ],
-    "category": "architecture conceptual lookup",
+    "category": "architecture",
     "notes": "Transform, pipe, and codec types live in schemas while API factories build them."
   },
   {
@@ -49,7 +49,7 @@
       "packages/zod/src/v4/core/api.ts",
       "packages/zod/src/v4/classic/schemas.ts"
     ],
-    "category": "cross file relationship",
+    "category": "cross_file",
     "notes": "Core factory functions implement refine behavior and classic schemas expose instance methods."
   },
   {
@@ -58,14 +58,16 @@
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/core/regexes.ts",
       "packages/zod/src/v4/core/checks.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the discriminated union use a Map-based fast path to dispatch to the correct schema option",
     "expected_files": [
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/core/api.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the coercion system convert input values before validation",
@@ -73,21 +75,24 @@
       "packages/zod/src/v4/classic/coerce.ts",
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/core/api.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the template literal schema build regex patterns from concatenated parts",
     "expected_files": [
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/core/api.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the registry and metadata system use WeakMap for schema-attached metadata with id-based lookup",
     "expected_files": [
       "packages/zod/src/v4/core/registries.ts",
       "packages/zod/src/v4/core/to-json-schema.ts"
-    ]
+    ],
+    "category": "cross_file"
   },
   {
     "query": "How does zod generate JSON Schema from zod schemas supporting multiple draft versions",
@@ -95,13 +100,15 @@
       "packages/zod/src/v4/core/to-json-schema.ts",
       "packages/zod/src/v4/core/json-schema-processors.ts",
       "packages/zod/src/v4/core/json-schema.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does zod convert a JSON Schema document back into zod schemas",
     "expected_files": [
       "packages/zod/src/v4/classic/from-json-schema.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the internationalization system provide locale-specific error messages",
@@ -109,20 +116,198 @@
       "packages/zod/src/v4/locales/en.ts",
       "packages/zod/src/v4/core/config.ts",
       "packages/zod/src/v4/core/errors.ts"
-    ]
+    ],
+    "category": "cross_file"
   },
   {
     "query": "How does the tuple schema validate fixed-length arrays with optional rest elements",
     "expected_files": [
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/core/api.ts"
-    ]
+    ],
+    "category": "implementation"
   },
   {
     "query": "How does the record schema handle strict vs loose key validation and numeric string keys",
     "expected_files": [
       "packages/zod/src/v4/core/schemas.ts",
       "packages/zod/src/v4/core/api.ts"
-    ]
+    ],
+    "category": "implementation"
+  },
+  {
+    "query": "How does ZodError collect and report multiple validation failures from a single parse call",
+    "expected_files": [
+      "packages/zod/src/v4/core/errors.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does safeParse return a discriminated union result instead of throwing on validation failure",
+    "expected_files": [
+      "packages/zod/src/v4/core/parse.ts",
+      "packages/zod/src/v4/classic/parse.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does zod accumulate errors during object validation when multiple fields fail simultaneously",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does the abort-early flag control whether zod stops validation at the first error",
+    "expected_files": [
+      "packages/zod/src/v4/core/parse.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does zod represent the path to a nested validation failure inside error issue objects",
+    "expected_files": [
+      "packages/zod/src/v4/core/errors.ts"
+    ],
+    "category": "error_handling"
+  },
+  {
+    "query": "How does the global zod configuration control error message locale and custom error maps",
+    "expected_files": [
+      "packages/zod/src/v4/core/config.ts"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "How is the classic API layer initialised relative to the core layer on import",
+    "expected_files": [
+      "packages/zod/src/v4/classic/index.ts",
+      "packages/zod/src/v4/core/index.ts"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "How does the mini build of zod differ from the classic build in exported API surface",
+    "expected_files": [
+      "packages/zod/src/v4/mini/index.ts"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "How does zod's version file expose version constants and what values does it define",
+    "expected_files": [
+      "packages/zod/src/v4/core/versions.ts"
+    ],
+    "category": "config_init"
+  },
+  {
+    "query": "What is a ZodType's _zod internal field and what runtime data does it contain",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "What is the Standard Schema protocol and how does zod implement it for interoperability",
+    "expected_files": [
+      "packages/zod/src/v4/core/standard-schema.ts"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "What is the ZSF specification file and what interchange format does it define",
+    "expected_files": [
+      "packages/zod/src/v4/core/zsf.ts"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "What is a codec in zod and how does it differ from a plain transform schema",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts",
+      "packages/zod/src/v4/classic/schemas.ts"
+    ],
+    "category": "vocabulary_gap"
+  },
+  {
+    "query": "How does the utility module implement deep-clone and merge operations used across schema composition",
+    "expected_files": [
+      "packages/zod/src/v4/core/util.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does the string-bool coercion schema convert truthy string values to booleans",
+    "expected_files": [
+      "packages/zod/src/v4/classic/schemas.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does zod generate deterministic hash IDs for schema objects used in deduplication",
+    "expected_files": [
+      "packages/zod/src/v4/core/util.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "How does the doc utility attach structured documentation metadata to schemas",
+    "expected_files": [
+      "packages/zod/src/v4/core/doc.ts"
+    ],
+    "category": "utility_helper"
+  },
+  {
+    "query": "Where is the ZodEnum schema defined and what methods does it expose for value access and iteration",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "Where is the ZodFile schema implemented for validating file input objects",
+    "expected_files": [
+      "packages/zod/src/v4/classic/schemas.ts"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "Where are the check helper functions exported for creating reusable custom constraint checks",
+    "expected_files": [
+      "packages/zod/src/v4/core/checks.ts",
+      "packages/zod/src/v4/classic/checks.ts"
+    ],
+    "category": "symbol_lookup"
+  },
+  {
+    "query": "How does the v4 core api.ts factory module expose schema constructors to callers",
+    "expected_files": [
+      "packages/zod/src/v4/core/api.ts"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How does zod separate its internal schema definition layer from the classic public-facing API",
+    "expected_files": [
+      "packages/zod/src/v4/core/core.ts",
+      "packages/zod/src/v4/classic/schemas.ts"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How does zod split JSON Schema generation logic across the generator, processors, and schema files",
+    "expected_files": [
+      "packages/zod/src/v4/core/json-schema-generator.ts",
+      "packages/zod/src/v4/core/json-schema-processors.ts",
+      "packages/zod/src/v4/core/json-schema.ts"
+    ],
+    "category": "architecture"
+  },
+  {
+    "query": "How does the lazy schema defer resolution to break recursive type cycles at runtime",
+    "expected_files": [
+      "packages/zod/src/v4/core/schemas.ts"
+    ],
+    "category": "implementation"
   }
 ]
