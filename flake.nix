@@ -5,8 +5,16 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, crane, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      crane,
+      flake-utils,
+      ...
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import nixpkgs { inherit system; };
         # crane v2: mkLib replaced the old crane.lib.${system} attribute
@@ -16,7 +24,8 @@
         # Some transitive deps (ring, aws-lc-sys) require Security and
         # SystemConfiguration on Darwin.
         darwinFrameworks = pkgs.lib.optionals pkgs.stdenv.isDarwin (
-          with pkgs.darwin.apple_sdk.frameworks; [
+          with pkgs.darwin.apple_sdk.frameworks;
+          [
             Security
             SystemConfiguration
           ]
@@ -25,22 +34,32 @@
         # cmake and pkg-config are needed at build time for CozoDB/RocksDB.
         commonArgs = {
           inherit src;
-          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
+          nativeBuildInputs = [
+            pkgs.cmake
+            pkgs.pkg-config
+          ];
           buildInputs = darwinFrameworks;
         };
-      in {
+      in
+      {
         packages = {
           # Release packages always compile against RocksDB for production
           # durability; SQLite remains the dev-shell default.
-          skelesearch-cli = craneLib.buildPackage (commonArgs // {
-            pname = "skelesearch-cli";
-            cargoExtraArgs = "-p skelesearch-cli --features skelesearch-core/storage-rocksdb";
-          });
+          skelesearch-cli = craneLib.buildPackage (
+            commonArgs
+            // {
+              pname = "skelesearch-cli";
+              cargoExtraArgs = "-p skelesearch-cli --features skelesearch-core/storage-rocksdb";
+            }
+          );
 
-          skelesearch-mcp = craneLib.buildPackage (commonArgs // {
-            pname = "skelesearch-mcp";
-            cargoExtraArgs = "-p skelesearch-mcp --features skelesearch-core/storage-rocksdb";
-          });
+          skelesearch-mcp = craneLib.buildPackage (
+            commonArgs
+            // {
+              pname = "skelesearch-mcp";
+              cargoExtraArgs = "-p skelesearch-mcp --features skelesearch-core/storage-rocksdb";
+            }
+          );
 
           # Alias expected by Claude plugin hook: hooks/session-start calls
           # `nix run .#mcp-server`.
@@ -59,7 +78,16 @@
             pkgs.cmake
             pkgs.pkg-config
             pkgs.clang
-          ] ++ darwinFrameworks;
+            # Benchmark scripts (TypeScript)
+            pkgs.bun
+            # ContextBench adapter (Python)
+            pkgs.uv
+            pkgs.python312
+            # Repo cloning for benchmarks
+            pkgs.git
+          ]
+          ++ darwinFrameworks;
         };
-      });
+      }
+    );
 }
