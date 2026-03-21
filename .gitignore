@@ -1,5 +1,6 @@
 /target/
-Cargo.lock
+# Cargo.lock is committed — this is a binary project.
+# Reproducible builds require pinned dependencies across machines.
 crates/cli/.fastembed_cache/
 
 .brain/
