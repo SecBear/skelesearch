@@ -12,3 +12,4 @@ benchmarks/repos/
 benchmarks/runs/
 benchmarks/tmp/.worktrees
 __pycache__/
+.direnv/
