@@ -7,9 +7,11 @@ description = "Local ONNX cross-encoder reranker for skelesearch"
 
 [dependencies]
 skelesearch-core = { path = "../core" }
-ort = { version = "=2.0.0-rc.5", default-features = false, features = ["ndarray"] }
-ndarray = "0.16"  # must match ort's ndarray; workspace uses 0.15 for other crates
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ort = { version = "=2.0.0-rc.11", default-features = false, features = [
+   "ndarray",
+] }
+ndarray = "0.17" # must match ort's ndarray; workspace uses 0.15 for CozoDB compat
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -27,7 +27,7 @@ use std::{path::Path, sync::Arc};
 use anyhow::Context;
 use async_trait::async_trait;
 use ndarray::Array2;
-use ort::Session;
+use ort::session::Session;
 use skelesearch_core::reranker::{RerankCandidate, Reranker};
 use tokenizers::{
     EncodeInput, PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
@@ -188,19 +188,17 @@ fn run_inference(
 
     // Run ONNX inference. Include token_type_ids only when the model expects it
     // — passing an unexpected input causes an ort runtime error.
-    // inputs! accepts ArrayView (TryFrom<ArrayView<T, D>> for DynValue); .view() copies
-    // data into the ort-managed buffer, so the originals can be dropped after the call.
     let outputs = if has_token_type_ids {
         session.run(ort::inputs![
-            "input_ids" => input_ids.view(),
-            "attention_mask" => attention_mask.view(),
-            "token_type_ids" => token_type_ids.view()
-        ]?)?
+            "input_ids" => ort::value::Tensor::from_array(input_ids.view())?,
+            "attention_mask" => ort::value::Tensor::from_array(attention_mask.view())?,
+            "token_type_ids" => ort::value::Tensor::from_array(token_type_ids.view())?
+        ])?
     } else {
         session.run(ort::inputs![
-            "input_ids" => input_ids.view(),
-            "attention_mask" => attention_mask.view()
-        ]?)?
+            "input_ids" => ort::value::Tensor::from_array(input_ids.view())?,
+            "attention_mask" => ort::value::Tensor::from_array(attention_mask.view())?
+        ])?
     };
 
     // Most HuggingFace optimum exports name the output tensor "logits".

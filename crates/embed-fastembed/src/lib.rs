@@ -71,7 +71,7 @@ impl EmbedProvider for FastEmbedProvider {
         // Run on a blocking thread — ONNX inference is CPU-bound and
         // TextEmbedding is not designed for async contexts.
         tokio::task::spawn_blocking(move || {
-            let locked = model
+            let mut locked = model
                 .lock()
                 .map_err(|_| anyhow::anyhow!("TextEmbedding mutex poisoned"))?;
 
