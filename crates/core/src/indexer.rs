@@ -607,21 +607,18 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         // Spawn PageRank computation as a background task now that all edges are
         // settled.  PageRank is a score boost, not a filter — stale ranks degrade
         // gracefully (new files simply get no boost until recomputation completes).
+        //
+        // NOTE: compute_pagerank(None) includes ALL edge types (imports + calls).
+        // Per-edge-type PageRank (separate import vs call centrality) is deferred
+        // until file_ranks supports a rank_type column — two concurrent spawns
+        // writing to the same :replace relation would race and the loser's ranks
+        // get silently wiped.
         let backend = Arc::clone(&self.backend);
         tokio::spawn(async move {
-            if let Err(e) = backend.compute_pagerank(Some(&["imports"])).await {
-                tracing::warn!(error = %e, "background import PageRank computation failed");
+            if let Err(e) = backend.compute_pagerank(None).await {
+                tracing::warn!(error = %e, "background PageRank computation failed");
             } else {
-                tracing::info!("import PageRank computation completed");
-            }
-        });
-
-        // Separate PageRank over call edges so call-graph centrality is tracked
-        // independently from import centrality.
-        let backend2 = Arc::clone(&self.backend);
-        tokio::spawn(async move {
-            if let Err(e) = backend2.compute_pagerank(Some(&["calls"])).await {
-                tracing::warn!(error = %e, "call-graph PageRank failed");
+                tracing::info!("PageRank computation completed");
             }
         });
 
