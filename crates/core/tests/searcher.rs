@@ -211,9 +211,10 @@ async fn two_hop_traversal_finds_transitive_imports() -> anyhow::Result<()> {
         EdgeRecord { from_file: "b.rs".into(), from_chunk: 0, to_file: "c.rs".into(), edge_type: "imports".into() },
     ]).await?;
 
-    let neighbors = backend.traverse_imports("a.rs", 2).await?;
-    assert!(neighbors.contains(&"b.rs".to_string()), "expected b.rs in {neighbors:?}");
-    assert!(neighbors.contains(&"c.rs".to_string()), "expected c.rs in {neighbors:?}");
+    let neighbors = backend.traverse_imports("a.rs", 2, None).await?;
+    let paths: Vec<String> = neighbors.iter().map(|(p, _)| p.clone()).collect();
+    assert!(paths.contains(&"b.rs".to_string()), "expected b.rs in {paths:?}");
+    assert!(paths.contains(&"c.rs".to_string()), "expected c.rs in {paths:?}");
     Ok(())
 }
 
@@ -237,8 +238,9 @@ async fn traverse_handles_cycles() -> anyhow::Result<()> {
         EdgeRecord { from_file: "b.rs".into(), from_chunk: 0, to_file: "a.rs".into(), edge_type: "imports".into() },
     ]).await?;
 
-    let neighbors = backend.traverse_imports("a.rs", 5).await?;
-    assert_eq!(neighbors, vec!["b.rs".to_string()]);
+    let neighbors = backend.traverse_imports("a.rs", 5, None).await?;
+    let paths: Vec<String> = neighbors.into_iter().map(|(p, _)| p).collect();
+    assert_eq!(paths, vec!["b.rs".to_string()]);
     Ok(())
 }
 

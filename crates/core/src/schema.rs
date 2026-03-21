@@ -95,9 +95,10 @@ pub trait StorageBackend: Send + Sync {
     async fn get_imports(&self, file_path: &str) -> anyhow::Result<Vec<String>>;
 
     /// BFS traversal of the import graph starting from `file_path`, up to
-    /// `max_depth` hops.  Returns all reachable files (excluding the start
-    /// node).  Cycles are handled by the visited set.
-    async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>>;
+    /// `max_depth` hops.  Returns `(file_path, depth)` for each reachable file
+    /// (excluding the start node).  Cycles are handled by the visited set.
+    /// Pass `edge_types = None` to traverse all edge types (current behavior).
+    async fn traverse_imports(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>>;
 
     /// Reverse BFS: find all files that (transitively) import `file_path`,
     /// up to `max_depth` hops. Returns files grouped by distance.
@@ -106,6 +107,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         file_path: &str,
         max_depth: usize,
+        edge_types: Option<&[&str]>,
     ) -> anyhow::Result<Vec<(String, usize)>>; // (file_path, depth)
 
     async fn hybrid_search(
@@ -126,7 +128,7 @@ pub trait StorageBackend: Send + Sync {
     async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>>;
 
     /// Compute PageRank over the file-level import graph and store results.
-    async fn compute_pagerank(&self) -> anyhow::Result<()>;
+    async fn compute_pagerank(&self, edge_types: Option<&[&str]>) -> anyhow::Result<()>;
 
     /// Retrieve PageRank scores for the given file paths.
     /// Returns a HashMap; files not in the graph get score 0.0.
@@ -599,17 +601,23 @@ impl StorageBackend for CozoBackend {
         rows.rows.iter().map(|r| Self::str_col(&r[0])).collect()
     }
 
-    async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>> {
+    async fn traverse_imports(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> {
         use std::collections::HashSet;
+        // edge_types=Some(&[]) means caller wants zero edge types: no results.
+        if let Some(types) = edge_types {
+            if types.is_empty() {
+                return Ok(vec![]);
+            }
+        }
         if max_depth == 0 {
             return Ok(vec![]);
         }
         let mut visited: HashSet<String> = HashSet::new();
         visited.insert(file_path.to_string());
         let mut frontier = vec![file_path.to_string()];
-        let mut result: Vec<String> = Vec::new();
+        let mut result: Vec<(String, usize)> = Vec::new();
 
-        for _ in 0..max_depth {
+        for depth in 1..=max_depth {
             if frontier.is_empty() {
                 break;
             }
@@ -620,17 +628,22 @@ impl StorageBackend for CozoBackend {
             let mut p = BTreeMap::new();
             p.insert("frontier".into(), frontier_dv);
 
-            let rows = self.run_imm(
-                "?[to_file] := *code_edges[from_file, _, to_file, _, _], is_in(from_file, $frontier)",
-                p,
-            )?;
+            let query = if let Some(types) = edge_types {
+                let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
+                p.insert("edge_types".into(), types_dv);
+                "?[to_file] := *code_edges[from_file, _, to_file, edge_type, _], is_in(from_file, $frontier), is_in(edge_type, $edge_types)"
+            } else {
+                "?[to_file] := *code_edges[from_file, _, to_file, _, _], is_in(from_file, $frontier)"
+            };
+
+            let rows = self.run_imm(query, p)?;
 
             frontier.clear();
             for row in &rows.rows {
                 if let Ok(to_file) = Self::str_col(&row[0]) {
                     if !visited.contains(&to_file) {
                         visited.insert(to_file.clone());
-                        result.push(to_file.clone());
+                        result.push((to_file.clone(), depth));
                         frontier.push(to_file);
                     }
                 }
@@ -639,8 +652,14 @@ impl StorageBackend for CozoBackend {
         Ok(result)
     }
 
-    async fn traverse_importers(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<(String, usize)>> {
+    async fn traverse_importers(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> {
         use std::collections::HashSet;
+        // edge_types=Some(&[]) means caller wants zero edge types: no results.
+        if let Some(types) = edge_types {
+            if types.is_empty() {
+                return Ok(vec![]);
+            }
+        }
         if max_depth == 0 {
             return Ok(vec![]);
         }
@@ -661,10 +680,15 @@ impl StorageBackend for CozoBackend {
             let mut p = BTreeMap::new();
             p.insert("frontier".into(), frontier_dv);
 
-            let rows = self.run_imm(
-                "?[from_file] := *code_edges[from_file, _, to_file, _, _], is_in(to_file, $frontier)",
-                p,
-            )?;
+            let query = if let Some(types) = edge_types {
+                let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
+                p.insert("edge_types".into(), types_dv);
+                "?[from_file] := *code_edges[from_file, _, to_file, edge_type, _], is_in(to_file, $frontier), is_in(edge_type, $edge_types)"
+            } else {
+                "?[from_file] := *code_edges[from_file, _, to_file, _, _], is_in(to_file, $frontier)"
+            };
+
+            let rows = self.run_imm(query, p)?;
 
             frontier.clear();
             for row in &rows.rows {
@@ -989,7 +1013,7 @@ impl StorageBackend for CozoBackend {
         Ok(result)
     }
 
-    async fn compute_pagerank(&self) -> anyhow::Result<()> {
+    async fn compute_pagerank(&self, edge_types: Option<&[&str]>) -> anyhow::Result<()> {
         // Extract file-level edges from CozoDB, compute PageRank in Rust,
         // and store results back.  CozoDB's built-in PageRank requires the
         // `graph-algo` feature which has a broken dependency (graph_builder
@@ -997,10 +1021,25 @@ impl StorageBackend for CozoBackend {
         // that while CozoDB development is stalled (see ADR-002).
 
         // 1. Extract unique directed edges: from_file -> to_file
-        let edge_rows = self.run_imm(
-            "?[f, t] := *code_edges[f, _, t, _, _]",
-            BTreeMap::new(),
-        )?;
+        let edge_rows = if let Some(types) = edge_types {
+            if types.is_empty() {
+                // No edge types requested: treat as empty graph, reset ranks.
+                let _ = self.run_mut(
+                    ":replace file_ranks { file_path => pagerank }",
+                    BTreeMap::new(),
+                );
+                return Ok(());
+            }
+            let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
+            let mut p = BTreeMap::new();
+            p.insert("edge_types".into(), types_dv);
+            self.run_imm(
+                "?[f, t] := *code_edges[f, _, t, edge_type, _], is_in(edge_type, $edge_types)",
+                p,
+            )?
+        } else {
+            self.run_imm("?[f, t] := *code_edges[f, _, t, _, _]", BTreeMap::new())?
+        };
 
         let mut node_to_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut id_to_node: Vec<String> = Vec::new();
@@ -1090,6 +1129,11 @@ impl StorageBackend for CozoBackend {
             "?[file_path, pagerank] <- $rows\n:replace file_ranks { file_path => pagerank }",
             p,
         )?;
+        // Phase B1 stub: when `edge_types` is `Some` with a single type (e.g. "calls"),
+        // results should be stored under a separate `rank_type`-prefixed relation so
+        // callers can retrieve per-edge-type PageRank independently from import-graph rank.
+        // The relation does not exist yet; this is the insertion point once Phase B1
+        // adds call-edge support.
         Ok(())
     }
 
@@ -1175,12 +1219,12 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         (**self).get_imports(file_path).await
     }
 
-    async fn traverse_imports(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<String>> {
-        (**self).traverse_imports(file_path, max_depth).await
+    async fn traverse_imports(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> {
+        (**self).traverse_imports(file_path, max_depth, edge_types).await
     }
 
-    async fn traverse_importers(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<(String, usize)>> {
-        (**self).traverse_importers(file_path, max_depth).await
+    async fn traverse_importers(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> {
+        (**self).traverse_importers(file_path, max_depth, edge_types).await
     }
 
     async fn hybrid_search(
@@ -1211,8 +1255,8 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         (**self).get_chunk_embeddings(keys).await
     }
 
-    async fn compute_pagerank(&self) -> anyhow::Result<()> {
-        (**self).compute_pagerank().await
+    async fn compute_pagerank(&self, edge_types: Option<&[&str]>) -> anyhow::Result<()> {
+        (**self).compute_pagerank(edge_types).await
     }
 
     async fn get_file_ranks(

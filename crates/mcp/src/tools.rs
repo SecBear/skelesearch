@@ -92,6 +92,15 @@ pub struct SearchCodeRow {
     pub why: String,
 }
 
+/// Response envelope for the `search_code` tool, including per-phase timings.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SearchCodeResponse {
+    pub results: Vec<SearchCodeRow>,
+    /// Per-phase latency breakdown of the search pipeline.
+    #[schemars(skip)]
+    pub _timings: skelesearch_core::SearchTimings,
+}
+
 /// Output of the `index_codebase` tool.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct IndexCodebaseOutput {

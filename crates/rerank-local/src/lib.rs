@@ -1,0 +1,339 @@
+//! Local ONNX cross-encoder reranker for skelesearch.
+//!
+//! Cross-encoder models score (query, document) pairs jointly, providing
+//! substantially higher precision than bi-encoder retrieval alone at the
+//! cost of O(N) inference calls — batched here for efficiency.
+//!
+//! # Model files
+//!
+//! This crate does **not** bundle model weights. Export a HuggingFace cross-encoder
+//! to ONNX with [`optimum`](https://huggingface.co/docs/optimum):
+//!
+//! ```sh
+//! pip install optimum[onnxruntime]
+//! optimum-cli export onnx \
+//!   --model cross-encoder/ms-marco-MiniLM-L-6-v2 \
+//!   --task text-classification \
+//!   ./models/ms-marco-MiniLM-L-6-v2/
+//! ```
+//!
+//! Recommended models (passage reranking, ONNX-exportable):
+//! - `cross-encoder/ms-marco-MiniLM-L-6-v2` — fast, strong MS-MARCO baseline
+//! - `BAAI/bge-reranker-base` — multilingual, instruction-following
+//! - `cross-encoder/ms-marco-electra-base` — highest quality, heavier
+
+use std::{path::Path, sync::Arc};
+
+use anyhow::Context;
+use async_trait::async_trait;
+use ndarray::Array2;
+use ort::Session;
+use skelesearch_core::reranker::{RerankCandidate, Reranker};
+use tokenizers::{
+    EncodeInput, PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
+    TruncationParams, TruncationStrategy,
+};
+use tracing::{debug, instrument};
+
+/// Maximum token sequence length fed to the model.
+///
+/// Cross-encoder models are typically trained on 512-token windows. Inputs
+/// longer than this are truncated from the document end (query is preserved).
+const MAX_SEQ_LEN: usize = 512;
+
+/// Local ONNX cross-encoder reranker.
+///
+/// Loads a cross-encoder model from a local directory containing:
+/// - `model.onnx` — ONNX export of the cross-encoder
+/// - `tokenizer.json` — HuggingFace tokenizer configuration
+///
+/// The model receives `(query, document)` pairs and returns relevance scores.
+/// All candidates are processed in a single batched ONNX forward pass.
+///
+/// # Architecture notes
+///
+/// - BERT-based models (e.g. MiniLM) expect `input_ids`, `attention_mask`,
+///   and `token_type_ids`. RoBERTa-based models omit `token_type_ids`. The
+///   struct auto-detects this from the model's ONNX input metadata.
+/// - Models with a single-logit output (shape `[B, 1]` or `[B]`) return the
+///   raw logit as the relevance score. Binary classifiers (`[B, 2]`) return
+///   the softmax probability of the positive class.
+/// - Inference is synchronous (ort is CPU-bound); `rerank` dispatches to a
+///   `tokio` blocking thread pool to avoid stalling the async runtime.
+pub struct LocalReranker {
+    /// Shared so the Arc can be moved into `spawn_blocking` without cloning weights.
+    session: Arc<Session>,
+    tokenizer: Arc<Tokenizer>,
+    /// True when the ONNX model's input list includes `token_type_ids`.
+    has_token_type_ids: bool,
+}
+
+impl LocalReranker {
+    /// Load a cross-encoder from a local directory.
+    ///
+    /// The directory must contain `model.onnx` and `tokenizer.json`.
+    /// Returns an error with the full path if either file is missing.
+    pub fn new(model_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let dir = model_dir.as_ref();
+
+        let model_path = dir.join("model.onnx");
+        let tokenizer_path = dir.join("tokenizer.json");
+
+        anyhow::ensure!(
+            model_path.exists(),
+            "ONNX model not found: {}",
+            model_path.display()
+        );
+        anyhow::ensure!(
+            tokenizer_path.exists(),
+            "tokenizer.json not found: {}",
+            tokenizer_path.display()
+        );
+
+        let session = Session::builder()
+            .context("failed to create ONNX runtime session builder")?
+            .commit_from_file(&model_path)
+            .with_context(|| format!("failed to load ONNX model: {}", model_path.display()))?;
+
+        // Detect BERT vs RoBERTa: only BERT-family models expect token_type_ids.
+        let has_token_type_ids = session
+            .inputs
+            .iter()
+            .any(|inp| inp.name == "token_type_ids");
+
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load tokenizer from {}: {e}",
+                tokenizer_path.display()
+            )
+        })?;
+
+        // Configure truncation (once, at load time):
+        //   LongestFirst truncates the document before the query, preserving
+        //   query tokens as much as possible — important for relevance.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_SEQ_LEN,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+                direction: TruncationDirection::Right,
+            }))
+            .map_err(|e| anyhow::anyhow!("failed to configure tokenizer truncation: {e}"))?;
+
+        // Pad all sequences in a batch to the longest sequence in that batch.
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
+            pad_to_multiple_of: None,
+            pad_id: 0,
+            pad_type_id: 0,
+            pad_token: "[PAD]".to_string(),
+        }));
+
+        Ok(Self {
+            session: Arc::new(session),
+            tokenizer: Arc::new(tokenizer),
+            has_token_type_ids,
+        })
+    }
+}
+
+/// Synchronous batch inference. Called from a `spawn_blocking` context.
+///
+/// Builds padded tensors for all `(query, candidate)` pairs, runs the ONNX
+/// session, and converts the raw logits to `f64` relevance scores.
+fn run_inference(
+    session: &Session,
+    tokenizer: &Tokenizer,
+    query: &str,
+    candidates: &[RerankCandidate],
+    has_token_type_ids: bool,
+) -> anyhow::Result<Vec<f64>> {
+    let batch_size = candidates.len();
+
+    // Build sentence-pair inputs for the tokenizer.
+    let pairs: Vec<EncodeInput> = candidates
+        .iter()
+        .map(|c| EncodeInput::Dual(query.into(), c.text.as_str().into()))
+        .collect();
+
+    // encode_batch pads all sequences to BatchLongest and truncates at MAX_SEQ_LEN.
+    let encodings = tokenizer
+        .encode_batch(pairs, /* add_special_tokens */ true)
+        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+
+    // All sequences in the batch have the same length after padding.
+    let seq_len = encodings
+        .first()
+        .map(|e| e.get_ids().len())
+        .unwrap_or(0);
+
+    debug!(batch_size, seq_len, "batch encoded");
+
+    let mut input_ids = Array2::<i64>::zeros((batch_size, seq_len));
+    let mut attention_mask = Array2::<i64>::zeros((batch_size, seq_len));
+    let mut token_type_ids = Array2::<i64>::zeros((batch_size, seq_len));
+
+    for (i, enc) in encodings.iter().enumerate() {
+        for (j, &id) in enc.get_ids().iter().enumerate() {
+            input_ids[[i, j]] = id as i64;
+        }
+        for (j, &mask) in enc.get_attention_mask().iter().enumerate() {
+            attention_mask[[i, j]] = mask as i64;
+        }
+        for (j, &type_id) in enc.get_type_ids().iter().enumerate() {
+            token_type_ids[[i, j]] = type_id as i64;
+        }
+    }
+
+    // Run ONNX inference. Include token_type_ids only when the model expects it
+    // — passing an unexpected input causes an ort runtime error.
+    // inputs! accepts ArrayView (TryFrom<ArrayView<T, D>> for DynValue); .view() copies
+    // data into the ort-managed buffer, so the originals can be dropped after the call.
+    let outputs = if has_token_type_ids {
+        session.run(ort::inputs![
+            "input_ids" => input_ids.view(),
+            "attention_mask" => attention_mask.view(),
+            "token_type_ids" => token_type_ids.view()
+        ]?)?
+    } else {
+        session.run(ort::inputs![
+            "input_ids" => input_ids.view(),
+            "attention_mask" => attention_mask.view()
+        ]?)?
+    };
+
+    // Most HuggingFace optimum exports name the output tensor "logits".
+    let logits_val = outputs
+        .get("logits")
+        .with_context(|| {
+            let names: Vec<_> = session.outputs.iter().map(|o| o.name.as_str()).collect();
+            format!(
+                "model output 'logits' not found; available outputs: {:?}",
+                names
+            )
+        })?;
+    let logits = logits_val.try_extract_tensor::<f32>()?;
+    let shape = logits.shape();
+
+    // Determine score extraction strategy from the output tensor shape.
+    //
+    // [B, 2] — binary classifier (neg class, pos class); return P(relevant)
+    //          via numerically stable 2-class softmax.
+    // [B, 1] — single-logit reranker; use the raw logit directly.
+    // [B]    — flat output (some models collapse the last dim); use as-is.
+    let scores: Vec<f64> = match shape {
+        [_, 2] => (0..batch_size)
+            .map(|i| {
+                let neg = logits[ndarray::IxDyn(&[i, 0])];
+                let pos = logits[ndarray::IxDyn(&[i, 1])];
+                // Numerically stable softmax: subtract max before exp.
+                let m = neg.max(pos);
+                let e_neg = (neg - m).exp();
+                let e_pos = (pos - m).exp();
+                (e_pos / (e_neg + e_pos)) as f64
+            })
+            .collect(),
+
+        [_, 1] => (0..batch_size)
+            .map(|i| logits[ndarray::IxDyn(&[i, 0])] as f64)
+            .collect(),
+
+        [_] => logits.iter().map(|&s| s as f64).collect(),
+
+        _ => anyhow::bail!(
+            "unexpected logits shape {:?}; expected [B], [B, 1], or [B, 2]",
+            shape
+        ),
+    };
+
+    debug!(batch_size, "inference complete");
+    Ok(scores)
+}
+
+#[async_trait]
+impl Reranker for LocalReranker {
+    #[instrument(skip_all, fields(candidates = candidates.len()))]
+    async fn rerank(
+        &self,
+        query: &str,
+        candidates: Vec<RerankCandidate>,
+    ) -> anyhow::Result<Vec<f64>> {
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let session = Arc::clone(&self.session);
+        let tokenizer = Arc::clone(&self.tokenizer);
+        let query = query.to_string();
+        let has_token_type_ids = self.has_token_type_ids;
+
+        // ort inference is synchronous and CPU-bound; move it off the async executor.
+        tokio::task::spawn_blocking(move || {
+            run_inference(&session, &tokenizer, &query, &candidates, has_token_type_ids)
+        })
+        .await
+        .context("reranker inference thread panicked")?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skelesearch_core::reranker::RerankCandidate;
+
+    fn make_candidates(texts: &[&str]) -> Vec<RerankCandidate> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| RerankCandidate {
+                index: i,
+                text: t.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn new_rejects_missing_directory() {
+        let result = LocalReranker::new("/nonexistent/path/to/model");
+        assert!(result.is_err());
+        let msg = result.err().expect("expected error").to_string();
+        assert!(
+            msg.contains("model.onnx not found") || msg.contains("ONNX model not found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_directory_missing_tokenizer() {
+        // Create a temp dir with only model.onnx (empty placeholder).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.onnx"), b"").unwrap();
+        // tokenizer.json is absent.
+        let result = LocalReranker::new(dir.path());
+        assert!(result.is_err());
+        let msg = result.err().expect("expected error").to_string();
+        assert!(msg.contains("tokenizer.json not found"), "unexpected: {msg}");
+    }
+
+    #[tokio::test]
+    async fn rerank_empty_candidates_returns_empty() {
+        // We cannot construct a real LocalReranker in a unit test (no model
+        // files), but we can test the Reranker trait contract via the NoopReranker
+        // to ensure the calling convention is correct.
+        use skelesearch_core::reranker::NoopReranker;
+        let scores = NoopReranker
+            .rerank("query", vec![])
+            .await
+            .expect("noop should not fail");
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn make_candidates_helper_is_correct() {
+        let c = make_candidates(&["a", "b"]);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].index, 0);
+        assert_eq!(c[1].text, "b");
+    }
+}

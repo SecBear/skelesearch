@@ -19,7 +19,7 @@ pub use provider::EmbedProvider;
 pub use schema::{
     ChunkRecord, CozoBackend, EdgeRecord, FileRecord, IndexStats, SearchResult, StorageBackend,
 };
-pub use searcher::{FileContext, Searcher};
+pub use searcher::{FileContext, Searcher, SearchTimings};
 pub use gc::collect_garbage;
 pub use grep::{grep_codebase, GrepMatch, GrepOptions};
 pub use config::{Config, ExpansionConfig, GraphConfig, IndexConfig, RerankerConfig, SearchConfig};

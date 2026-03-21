@@ -54,6 +54,7 @@ tracing = { workspace = true }
 regex = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
+lru = "0.12"
 
 [dev-dependencies]
 tempfile = { workspace = true }

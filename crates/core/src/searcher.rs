@@ -6,6 +6,23 @@ use crate::{expander::QueryExpander, reranker::{RerankCandidate, Reranker}, Chun
 // Public output types
 // ---------------------------------------------------------------------------
 
+/// Timing breakdown of search pipeline phases.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SearchTimings {
+    /// Query embedding generation (ms).
+    pub embed_ms: u64,
+    /// HNSW + BM25 + RRF fusion retrieval (ms).
+    pub retrieve_ms: u64,
+    /// LLM query expansion (ms, 0 if skipped).
+    pub expand_ms: u64,
+    /// Cross-encoder reranking (ms, 0 if skipped).
+    pub rerank_ms: u64,
+    /// Graph augmentation (ms, 0 if disabled).
+    pub graph_ms: u64,
+    /// End-to-end total (ms).
+    pub total_ms: u64,
+}
+
 /// Per-file context: all indexed chunks plus one-hop import graph for that file.
 #[derive(Debug, Clone, Default)]
 pub struct FileContext {
@@ -138,11 +155,25 @@ pub struct Searcher<B, P> {
     /// Optional LLM-based query expander that enriches conceptual queries with
     /// code-vocabulary keywords before BM25 matching.  `None` skips expansion.
     expander: Option<Box<dyn QueryExpander>>,
+    /// LRU cache for query embeddings.  Bounded at 256 entries.
+    ///
+    /// ASSUMPTION: `provider` is fixed at construction time, so cached
+    /// vectors always match the current provider's dimension.  If the
+    /// provider were hot-swapped this cache would need to be flushed.
+    query_embed_cache: std::sync::Mutex<lru::LruCache<String, Vec<f32>>>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     pub fn new(backend: Arc<B>, provider: P) -> Self {
-        Self { backend, provider, reranker: None, expander: None }
+        Self {
+            backend,
+            provider,
+            reranker: None,
+            expander: None,
+            query_embed_cache: std::sync::Mutex::new(
+                lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
+            ),
+        }
     }
 
     /// Attach an LLM-based query expander.  Called once at construction time;
@@ -179,17 +210,66 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         diversity: f32,
         max_tokens: Option<usize>,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        // Produce the query vector.  A single-element batch keeps the
-        // provider interface uniform.
-        let embeddings = self.provider.embed_batch(vec![query.to_string()]).await?;
-        let query_vec = embeddings
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
+        let (results, _timings) = self
+            .search_with_timings(query, top_k, include_graph, max_depth, diversity, max_tokens)
+            .await?;
+        Ok(results)
+    }
 
-        // LLM-based query expansion for conceptual queries.
+    /// Like [`Self::search`] but also returns a [`SearchTimings`] breakdown.
+    ///
+    /// Use this from callers that need per-phase latency data (e.g. the MCP
+    /// server surface).  All other callers should prefer [`Self::search`] to
+    /// avoid destructuring the tuple.
+    #[tracing::instrument(skip_all, fields(%query, top_k, diversity))]
+    pub async fn search_with_timings(
+        &self,
+        query: &str,
+        top_k: usize,
+        include_graph: bool,
+        max_depth: usize,
+        diversity: f32,
+        max_tokens: Option<usize>,
+    ) -> anyhow::Result<(Vec<SearchResult>, SearchTimings)> {
+        let total_start = std::time::Instant::now();
+        let mut timings = SearchTimings::default();
+
+        // -- Embedding (cache-aware) -------------------------------------------
+        // Check the LRU cache first to avoid a redundant embed API call for
+        // repeated or near-identical queries.  Empty queries are not cached.
+        let embed_start = std::time::Instant::now();
+        let normalized_query = query.trim().to_string();
+        let query_vec: Vec<f32> = if normalized_query.is_empty() {
+            // Empty query: skip cache, return zero vector.
+            vec![0.0; self.provider.dim()]
+        } else if let Some(cached) = self.query_embed_cache
+            .lock()
+            .expect("query_embed_cache mutex poisoned")
+            .get(&normalized_query)
+            .cloned()
+        {
+            tracing::debug!("query embedding cache hit");
+            cached
+        } else {
+            let embeddings = self.provider.embed_batch(vec![query.to_string()]).await?;
+            let vec = embeddings
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
+            // Store in cache.  Lock is re-acquired after the await so we
+            // never hold it across the async embed call.
+            self.query_embed_cache
+                .lock()
+                .expect("query_embed_cache mutex poisoned")
+                .put(normalized_query, vec.clone());
+            vec
+        };
+        timings.embed_ms = embed_start.elapsed().as_millis() as u64;
+
+        // -- LLM query expansion -----------------------------------------------
         // Only runs when an expander is configured and the query looks conceptual.
         // Failures degrade gracefully: expansion is skipped, search proceeds.
+        let expand_start = std::time::Instant::now();
         let expanded_keywords_raw = if let Some(ref expander) = self.expander {
             use crate::router::{classify_query, QueryStrategy};
             if classify_query(query) == QueryStrategy::Semantic {
@@ -200,6 +280,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         } else {
             vec![]
         };
+        // Only charge expand_ms when the expander is configured (i.e. it ran
+        // or was at least considered); 0 when no expander is attached.
+        if self.expander.is_some() {
+            timings.expand_ms = expand_start.elapsed().as_millis() as u64;
+        }
 
         // Filter expansion keywords that have no lexical overlap with the
         // original query — prevents semantic drift from LLM hallucination.
@@ -254,10 +339,13 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // other special characters that break the FTS query mini-language.
         let bm25_query = sanitize_fts_query(&bm25_query);
 
+        // -- Hybrid retrieval --------------------------------------------------
+        let retrieve_start = std::time::Instant::now();
         let mut hits = self
             .backend
             .hybrid_search(&query_vec, &bm25_query, top_k)
             .await?;
+        timings.retrieve_ms = retrieve_start.elapsed().as_millis() as u64;
 
         // PageRank boost: structurally important files get a mild score uplift.
         // Log-dampened to prevent hub files from dominating all queries.
@@ -284,15 +372,28 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         }
 
         if hits.is_empty() {
-            return Ok(vec![]);
+            timings.total_ms = total_start.elapsed().as_millis() as u64;
+            tracing::info!(
+                embed_ms = timings.embed_ms,
+                retrieve_ms = timings.retrieve_ms,
+                expand_ms = timings.expand_ms,
+                rerank_ms = timings.rerank_ms,
+                graph_ms = timings.graph_ms,
+                total_ms = timings.total_ms,
+                "search pipeline timings"
+            );
+            return Ok((vec![], timings));
         }
 
-        // Graph augmentation: pull in chunks from files reachable via resolved
-        // import edges.  Runs after hybrid search (so we have seed hits) but
-        // before MMR + reranker (so expanded results participate in filtering).
+        // -- Graph augmentation ------------------------------------------------
+        // Pull in chunks from files reachable via resolved import edges.
+        // Runs after hybrid search (so we have seed hits) but before MMR +
+        // reranker (so expanded results participate in filtering).
         if include_graph && max_depth > 0 {
+            let graph_start = std::time::Instant::now();
             let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
             hits = self.augment_with_graph(hits, max_depth, best_score).await?;
+            timings.graph_ms = graph_start.elapsed().as_millis() as u64;
         }
 
         // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
@@ -321,6 +422,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             );
         }
 
+        // -- Reranking ---------------------------------------------------------
         // Optional cross-encoder reranking for precision improvement.
         // Reranker sees all post-MMR results; it reorders them before the
         // token-budget filter selects the top slice.
@@ -333,12 +435,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // we lean on fusion; the tail benefits more from reranker signal.
         let hits = if !strong_signal {
             if let Some(ref reranker) = self.reranker {
+                let rerank_start = std::time::Instant::now();
                 let candidates: Vec<RerankCandidate> = hits
                     .iter()
                     .enumerate()
                     .map(|(i, h)| RerankCandidate { index: i, text: h.content.clone() })
                     .collect();
                 let scores = reranker.rerank(query, candidates).await?;
+                timings.rerank_ms = rerank_start.elapsed().as_millis() as u64;
                 let mut scored: Vec<_> = hits.into_iter().zip(scores).collect();
                 // Sort by reranker score descending to establish position weights.
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -405,7 +509,17 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             hits
         };
 
-        Ok(hits)
+        timings.total_ms = total_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            embed_ms = timings.embed_ms,
+            retrieve_ms = timings.retrieve_ms,
+            expand_ms = timings.expand_ms,
+            rerank_ms = timings.rerank_ms,
+            graph_ms = timings.graph_ms,
+            total_ms = timings.total_ms,
+            "search pipeline timings"
+        );
+        Ok((hits, timings))
     }
 
     /// Return all indexed chunks, outbound imports, and inbound importers for
@@ -449,11 +563,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
     /// Extend `hits` with chunks from files reachable via resolved import edges.
     ///
-    /// Graph-expanded results receive a flat score of `best_score * 0.5`.
-    /// This ensures they rank below direct hits but above noise, and participate
-    /// meaningfully in downstream MMR and reranker stages.
-    /// (Depth-decay `0.5^depth` is deferred until `traverse_imports` returns
-    /// per-hop depth information.)
+    /// Graph-expanded results are scored using depth-decay: `best_score * 0.6 * 0.7^depth`.
+    /// Depth 1 → 0.42×, depth 2 → 0.29×, depth 3 → 0.21×.  This ensures closer
+    /// transitive imports score higher than distant ones while all graph results
+    /// rank below direct hits.
     async fn augment_with_graph(
         &self,
         mut hits: Vec<SearchResult>,
@@ -466,15 +579,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let mut seen_chunks: std::collections::HashSet<(String, usize)> =
             hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
 
-        // BFS traversal depth is handled by traverse_imports.  All reachable
-        // files are scored identically at 0.5× the best direct-hit score.
-        // Depth-decay (0.5^depth) is deferred until traverse_imports returns
-        // per-hop depth info.
-        let graph_score = best_score * 0.5;
-
         for file_path in &present {
-            let reachable = self.backend.traverse_imports(file_path, max_depth).await?;
-            for target in reachable {
+            let reachable = self.backend.traverse_imports(file_path, max_depth, None).await?;
+            for (target, depth) in reachable {
+                // Depth-decay: 0.6 × 0.7^depth (depth 1 ≈ 0.42, depth 2 ≈ 0.29, depth 3 ≈ 0.21).
+                let graph_score = best_score * 0.6 * 0.7_f64.powi(depth as i32);
                 let chunks = self.backend.get_chunks_for_file(&target).await?;
                 for chunk in chunks {
                     let key = (chunk.file_path.clone(), chunk.chunk_idx);

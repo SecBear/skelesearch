@@ -559,7 +559,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
 
         // Compute PageRank over the import graph now that all edges are settled.
         // Failure is non-fatal: a missing or empty graph should not abort indexing.
-        if let Err(e) = self.backend.compute_pagerank().await {
+        if let Err(e) = self.backend.compute_pagerank(None).await {
             tracing::warn!(error = %e, "failed to compute PageRank");
         }
 

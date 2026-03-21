@@ -212,7 +212,7 @@ async fn list_tools_exposes_the_v1_tools() -> anyhow::Result<()> {
 #[tokio::test]
 async fn search_code_output_exposes_spec_fields() -> anyhow::Result<()> {
     let server = test_server().await?;
-    let rows = server
+    let response = server
         .search_code(SearchCodeInput {
             query: "import edges".into(),
             top_k: 3,
@@ -225,10 +225,10 @@ async fn search_code_output_exposes_spec_fields() -> anyhow::Result<()> {
         })
         .await?;
     assert!(
-        !rows.is_empty(),
+        !response.results.is_empty(),
         "expected at least one result from pre-indexed fixture"
     );
-    let row = &rows[0];
+    let row = &response.results[0];
     assert!(!row.file_path.is_empty());
     assert!(row.end_line >= row.start_line);
     assert!(!row.content.is_empty());

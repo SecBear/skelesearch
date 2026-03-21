@@ -7,6 +7,7 @@ members = [
    "crates/mcp",
    "crates/cli",
    "crates/rerank-api",
+   "crates/rerank-local",
 ]
 resolver = "2"
 

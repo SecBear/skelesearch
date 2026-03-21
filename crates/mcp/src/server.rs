@@ -29,7 +29,7 @@ use skelesearch_embed_fastembed::provider_from_name;
 use crate::tools::{
     ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
     GetFileContextInput, GrepSearchRow, ImpactEntry, ImpactSetOutput, IndexCodebaseInput,
-    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeRow,
+    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeResponse, SearchCodeRow,
     SmartSearchInput, SmartSearchOutput, SmartSearchResults, SymbolRow, TestContextOutput,
 };
 
@@ -256,7 +256,7 @@ impl SkeleSearchServer {
     pub async fn search_code(
         &self,
         input: SearchCodeInput,
-    ) -> anyhow::Result<Vec<SearchCodeRow>> {
+    ) -> anyhow::Result<SearchCodeResponse> {
         let provider = self.prepare_search_provider().await?;
         let searcher = Searcher::new(Arc::clone(&self.backend), provider);
         let (expander, reranker) = self.auto_configure_pipeline();
@@ -265,11 +265,10 @@ impl SkeleSearchServer {
         let top_k = input.top_k.max(1);
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
-        let start = std::time::Instant::now();
-        let mut results = searcher
-            .search(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
+        let (mut results, timings) = searcher
+            .search_with_timings(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
             .await?;
-        tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, results = results.len(), "search_code complete");
+        tracing::info!(results = results.len(), "search_code complete");
 
         // Filter to branch-changed files if requested.
         if input.branch_scope {
@@ -312,7 +311,7 @@ impl SkeleSearchServer {
             rows = unseen;
         }
 
-        Ok(rows)
+        Ok(SearchCodeResponse { results: rows, _timings: timings })
     }
 
     /// Index the codebase at `input.path`.  Returns an error for unknown
@@ -496,7 +495,7 @@ impl SkeleSearchServer {
                 }
             }
             QueryStrategy::Semantic => {
-                let rows = self
+                let response = self
                     .search_code(SearchCodeInput {
                         query: input.query.clone(),
                         top_k: input.top_k,
@@ -509,7 +508,7 @@ impl SkeleSearchServer {
                         session_id: input.session_id.clone(),
                     })
                     .await?;
-                SmartSearchResults::Semantic(rows)
+                SmartSearchResults::Semantic(response.results)
             }
         };
         Ok(SmartSearchOutput { strategy: strategy.to_string(), results })
@@ -542,7 +541,7 @@ impl SkeleSearchServer {
         input: FindImpactSetInput,
     ) -> anyhow::Result<ImpactSetOutput> {
         let max_depth = input.max_depth.unwrap_or(3).min(5);
-        let all_importers = match self.backend.traverse_importers(&input.file_path, max_depth).await {
+        let all_importers = match self.backend.traverse_importers(&input.file_path, max_depth, None).await {
             Ok(v) => v,
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
@@ -676,7 +675,7 @@ impl SkeleSearchServer {
         self.search_code(input)
             .await
             .map_err(|e| e.to_string())
-            .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
+            .and_then(|response| serde_json::to_string(&response).map_err(|e| e.to_string()))
     }
 
     /// Index a directory for code search. Run once, updates incrementally.
