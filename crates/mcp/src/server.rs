@@ -24,7 +24,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, StorageBackend};
-use skelesearch_embed_fastembed::{FastEmbedProvider, provider_from_name};
+use skelesearch_embed_fastembed::provider_from_name;
 
 use crate::tools::{
     ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
@@ -140,7 +140,8 @@ impl SkeleSearchServer {
     /// Returns an error when the index is empty so callers get a clear
     /// message rather than empty results.  When the server started with
     /// `NoopProvider` (dim == 1) but a persistent index exists, lazily
-    /// upgrades to `FastEmbedProvider` and promotes it for future calls.
+    /// initializes the correct provider (read from the manifest) and promotes
+    /// it for future calls.
     async fn prepare_search_provider(&self) -> anyhow::Result<ArcProvider> {
         let stats = match self.backend.stats().await {
             Ok(s) => s,
@@ -164,7 +165,17 @@ impl SkeleSearchServer {
         // Slow path: started with NoopProvider (dim == 1) but a persisted
         // index exists.  Lazily initialize the real provider and promote it
         // so subsequent calls skip this branch.
-        let real = FastEmbedProvider::default().context("failed to initialize fastembed provider")?;
+        // Read which provider built this index so we use the correct embedding
+        // dimension (e.g. voyage=1024, openai=1536, fastembed=768).
+        let provider_name = {
+            let manifest = ManifestStore::open(self.manifest_path.as_path())
+                .context("failed to open manifest")?;
+            manifest.get_meta("provider")
+                .context("failed to read provider from manifest")?
+                .unwrap_or_else(|| "fastembed".to_string())
+        };
+        let real = provider_from_name(&provider_name)
+            .with_context(|| format!("failed to initialize provider '{provider_name}'"))?;
         let arc_provider = ArcProvider::new(real);
         *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = arc_provider.clone();
         Ok(arc_provider)
@@ -590,7 +601,7 @@ impl SkeleSearchServer {
         let colocated: Vec<String> = all_files.into_iter()
             .filter(|f| {
                 is_test_file_path(f)
-                    && (f.starts_with(&dir)
+                    && (std::path::Path::new(f).starts_with(&dir)
                         || f.contains(&format!("/tests/{}", stem))
                         || f.contains(&format!("/__tests__/{}", stem)))
             })
