@@ -270,7 +270,7 @@ impl CozoBackend {
     ) -> anyhow::Result<Vec<(String, usize, f64, String, String, usize, usize)>> {
         let script = format!(
             r#"?[file_path, chunk_idx, bm25, content, chunk_type, start_line, end_line] :=
-    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: {limit}, bind_score: bm25 }},
+    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: {limit}, score_kind: 'tf_idf', bind_score: bm25 }},
     *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _]
 :order -bm25
 :limit {limit}"#
