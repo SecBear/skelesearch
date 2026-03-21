@@ -91,6 +91,7 @@ def run_skelesearch(
     provider: str = "fastembed",
     top_k: int = 10,
     use_cache: bool = True,
+    index_timeout: int = 3600,
 ) -> list[dict]:
     """Index (if needed) and search with skelesearch.
 
@@ -107,7 +108,7 @@ def run_skelesearch(
 
         idx_result = subprocess.run(
             [binary, "index", str(project_dir), "--provider", provider],
-            capture_output=True, timeout=900, env=env,
+            capture_output=True, timeout=index_timeout, env=env,
         )
         if idx_result.returncode != 0:
             print(f"  WARN: index failed: {idx_result.stderr[:200]}", file=sys.stderr)
@@ -245,6 +246,12 @@ def main():
         action="store_true",
         help="Force re-index even if .skelesearch/ already exists",
     )
+    parser.add_argument(
+        "--index-timeout",
+        type=int,
+        default=3600,
+        help="Timeout in seconds for indexing a repo (default: 3600)",
+    )
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
 
@@ -298,6 +305,7 @@ def main():
             provider=args.provider,
             top_k=args.top_k,
             use_cache=not args.no_cache,
+            index_timeout=args.index_timeout,
         )
         elapsed = time.time() - t0
 
