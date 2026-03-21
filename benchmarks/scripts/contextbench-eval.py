@@ -84,6 +84,16 @@ def clone_at_commit(repo_url: str, commit: str, dest: Path) -> bool:
         return False
 
 
+def count_source_files(project_dir: Path) -> int:
+    """Quick count of source files in a repo (no hidden dirs, no vendor)."""
+    count = 0
+    skip_dirs = {'.git', 'node_modules', 'vendor', '.venv', '__pycache__', 'build', 'dist'}
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+        count += len(files)
+    return count
+
+
 def run_skelesearch(
     binary: str,
     project_dir: Path,
@@ -92,26 +102,50 @@ def run_skelesearch(
     top_k: int = 10,
     use_cache: bool = True,
     index_timeout: int = 3600,
+    max_files: int = 50000,
 ) -> list[dict]:
     """Index (if needed) and search with skelesearch.
 
     Returns list of dicts with file, start_line, end_line per retrieved chunk.
     Caching: if .skelesearch/ already exists and use_cache is True, skip indexing.
+    Repos with more than max_files source files are skipped (too large for CPU indexing).
     """
     env = os.environ.copy()
+    # Enable tracing output from skelesearch
+    env.setdefault("RUST_LOG", "skelesearch=info")
     skel_dir = project_dir / ".skelesearch"
 
     if not use_cache or not skel_dir.exists():
+        # Check repo size before indexing
+        file_count = count_source_files(project_dir)
+        if file_count > max_files:
+            print(f"  SKIP: {file_count} files exceeds limit of {max_files}", file=sys.stderr)
+            return []
+        print(f"  Indexing {file_count} files...")
+
         # Need to index — wipe any stale state first
         if skel_dir.exists():
             shutil.rmtree(skel_dir)
 
-        idx_result = subprocess.run(
+        # Stream output so we can see progress and diagnose hangs
+        idx_proc = subprocess.Popen(
             [binary, "index", str(project_dir), "--provider", provider],
-            capture_output=True, timeout=index_timeout, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, text=True,
         )
-        if idx_result.returncode != 0:
-            print(f"  WARN: index failed: {idx_result.stderr[:200]}", file=sys.stderr)
+        try:
+            stdout, _ = idx_proc.communicate(timeout=index_timeout)
+            if idx_proc.returncode != 0:
+                print(f"  WARN: index failed (exit {idx_proc.returncode}): {stdout[:300]}", file=sys.stderr)
+                return []
+            # Print last line of output (summary)
+            last_line = stdout.strip().split('\n')[-1] if stdout.strip() else ''
+            if last_line:
+                print(f"  Index: {last_line}")
+        except subprocess.TimeoutExpired:
+            idx_proc.kill()
+            idx_proc.wait()
+            print(f"  WARN: index timed out after {index_timeout}s", file=sys.stderr)
             return []
 
     # Search
@@ -252,6 +286,12 @@ def main():
         default=3600,
         help="Timeout in seconds for indexing a repo (default: 3600)",
     )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=50000,
+        help="Skip repos with more source files than this (default: 50000)",
+    )
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
 
@@ -306,6 +346,7 @@ def main():
             top_k=args.top_k,
             use_cache=not args.no_cache,
             index_timeout=args.index_timeout,
+            max_files=args.max_files,
         )
         elapsed = time.time() - t0
 
