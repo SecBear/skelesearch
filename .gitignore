@@ -6,6 +6,7 @@ crates/cli/.fastembed_cache/
 .fastembed_cache/
 .skelesearch/
 .env*
+!.envrc
 benchmarks/repos/
 benchmarks/runs/
 benchmarks/tmp/
