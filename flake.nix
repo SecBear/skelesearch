@@ -91,6 +91,11 @@
             pkgs.git
           ]
           ++ darwinFrameworks;
+          # numpy and other Python C-extensions need libstdc++.so.6 on NixOS.
+          # stdenv.cc.cc.lib provides it; LD_LIBRARY_PATH makes it discoverable.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+            pkgs.stdenv.cc.cc.lib
+          ];
         };
       }
     );
