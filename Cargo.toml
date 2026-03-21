@@ -7,8 +7,10 @@ members = [
    "crates/mcp",
    "crates/cli",
    "crates/rerank-api",
-   "crates/rerank-local",
 ]
+# rerank-local requires ort (ONNX Runtime) which needs platform-specific setup.
+# Build explicitly: cargo build -p skelesearch-rerank-local
+exclude = ["crates/rerank-local"]
 resolver = "2"
 
 [workspace.package]
