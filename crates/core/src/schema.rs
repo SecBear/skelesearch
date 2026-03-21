@@ -640,24 +640,41 @@ impl StorageBackend for CozoBackend {
     }
 
     async fn traverse_importers(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<(String, usize)>> {
+        use std::collections::HashSet;
+        if max_depth == 0 {
+            return Ok(vec![]);
+        }
         let mut result = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited: HashSet<String> = HashSet::new();
         visited.insert(file_path.to_string());
         let mut frontier = vec![file_path.to_string()];
 
         for depth in 1..=max_depth {
-            let mut next_frontier = Vec::new();
-            for f in &frontier {
-                let importers = self.get_importers(f).await?;
-                for imp in importers {
-                    if visited.insert(imp.clone()) {
-                        result.push((imp.clone(), depth));
-                        next_frontier.push(imp);
+            if frontier.is_empty() {
+                break;
+            }
+            // Build frontier as DataValue::List for CozoDB's is_in() predicate —
+            // single batched query instead of N+1 per-node get_importers() calls.
+            let frontier_dv = DataValue::List(
+                frontier.iter().map(|k| Self::dv_str(k)).collect(),
+            );
+            let mut p = BTreeMap::new();
+            p.insert("frontier".into(), frontier_dv);
+
+            let rows = self.run_imm(
+                "?[from_file] := *code_edges[from_file, _, to_file, _, _], is_in(to_file, $frontier)",
+                p,
+            )?;
+
+            frontier.clear();
+            for row in &rows.rows {
+                if let Ok(from_file) = Self::str_col(&row[0]) {
+                    if visited.insert(from_file.clone()) {
+                        result.push((from_file.clone(), depth));
+                        frontier.push(from_file);
                     }
                 }
             }
-            frontier = next_frontier;
-            if frontier.is_empty() { break; }
         }
         Ok(result)
     }
@@ -910,32 +927,65 @@ impl StorageBackend for CozoBackend {
     async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> {
         let dim = self.dim.load(Ordering::Relaxed);
         let zero = vec![0.0f32; dim];
-        let mut result = Vec::with_capacity(keys.len());
-        for (file_path, chunk_idx) in keys {
-            let mut p = BTreeMap::new();
-            p.insert("fp".into(), Self::dv_str(file_path));
-            p.insert("ci".into(), DataValue::Num(cozo::Num::Int(*chunk_idx as i64)));
-            let rows = self.run_imm(
-                "?[emb] := *chunks[fp, ci, _, _, _, _, _, emb], fp = $fp, ci = $ci",
-                p,
-            )?;
-            let emb = rows
-                .rows
-                .into_iter()
-                .next()
-                .and_then(|row| match &row[0] {
-                    DataValue::List(items) if !items.is_empty() => Some(
-                        items.iter().map(|d| match d {
-                            DataValue::Num(cozo::Num::Float(f)) => *f as f32,
-                            DataValue::Num(cozo::Num::Int(i)) => *i as f32,
-                            _ => 0.0,
-                        }).collect(),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_else(|| zero.clone());
-            result.push(emb);
+
+        if keys.is_empty() {
+            return Ok(vec![]);
         }
+
+        // Collect unique file paths for the batched is_in() query.
+        let unique_fps: Vec<DataValue> = keys
+            .iter()
+            .map(|(fp, _)| fp.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|fp| Self::dv_str(fp))
+            .collect();
+
+        let mut p = BTreeMap::new();
+        p.insert("fps".into(), DataValue::List(unique_fps));
+
+        let rows = self.run_imm(
+            "?[fp, ci, emb] := *chunks[fp, ci, _, _, _, _, _, emb], is_in(fp, $fps)",
+            p,
+        )?;
+
+        // Build a HashMap keyed by (file_path, chunk_idx) for O(1) lookup.
+        let mut emb_map: std::collections::HashMap<(String, usize), Vec<f32>> =
+            std::collections::HashMap::new();
+        for row in rows.rows {
+            let fp = match &row[0] {
+                DataValue::Str(s) => s.to_string(),
+                _ => continue,
+            };
+            let ci = match &row[1] {
+                DataValue::Num(cozo::Num::Int(i)) => *i as usize,
+                _ => continue,
+            };
+            let emb = match &row[2] {
+                DataValue::List(items) if !items.is_empty() => items
+                    .iter()
+                    .map(|d| match d {
+                        DataValue::Num(cozo::Num::Float(f)) => *f as f32,
+                        DataValue::Num(cozo::Num::Int(i)) => *i as f32,
+                        _ => 0.0,
+                    })
+                    .collect(),
+                _ => continue,
+            };
+            emb_map.insert((fp, ci), emb);
+        }
+
+        // Reconstruct results in original input order, falling back to zero vector.
+        let result = keys
+            .iter()
+            .map(|(fp, ci)| {
+                emb_map
+                    .get(&(fp.clone(), *ci))
+                    .cloned()
+                    .unwrap_or_else(|| zero.clone())
+            })
+            .collect();
+
         Ok(result)
     }
 
