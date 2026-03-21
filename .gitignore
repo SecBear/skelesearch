@@ -9,4 +9,4 @@ crates/cli/.fastembed_cache/
 !.envrc
 benchmarks/repos/
 benchmarks/runs/
-benchmarks/tmp/
+benchmarks/tmp/.worktrees
