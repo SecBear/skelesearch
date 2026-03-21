@@ -65,7 +65,7 @@ pub struct Indexer<B, P> {
     include_extensions: Option<HashSet<String>>,
 }
 
-impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
+impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
     pub fn new(backend: Arc<B>, manifest: Arc<ManifestStore>, provider: P) -> Self {
         Self {
             backend,
@@ -557,11 +557,17 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             self.manifest.remove(path)?;
         }
 
-        // Compute PageRank over the import graph now that all edges are settled.
-        // Failure is non-fatal: a missing or empty graph should not abort indexing.
-        if let Err(e) = self.backend.compute_pagerank(None).await {
-            tracing::warn!(error = %e, "failed to compute PageRank");
-        }
+        // Spawn PageRank computation as a background task now that all edges are
+        // settled.  PageRank is a score boost, not a filter — stale ranks degrade
+        // gracefully (new files simply get no boost until recomputation completes).
+        let backend = Arc::clone(&self.backend);
+        tokio::spawn(async move {
+            if let Err(e) = backend.compute_pagerank(None).await {
+                tracing::warn!(error = %e, "background PageRank computation failed");
+            } else {
+                tracing::info!("PageRank computation completed");
+            }
+        });
 
         Ok(result)
     }

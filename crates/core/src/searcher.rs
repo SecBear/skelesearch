@@ -242,27 +242,31 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let query_vec: Vec<f32> = if normalized_query.is_empty() {
             // Empty query: skip cache, return zero vector.
             vec![0.0; self.provider.dim()]
-        } else if let Some(cached) = self.query_embed_cache
-            .lock()
-            .expect("query_embed_cache mutex poisoned")
-            .get(&normalized_query)
-            .cloned()
-        {
-            tracing::debug!("query embedding cache hit");
-            cached
         } else {
-            let embeddings = self.provider.embed_batch(vec![query.to_string()]).await?;
-            let vec = embeddings
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
-            // Store in cache.  Lock is re-acquired after the await so we
-            // never hold it across the async embed call.
-            self.query_embed_cache
-                .lock()
-                .expect("query_embed_cache mutex poisoned")
-                .put(normalized_query, vec.clone());
-            vec
+            // Probe cache with a scoped lock — guard must drop before any await.
+            let cached = {
+                self.query_embed_cache
+                    .lock()
+                    .expect("query_embed_cache mutex poisoned")
+                    .get(&normalized_query)
+                    .cloned()
+            };
+            if let Some(vec) = cached {
+                tracing::debug!("query embedding cache hit");
+                vec
+            } else {
+                let embeddings = self.provider.embed_batch(vec![normalized_query.clone()]).await?;
+                let vec = embeddings
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
+                // Re-acquire lock after await to store the result.
+                self.query_embed_cache
+                    .lock()
+                    .expect("query_embed_cache mutex poisoned")
+                    .put(normalized_query, vec.clone());
+                vec
+            }
         };
         timings.embed_ms = embed_start.elapsed().as_millis() as u64;
 
