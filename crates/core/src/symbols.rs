@@ -18,6 +18,14 @@ pub struct SymbolDef {
     pub end_line: usize,
 }
 
+/// A `@reference.call` capture: a function or method call site within a file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReferenceCapture {
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Extraction
 // ---------------------------------------------------------------------------
@@ -80,6 +88,88 @@ pub fn extract_symbols(filename: &str, source: &str) -> anyhow::Result<Vec<Symbo
         &mut symbols,
     );
     Ok(symbols)
+}
+
+/// Extract `@reference.call` captures from `source` using the tree-sitter-tags
+/// pipeline for the language inferred from `filename`'s extension.
+///
+/// Returns an empty `Vec` when the language has no tags query, when the query
+/// fails to compile, or when `source` yields no call references — not an error.
+pub fn extract_references(filename: &str, source: &str) -> anyhow::Result<Vec<ReferenceCapture>> {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let (tags_query, lang) = match tags_info_for_extension(ext) {
+        Some(info) => info,
+        None => return Ok(vec![]),
+    };
+
+    match TagsConfiguration::new(lang, tags_query, "") {
+        Ok(tags_cfg) => extract_references_via_tags(&tags_cfg, source),
+        Err(e) => {
+            // Same graceful degradation as extract_symbols.
+            tracing::debug!(
+                ext,
+                error = %e,
+                "tree-sitter-tags config failed; skipping reference extraction"
+            );
+            Ok(vec![])
+        }
+    }
+}
+
+fn extract_references_via_tags(
+    config: &TagsConfiguration,
+    source: &str,
+) -> anyhow::Result<Vec<ReferenceCapture>> {
+    let mut ctx = TagsContext::new();
+    let source_bytes = source.as_bytes();
+
+    let (iter, _cancelled) = ctx
+        .generate_tags(config, source_bytes, None)
+        .map_err(|e| anyhow::anyhow!("generate_tags: {e}"))?;
+
+    let mut refs = Vec::new();
+    for result in iter {
+        let tag = match result {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping tag error in reference extraction");
+                continue;
+            }
+        };
+
+        // Only emit references (not definitions).
+        if tag.is_definition {
+            continue;
+        }
+
+        // Filter to call references specifically (@reference.call).
+        let syntax_type = config.syntax_type_name(tag.syntax_type_id);
+        if syntax_type != "call" {
+            continue;
+        }
+
+        // Skip tags with empty name ranges (anonymous constructs).
+        if tag.name_range.is_empty() {
+            continue;
+        }
+
+        let name = match std::str::from_utf8(&source_bytes[tag.name_range.clone()]) {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+
+        refs.push(ReferenceCapture {
+            name,
+            start_line: tag.span.start.row + 1, // 0-indexed → 1-indexed
+            end_line: tag.span.end.row + 1,
+        });
+    }
+
+    Ok(refs)
 }
 
 // ---------------------------------------------------------------------------

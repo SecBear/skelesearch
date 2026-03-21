@@ -3910,6 +3910,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "skelesearch-rerank-local"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ndarray 0.17.2",
+ "ort",
+ "skelesearch-core",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "skelesearch-telemetry"
 version = "0.1.0"
 dependencies = [

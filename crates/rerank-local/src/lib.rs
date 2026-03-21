@@ -61,8 +61,8 @@ const MAX_SEQ_LEN: usize = 512;
 /// - Inference is synchronous (ort is CPU-bound); `rerank` dispatches to a
 ///   `tokio` blocking thread pool to avoid stalling the async runtime.
 pub struct LocalReranker {
-    /// Shared so the Arc can be moved into `spawn_blocking` without cloning weights.
-    session: Arc<Session>,
+    /// Wrapped in Mutex because ort rc.11+ requires &mut self for session.run().
+    session: Arc<std::sync::Mutex<Session>>,
     tokenizer: Arc<Tokenizer>,
     /// True when the ONNX model's input list includes `token_type_ids`.
     has_token_type_ids: bool,
@@ -90,16 +90,15 @@ impl LocalReranker {
             tokenizer_path.display()
         );
 
-        let session = Session::builder()
-            .context("failed to create ONNX runtime session builder")?
+        let session = Session::builder()?
             .commit_from_file(&model_path)
             .with_context(|| format!("failed to load ONNX model: {}", model_path.display()))?;
 
         // Detect BERT vs RoBERTa: only BERT-family models expect token_type_ids.
         let has_token_type_ids = session
-            .inputs
+            .inputs()
             .iter()
-            .any(|inp| inp.name == "token_type_ids");
+            .any(|inp| inp.name() == "token_type_ids");
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
             anyhow::anyhow!(
@@ -131,7 +130,7 @@ impl LocalReranker {
         }));
 
         Ok(Self {
-            session: Arc::new(session),
+            session: Arc::new(std::sync::Mutex::new(session)),
             tokenizer: Arc::new(tokenizer),
             has_token_type_ids,
         })
@@ -143,7 +142,7 @@ impl LocalReranker {
 /// Builds padded tensors for all `(query, candidate)` pairs, runs the ONNX
 /// session, and converts the raw logits to `f64` relevance scores.
 fn run_inference(
-    session: &Session,
+    session: &mut Session,
     tokenizer: &Tokenizer,
     query: &str,
     candidates: &[RerankCandidate],
@@ -186,32 +185,34 @@ fn run_inference(
         }
     }
 
+    // Collect output names before running inference (session.run borrows &mut self,
+    // so we can't access session.outputs() inside the error handler below).
+    let output_names: Vec<String> = session.outputs().iter().map(|o| o.name().to_string()).collect();
+
     // Run ONNX inference. Include token_type_ids only when the model expects it
     // — passing an unexpected input causes an ort runtime error.
     let outputs = if has_token_type_ids {
         session.run(ort::inputs![
-            "input_ids" => ort::value::Tensor::from_array(input_ids.view())?,
-            "attention_mask" => ort::value::Tensor::from_array(attention_mask.view())?,
-            "token_type_ids" => ort::value::Tensor::from_array(token_type_ids.view())?
+            "input_ids" => ort::value::TensorRef::from_array_view(input_ids.view())?,
+            "attention_mask" => ort::value::TensorRef::from_array_view(attention_mask.view())?,
+            "token_type_ids" => ort::value::TensorRef::from_array_view(token_type_ids.view())?
         ])?
     } else {
         session.run(ort::inputs![
-            "input_ids" => ort::value::Tensor::from_array(input_ids.view())?,
-            "attention_mask" => ort::value::Tensor::from_array(attention_mask.view())?
+            "input_ids" => ort::value::TensorRef::from_array_view(input_ids.view())?,
+            "attention_mask" => ort::value::TensorRef::from_array_view(attention_mask.view())?
         ])?
     };
-
     // Most HuggingFace optimum exports name the output tensor "logits".
     let logits_val = outputs
         .get("logits")
         .with_context(|| {
-            let names: Vec<_> = session.outputs.iter().map(|o| o.name.as_str()).collect();
             format!(
                 "model output 'logits' not found; available outputs: {:?}",
-                names
+                output_names
             )
         })?;
-    let logits = logits_val.try_extract_tensor::<f32>()?;
+    let logits = logits_val.try_extract_array::<f32>()?;
     let shape = logits.shape();
 
     // Determine score extraction strategy from the output tensor shape.
@@ -268,7 +269,9 @@ impl Reranker for LocalReranker {
 
         // ort inference is synchronous and CPU-bound; move it off the async executor.
         tokio::task::spawn_blocking(move || {
-            run_inference(&session, &tokenizer, &query, &candidates, has_token_type_ids)
+            let mut session_guard = session.lock()
+                .map_err(|_| anyhow::anyhow!("session mutex poisoned"))?;
+            run_inference(&mut session_guard, &tokenizer, &query, &candidates, has_token_type_ids)
         })
         .await
         .context("reranker inference thread panicked")?

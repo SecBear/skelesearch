@@ -9,7 +9,7 @@ use crate::{
     content_hash, ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore,
     StorageBackend,
 };
-use crate::symbols::extract_symbols;
+use crate::symbols::{extract_references, extract_symbols};
 
 // ---------------------------------------------------------------------------
 // Public output type
@@ -276,6 +276,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             struct BatchFile<'a> {
                 candidate: &'a FileCandidate,
                 hash: String,
+                source: String,
                 chunks: Vec<crate::ParsedChunk>,
                 edges: Vec<crate::ImportEdge>,
                 symbols: Vec<crate::symbols::SymbolDef>,
@@ -313,7 +314,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 let edges = chunker.extract_edges(&fc.rel_path, &source).unwrap_or_default();
                 let symbols = extract_symbols(&fc.rel_path, &source).unwrap_or_default();
 
-                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols });
+                batch_files.push(BatchFile { candidate: fc, hash, source, chunks, edges, symbols });
             }
 
             if batch_files.is_empty() {
@@ -508,6 +509,52 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 if !edge_records.is_empty() {
                     self.backend.upsert_edges(&edge_records).await?;
                 }
+
+                // Extract call-site references and join with resolved import edges
+                // to emit "calls" edges. The heuristic: if a @reference.call name
+                // matches the file stem of a resolved import target, emit a calls
+                // edge. This is a v1 approximation — it catches namespace-style
+                // imports (e.g. `import utils; utils.foo()`) and misses named
+                // imports (e.g. `from utils import foo; foo()`), but is cheap
+                // and produces directionally correct signal.
+                if !edge_records.is_empty() {
+                    let references = extract_references(&fc.rel_path, &bf.source)
+                        .unwrap_or_default();
+                    if !references.is_empty() {
+                        let ref_names: std::collections::HashSet<&str> =
+                            references.iter().map(|r| r.name.as_str()).collect();
+                        // One calls edge per unique target file; dedup by to_file.
+                        let mut seen_targets = std::collections::HashSet::new();
+                        let call_edges: Vec<EdgeRecord> = edge_records.iter()
+                            .filter_map(|e| {
+                                // Match by file stem: "utils" from "src/utils.rs".
+                                let stem = Path::new(&e.to_file)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())?;
+                                if ref_names.contains(stem)
+                                    && seen_targets.insert(e.to_file.clone())
+                                {
+                                    Some(EdgeRecord {
+                                        from_file: e.from_file.clone(),
+                                        from_chunk: 0,
+                                        to_file: e.to_file.clone(),
+                                        edge_type: "calls".into(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if !call_edges.is_empty() {
+                            tracing::info!(
+                                file = %fc.rel_path,
+                                count = call_edges.len(),
+                                "call edges"
+                            );
+                            self.backend.upsert_edges(&call_edges).await?;
+                        }
+                    }
+                }
                 tracing::info!(
                     file = %fc.rel_path,
                     total = bf.edges.len(),
@@ -562,10 +609,19 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         // gracefully (new files simply get no boost until recomputation completes).
         let backend = Arc::clone(&self.backend);
         tokio::spawn(async move {
-            if let Err(e) = backend.compute_pagerank(None).await {
-                tracing::warn!(error = %e, "background PageRank computation failed");
+            if let Err(e) = backend.compute_pagerank(Some(&["imports"])).await {
+                tracing::warn!(error = %e, "background import PageRank computation failed");
             } else {
-                tracing::info!("PageRank computation completed");
+                tracing::info!("import PageRank computation completed");
+            }
+        });
+
+        // Separate PageRank over call edges so call-graph centrality is tracked
+        // independently from import centrality.
+        let backend2 = Arc::clone(&self.backend);
+        tokio::spawn(async move {
+            if let Err(e) = backend2.compute_pagerank(Some(&["calls"])).await {
+                tracing::warn!(error = %e, "call-graph PageRank failed");
             }
         });
 

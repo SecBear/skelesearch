@@ -133,7 +133,8 @@
     "expected_files": [
       "httpx/__init__.py"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol_lookup",
+    "notes": "BARREL PENALTY: __init__.py is detected as a barrel file and scored at 0.4x. However, this query specifically asks about the public namespace, so __init__.py IS the correct answer. The semantic embedding for 'public package namespace expose symbols' should be strong enough to survive the 0.4x penalty over other files. __init__.py has 80 entries in __all__ and 12 wildcard re-export lines."
   },
   {
     "query": "Where is the Timeout configuration class defined and what per-phase timeout fields does it expose",
@@ -161,7 +162,8 @@
     "expected_files": [
       "httpx/_transports/mock.py"
     ],
-    "category": "implementation"
+    "category": "implementation",
+    "notes": "TEST FILE RISK: the word 'tests' in the query may boost files inside the tests/ directory. Test files receive a 0.3x penalty in scoring. _transports/mock.py is a production module (not in tests/) that implements MockTransport; it should rank well."
   },
   {
     "query": "How do cookies flow from the client cookie jar into requests and back from responses",

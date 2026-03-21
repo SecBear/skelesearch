@@ -8,10 +8,8 @@ members = [
    "crates/cli",
    "crates/rerank-api",
    "crates/telemetry",
+   "crates/rerank-local",
 ]
-# rerank-local excluded until ort rc.11 API migration is complete.
-# Build explicitly: cargo check -p skelesearch-rerank-local
-exclude = ["crates/rerank-local"]
 resolver = "2"
 
 [workspace.package]
