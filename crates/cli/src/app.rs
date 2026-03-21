@@ -19,19 +19,16 @@ use crate::eval;
 // ---------------------------------------------------------------------------
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    // Initialise tracing before dispatching so every command gets structured
-    // logging.  Write to stderr so stdout remains clean for MCP JSON-RPC.
-    let level = match cli.verbose {
+    // Initialise tracing. Verbose flag sets the default level; RUST_LOG
+    // overrides it. When OTEL_EXPORTER_OTLP_ENDPOINT is set and the `otlp`
+    // feature is enabled on skelesearch-telemetry, spans are also exported.
+    let default_level = match cli.verbose {
         0 => "warn",
         1 => "info",
         2 => "debug",
         _ => "trace",
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(level))
-        .with_writer(std::io::stderr)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .init();
+    let _telemetry = skelesearch_telemetry::init_tracing("skelesearch", default_level);
 
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,

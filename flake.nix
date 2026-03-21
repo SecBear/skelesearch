@@ -21,16 +21,6 @@
         craneLib = crane.mkLib pkgs;
         src = craneLib.cleanCargoSource ./.;
 
-        # Some transitive deps (ring, aws-lc-sys) require Security and
-        # SystemConfiguration on Darwin.
-        darwinFrameworks = pkgs.lib.optionals pkgs.stdenv.isDarwin (
-          with pkgs.darwin.apple_sdk.frameworks;
-          [
-            Security
-            SystemConfiguration
-          ]
-        );
-
         # cmake and pkg-config are needed at build time for CozoDB/RocksDB.
         commonArgs = {
           inherit src;
@@ -38,7 +28,6 @@
             pkgs.cmake
             pkgs.pkg-config
           ];
-          buildInputs = darwinFrameworks;
         };
       in
       {
@@ -89,8 +78,7 @@
             pkgs.python312
             # Repo cloning for benchmarks
             pkgs.git
-          ]
-          ++ darwinFrameworks;
+          ];
           # numpy and other Python C-extensions need libstdc++.so.6 on NixOS.
           # stdenv.cc.cc.lib provides it; LD_LIBRARY_PATH makes it discoverable.
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
