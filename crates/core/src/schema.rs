@@ -640,24 +640,41 @@ impl StorageBackend for CozoBackend {
     }
 
     async fn traverse_importers(&self, file_path: &str, max_depth: usize) -> anyhow::Result<Vec<(String, usize)>> {
+        use std::collections::HashSet;
+        if max_depth == 0 {
+            return Ok(vec![]);
+        }
         let mut result = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited: HashSet<String> = HashSet::new();
         visited.insert(file_path.to_string());
         let mut frontier = vec![file_path.to_string()];
 
         for depth in 1..=max_depth {
-            let mut next_frontier = Vec::new();
-            for f in &frontier {
-                let importers = self.get_importers(f).await?;
-                for imp in importers {
-                    if visited.insert(imp.clone()) {
-                        result.push((imp.clone(), depth));
-                        next_frontier.push(imp);
+            if frontier.is_empty() {
+                break;
+            }
+            // Build frontier as DataValue::List for CozoDB's is_in() predicate —
+            // single batched query instead of N+1 per-node get_importers() calls.
+            let frontier_dv = DataValue::List(
+                frontier.iter().map(|k| Self::dv_str(k)).collect(),
+            );
+            let mut p = BTreeMap::new();
+            p.insert("frontier".into(), frontier_dv);
+
+            let rows = self.run_imm(
+                "?[from_file] := *code_edges[from_file, _, to_file, _, _], is_in(to_file, $frontier)",
+                p,
+            )?;
+
+            frontier.clear();
+            for row in &rows.rows {
+                if let Ok(from_file) = Self::str_col(&row[0]) {
+                    if visited.insert(from_file.clone()) {
+                        result.push((from_file.clone(), depth));
+                        frontier.push(from_file);
                     }
                 }
             }
-            frontier = next_frontier;
-            if frontier.is_empty() { break; }
         }
         Ok(result)
     }
