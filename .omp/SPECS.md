@@ -1,2 +1,3 @@
 # Spec Index
-- [Vision](specs/00-vision.md)
+
+- [Vision & Project Context](specs/00-vision.md) — goals, Linear project, key metrics, non-goals
