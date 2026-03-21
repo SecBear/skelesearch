@@ -72,12 +72,16 @@
           # clang provides a C++20-capable compiler needed for optional
           # RocksDB builds during development; cmake/pkg-config mirror
           # the release nativeBuildInputs so `cargo build` works locally.
+          nativeBuildInputs = [
+            pkgs.cmake
+            pkgs.pkg-config
+          ];
           buildInputs = [
             pkgs.rustc
             pkgs.cargo
-            pkgs.cmake
-            pkgs.pkg-config
             pkgs.clang
+            # Native TLS (reqwest -> openssl-sys)
+            pkgs.openssl
             # Benchmark scripts (TypeScript)
             pkgs.bun
             # ContextBench adapter (Python)
