@@ -168,6 +168,29 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
     print(f"Cache dir: {cache_dir}")
 
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save_partial():
+        """Write current results to disk so long runs survive crashes."""
+        ok = [r for r in results if r.get('status') == 'ok']
+        partial = {
+            'benchmark': 'SWE-bench Lite file localization',
+            'provider': args.provider,
+            'status': 'in_progress',
+            'completed': len(ok),
+            'skipped': skipped,
+            'acc_at_1': round(sum(r['acc1'] for r in ok) / len(ok) * 100, 1) if ok else 0,
+            'acc_at_5': round(sum(r['acc5'] for r in ok) / len(ok) * 100, 1) if ok else 0,
+            'mrr': round(sum(r['mrr'] for r in ok) / len(ok), 3) if ok else 0,
+            'results': results,
+        }
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(partial, f, indent=2)
+        except Exception:
+            pass  # never crash on save
+
     results = []
     # Group by repo for index reuse
     repo_groups = defaultdict(list)
@@ -248,6 +271,7 @@ def main():
 
             # Stream progress
             print(f"    Acc@1={a1:.0f} Acc@5={a5:.0f} R@5={r5:.1%} MRR={m:.3f} ({elapsed:.0f}s)")
+            save_partial()  # incremental save after each instance
 
     # Aggregate
     ok_results = [r for r in results if r["status"] == "ok"]
