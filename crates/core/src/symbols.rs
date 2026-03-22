@@ -3,6 +3,63 @@ use tree_sitter::Language;
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
 // ---------------------------------------------------------------------------
+// Custom tags queries
+// ---------------------------------------------------------------------------
+
+/// TypeScript's built-in TAGS_QUERY only captures `@reference.type` and
+/// `@reference.class` — it has no `@reference.call` patterns, so call-graph
+/// edges are entirely absent for `.ts`/`.tsx` files.
+///
+/// This custom query keeps every definition pattern from the upstream
+/// `tree_sitter_typescript::TAGS_QUERY` verbatim, then appends
+/// `@reference.call` captures modelled after the JavaScript tags query.
+/// TypeScript inherits `call_expression` from the JavaScript grammar, so
+/// the same node shapes apply.
+///
+/// Convention: `@name` sub-capture = identifier text; `@reference.call`
+/// on the enclosing call / arguments node = the tag site.
+const TS_CUSTOM_TAGS_QUERY: &str = r#"
+; Original TypeScript definitions (verbatim from built-in TAGS_QUERY).
+(function_signature
+  name: (identifier) @name) @definition.function
+
+(method_signature
+  name: (property_identifier) @name) @definition.method
+
+(abstract_method_signature
+  name: (property_identifier) @name) @definition.method
+
+(abstract_class_declaration
+  name: (type_identifier) @name) @definition.class
+
+(module
+  name: (identifier) @name) @definition.module
+
+(interface_declaration
+  name: (type_identifier) @name) @definition.interface
+
+(type_annotation
+  (type_identifier) @name) @reference.type
+
+(new_expression
+  constructor: (identifier) @name) @reference.class
+
+; Added: call-site references.
+; Direct call: foo() -- excludes require() (module boundary, not a semantic edge).
+(
+  (call_expression
+    function: (identifier) @name) @reference.call
+  (#not-match? @name "^(require)$")
+)
+
+; Member call: obj.method() -- @name = property identifier; @reference.call = arguments node.
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)
+  arguments: (_) @reference.call)
+"#;
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -193,13 +250,14 @@ fn tags_info_for_extension(ext: &str) -> Option<(&'static str, Language)> {
             tree_sitter_python::TAGS_QUERY,
             tree_sitter_python::LANGUAGE.into(),
         )),
-        // ts and tsx share the same tags.scm but use different grammars.
+        // ts and tsx share the same grammar shape but the built-in TAGS_QUERY
+        // has no @reference.call patterns; use TS_CUSTOM_TAGS_QUERY instead.
         "ts" => Some((
-            tree_sitter_typescript::TAGS_QUERY,
+            TS_CUSTOM_TAGS_QUERY,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         )),
         "tsx" => Some((
-            tree_sitter_typescript::TAGS_QUERY,
+            TS_CUSTOM_TAGS_QUERY,
             tree_sitter_typescript::LANGUAGE_TSX.into(),
         )),
         "js" | "jsx" | "mjs" | "cjs" => Some((

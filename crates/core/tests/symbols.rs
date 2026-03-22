@@ -1,4 +1,4 @@
-use skelesearch_core::symbols::{extract_symbols, SymbolDef};
+use skelesearch_core::symbols::{extract_references, extract_symbols, SymbolDef};
 
 #[test]
 fn extract_rust_symbols() {
@@ -95,4 +95,36 @@ async fn find_symbols_kind_filter() -> anyhow::Result<()> {
     assert_eq!(structs[0].kind, "struct");
 
     Ok(())
+}
+
+
+#[test]
+fn typescript_extract_references_finds_calls() {
+    let source = r#"import { foo } from './bar';
+function main() {
+    foo();
+    console.log('test');
+}
+"#;
+    let refs = extract_references("test.ts", source).unwrap();
+    let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(!refs.is_empty(), "expected call references for TypeScript, got none");
+    assert!(names.contains(&"foo"), "expected 'foo' call ref in {names:?}");
+    assert!(names.contains(&"log"), "expected 'log' member call ref in {names:?}");
+}
+
+#[test]
+fn typescript_tsx_extract_references_finds_calls() {
+    let source = r#"import React from 'react';
+function Component() {
+    const x = doSomething();
+    obj.method();
+    return React.createElement('div');
+}
+"#;
+    let refs = extract_references("component.tsx", source).unwrap();
+    let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(!refs.is_empty(), "expected call references for TSX, got none");
+    assert!(names.contains(&"doSomething"), "expected 'doSomething' in {names:?}");
+    assert!(names.contains(&"method"), "expected 'method' member call in {names:?}");
 }
