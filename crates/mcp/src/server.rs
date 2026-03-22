@@ -255,7 +255,7 @@ impl SkeleSearchServer {
             {
                 "cloud API key detected"
             } else {
-                "local model (gte-modernbert-base)"
+                "local model (MiniLM-L6-v2)"
             };
             tracing::info!(source, "reranking enabled");
         }

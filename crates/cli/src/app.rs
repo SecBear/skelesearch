@@ -208,7 +208,7 @@ where
                 // No cloud API keys — try local ONNX reranker as final fallback.
                 match skelesearch_rerank_local::LocalReranker::default_model() {
                     Ok(r) => {
-                        tracing::info!("local reranker enabled (gte-modernbert-base)");
+                        tracing::info!("local reranker enabled (MiniLM-L6-v2)");
                         searcher.with_reranker(Box::new(r))
                     }
                     Err(_) => {

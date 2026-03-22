@@ -37,20 +37,30 @@ use tracing::{debug, instrument};
 
 /// Canonical HuggingFace repo for the default local reranker model.
 ///
-/// gte-reranker-modernbert-base (Alibaba-NLP): CoIR avg 79.99,
-/// CodeSearchNet-Python 98.37. Apache-2.0. 149M params, 8192-token context.
-const DEFAULT_MODEL_REPO: &str = "Alibaba-NLP/gte-reranker-modernbert-base";
+/// ms-marco-MiniLM-L-6-v2 (cross-encoder): 22M params, 512-token context.
+/// Fast on CPU (~50-100ms for 10 candidates). Not code-specific but effective
+/// for reranking code search results where chunks are <400 tokens.
+///
+/// For GPU users wanting higher quality, see `GTE_MODEL_REPO` below.
+const DEFAULT_MODEL_REPO: &str = "cross-encoder/ms-marco-MiniLM-L6-v2";
 
 /// Cache directory name used for the default model.
-const DEFAULT_MODEL_CACHE_NAME: &str = "gte-modernbert-base";
+const DEFAULT_MODEL_CACHE_NAME: &str = "ms-marco-MiniLM-L6-v2";
+
+/// HuggingFace repo for the high-quality GPU reranker.
+///
+/// gte-reranker-modernbert-base (Alibaba-NLP): 149M params, 8192-token context.
+/// CoIR avg 79.99, CodeSearchNet-Python 98.37. Apache-2.0.
+/// Requires GPU (CUDA) for acceptable latency; ~4s/query on CPU.
+#[allow(dead_code)]
+const GTE_MODEL_REPO: &str = "Alibaba-NLP/gte-reranker-modernbert-base";
 
 /// Default max token sequence length.
 ///
-/// skelesearch chunks are capped at 1500 non-whitespace chars (~750 tokens).
-/// 1024 provides headroom for query + special tokens while keeping inference
-/// fast. gte-reranker-modernbert-base supports up to 8192, but padding all
-/// candidates to that length is prohibitively slow on CPU.
-const DEFAULT_MAX_SEQ_LEN: usize = 1024;
+/// MiniLM supports 512 tokens. Our chunks are ~375 tokens after tokenization,
+/// so 512 is sufficient. Configurable via `with_max_seq_len()` for models
+/// with longer context (e.g. gte-modernbert-base supports 8192).
+const DEFAULT_MAX_SEQ_LEN: usize = 512;
 
 /// Default sub-batch size for ONNX forward passes.
 ///
@@ -182,21 +192,27 @@ impl LocalReranker {
         self
     }
 
-    /// Load the default reranker model (gte-reranker-modernbert-base).
+    /// Load the default reranker model (ms-marco-MiniLM-L6-v2).
     ///
-    /// Looks for model files in `~/.cache/skelesearch/reranker/gte-modernbert-base/`.
-    /// Returns a descriptive error with download instructions when files are absent.
+    /// Fast CPU cross-encoder (22M params, ~50-100ms for 10 candidates).
+    /// Looks for model files in `~/.cache/skelesearch/reranker/ms-marco-MiniLM-L6-v2/`.
     ///
     /// # Download
     ///
     /// ```sh
-    /// mkdir -p ~/.cache/skelesearch/reranker/gte-modernbert-base
+    /// mkdir -p ~/.cache/skelesearch/reranker/ms-marco-MiniLM-L6-v2
     /// uv tool run --from huggingface_hub hf download \
-    ///     Alibaba-NLP/gte-reranker-modernbert-base \
+    ///     cross-encoder/ms-marco-MiniLM-L6-v2 \
     ///     onnx/model.onnx tokenizer.json \
-    ///     --local-dir ~/.cache/skelesearch/reranker/gte-modernbert-base
-    /// mv ~/.cache/skelesearch/reranker/gte-modernbert-base/onnx/model.onnx \
-    ///     ~/.cache/skelesearch/reranker/gte-modernbert-base/model.onnx
+    ///     --local-dir ~/.cache/skelesearch/reranker/ms-marco-MiniLM-L6-v2
+    /// mv ~/.cache/skelesearch/reranker/ms-marco-MiniLM-L6-v2/onnx/model.onnx \
+    ///     ~/.cache/skelesearch/reranker/ms-marco-MiniLM-L6-v2/model.onnx
+    /// ```
+    ///
+    /// For higher quality (requires NVIDIA GPU), use gte-reranker-modernbert-base:
+    /// ```sh
+    /// # Same pattern but with Alibaba-NLP/gte-reranker-modernbert-base
+    /// # Then: LocalReranker::new(path).with_max_seq_len(8192)
     /// ```
     ///
     /// The ONNX file (`onnx/model.onnx` from the HF repo) must be placed as
@@ -464,7 +480,7 @@ mod tests {
         // Unless the user happens to have the model cached, this test confirms
         // the error path is reachable and contains actionable guidance.
         //
-        // If the model IS present in ~/.cache/skelesearch/reranker/gte-modernbert-base/,
+        // If the model IS present in ~/.cache/skelesearch/reranker/ms-marco-MiniLM-L6-v2/,
         // this test is skipped so CI machines with cached models aren't broken.
         let cache = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
