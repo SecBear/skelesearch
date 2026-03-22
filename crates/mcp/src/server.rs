@@ -237,15 +237,38 @@ impl SkeleSearchServer {
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("voyage", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
+            })
+            .or_else(|| {
+                // SKELESEARCH_RERANKER=local enables the local ONNX reranker.
+                // SKELESEARCH_RERANKER_MODEL_DIR overrides the default cache path.
+                // Best with CoreML (--features coreml) on Apple Silicon — model stays warm.
+                let local = std::env::var("SKELESEARCH_RERANKER").ok()
+                    .filter(|v| v == "local");
+                if local.is_none() { return None; }
+                let result = if let Ok(dir) = std::env::var("SKELESEARCH_RERANKER_MODEL_DIR") {
+                    let expanded = if dir.starts_with("~/") {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                        std::path::PathBuf::from(home).join(&dir[2..])
+                    } else {
+                        std::path::PathBuf::from(&dir)
+                    };
+                    skelesearch_rerank_local::LocalReranker::new(&expanded)
+                } else {
+                    skelesearch_rerank_local::LocalReranker::default_model()
+                };
+                result.ok().map(|r| -> Box<dyn Reranker> { Box::new(r) })
             });
-            // No local reranker auto-fallback — CPU cross-encoders are either
-            // too slow (gte-modernbert) or not code-aware (MiniLM), degrading results.
 
         if expander.is_some() {
             tracing::info!("query expansion enabled (OPENAI_API_KEY detected)");
         }
         if reranker.is_some() {
-            tracing::info!("cloud reranker enabled");
+            let source = if std::env::var("SKELESEARCH_RERANKER").ok().filter(|v| v == "local").is_some() {
+                "local ONNX model"
+            } else {
+                "cloud API key"
+            };
+            tracing::info!(source, "reranking enabled");
         }
 
         (expander, reranker)

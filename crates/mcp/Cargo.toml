@@ -13,6 +13,11 @@ path = "src/lib.rs"
 name = "skelesearch-mcp"
 path = "src/main.rs"
 
+[features]
+default = []
+coreml = ["skelesearch-rerank-local/coreml"]
+cuda = ["skelesearch-rerank-local/cuda"]
+
 [dependencies]
 skelesearch-core = { path = "../core" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }

@@ -1,8 +1,20 @@
 {
-  "mcpServers": {
-    "linear": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.linear.app/mcp"]
-    }
-  }
+   "mcpServers": {
+      "linear": {
+         "command": "npx",
+         "args": [
+            "-y",
+            "mcp-remote",
+            "https://mcp.linear.app/mcp"
+         ]
+      },
+      "skelesearch": {
+         "command": "./target/release/skelesearch-mcp",
+         "env": {
+            "SKELESEARCH_RERANKER": "local",
+            "SKELESEARCH_RERANKER_MODEL_DIR": "~/.cache/skelesearch/reranker/gte-modernbert-base",
+            "RUST_LOG": "skelesearch=info"
+         }
+      }
+   }
 }
