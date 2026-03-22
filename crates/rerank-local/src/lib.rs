@@ -35,6 +35,15 @@ use tokenizers::{
 };
 use tracing::{debug, instrument};
 
+/// Canonical HuggingFace repo for the default local reranker model.
+///
+/// gte-reranker-modernbert-base (Alibaba-NLP): CoIR avg 79.99,
+/// CodeSearchNet-Python 98.37. Apache-2.0. 149M params, 8192-token context.
+const DEFAULT_MODEL_REPO: &str = "Alibaba-NLP/gte-reranker-modernbert-base";
+
+/// Cache directory name used for the default model.
+const DEFAULT_MODEL_CACHE_NAME: &str = "gte-modernbert-base";
+
 /// Maximum token sequence length fed to the model.
 ///
 /// Cross-encoder models are typically trained on 512-token windows. Inputs
@@ -134,6 +143,48 @@ impl LocalReranker {
             tokenizer: Arc::new(tokenizer),
             has_token_type_ids,
         })
+    }
+
+    /// Load the default reranker model (gte-reranker-modernbert-base).
+    ///
+    /// Looks for model files in `~/.cache/skelesearch/reranker/gte-modernbert-base/`.
+    /// Returns a descriptive error with download instructions when files are absent.
+    ///
+    /// # Download
+    ///
+    /// ```sh
+    /// mkdir -p ~/.cache/skelesearch/reranker/gte-modernbert-base
+    /// huggingface-cli download Alibaba-NLP/gte-reranker-modernbert-base \
+    ///     onnx/model.onnx tokenizer.json \
+    ///     --local-dir ~/.cache/skelesearch/reranker/gte-modernbert-base
+    /// ```
+    ///
+    /// The ONNX file (`onnx/model.onnx` from the HF repo) must be placed as
+    /// `model.onnx` in the cache directory. `tokenizer.json` is placed as-is.
+    pub fn default_model() -> anyhow::Result<Self> {
+        let cache = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
+            .join("skelesearch")
+            .join("reranker")
+            .join(DEFAULT_MODEL_CACHE_NAME);
+
+        if !cache.join("model.onnx").exists() {
+            anyhow::bail!(
+                concat!(
+                    "Default reranker model not found at {path}.\n\n",
+                    "Download with:\n",
+                    "  mkdir -p {path}\n",
+                    "  huggingface-cli download {repo} \\\n",
+                    "      onnx/model.onnx tokenizer.json \\\n",
+                    "      --local-dir {path}\n\n",
+                    "Then: mv {path}/onnx/model.onnx {path}/model.onnx",
+                ),
+                path = cache.display(),
+                repo = DEFAULT_MODEL_REPO,
+            );
+        }
+
+        Self::new(&cache)
     }
 }
 
@@ -336,5 +387,28 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].index, 0);
         assert_eq!(c[1].text, "b");
+    }
+
+    #[test]
+    fn default_model_missing_emits_download_instructions() {
+        // Unless the user happens to have the model cached, this test confirms
+        // the error path is reachable and contains actionable guidance.
+        //
+        // If the model IS present in ~/.cache/skelesearch/reranker/gte-modernbert-base/,
+        // this test is skipped so CI machines with cached models aren't broken.
+        let cache = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
+            .join("skelesearch")
+            .join("reranker")
+            .join(DEFAULT_MODEL_CACHE_NAME);
+        if cache.join("model.onnx").exists() {
+            // Model is cached; skip the error-path check.
+            return;
+        }
+        let result = LocalReranker::default_model();
+        assert!(result.is_err(), "expected error when model is absent");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("huggingface-cli download"), "expected download hint in: {msg}");
+        assert!(msg.contains(DEFAULT_MODEL_REPO), "expected repo name in: {msg}");
     }
 }

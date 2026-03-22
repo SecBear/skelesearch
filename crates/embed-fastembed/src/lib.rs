@@ -3,8 +3,38 @@
 
 use anyhow::Context;
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use skelesearch_core::EmbedProvider;
+
+/// Configuration for constructing a [`FastEmbedProvider`].
+///
+/// Use [`Default::default()`] for a sensible starting point, then override
+/// individual fields as needed.
+pub struct FastEmbedOptions {
+    /// Which fastembed model to load.
+    pub model: EmbeddingModel,
+    /// Request INT8-quantized inference.
+    ///
+    /// fastembed v5 represents quantized models as distinct [`EmbeddingModel`]
+    /// variants (e.g. `BGESmallENV15Q`). `JinaEmbeddingsV2BaseCode` has no
+    /// quantized variant; when `quantized` is true for a model without one,
+    /// a warning is emitted and the full-precision model is used instead.
+    /// TODO: add a model→Q-variant mapping and return an error or switch
+    /// to the Q variant automatically once we support models that have one.
+    pub quantized: bool,
+    /// Show download progress bar during model weight download.
+    pub show_download_progress: bool,
+}
+
+impl Default for FastEmbedOptions {
+    fn default() -> Self {
+        Self {
+            model: EmbeddingModel::JinaEmbeddingsV2BaseCode,
+            quantized: false,
+            show_download_progress: true,
+        }
+    }
+}
 
 /// An [`EmbedProvider`] backed by [`fastembed::TextEmbedding`].
 ///
@@ -17,6 +47,9 @@ pub struct FastEmbedProvider {
     // but fastembed does not guarantee Send, so we pin it to a blocking thread.
     model: std::sync::Arc<std::sync::Mutex<TextEmbedding>>,
     dim: usize,
+    /// Whether this instance was built with quantized=true.  Reflected in
+    /// EmbedProvider::name() so callers can distinguish provider flavors.
+    quantized: bool,
 }
 
 impl FastEmbedProvider {
@@ -35,18 +68,46 @@ impl FastEmbedProvider {
 
     /// Construct with an explicit fastembed [`EmbeddingModel`].
     pub fn with_model(model: EmbeddingModel) -> anyhow::Result<Self> {
-        let model_info = TextEmbedding::get_model_info(&model)
+        Self::with_options(FastEmbedOptions {
+            model,
+            ..Default::default()
+        })
+    }
+
+    /// Construct with full control over embedding options.
+    ///
+    /// When `opts.quantized` is `true` but the chosen model has no Q-variant,
+    /// this emits a tracing warning and proceeds with the full-precision model.
+    pub fn with_options(opts: FastEmbedOptions) -> anyhow::Result<Self> {
+        if opts.quantized {
+            // fastembed v5 does not expose a runtime quantization knob on
+            // TextInitOptions.  Quantized inference requires selecting the
+            // appropriate Q-variant EmbeddingModel (e.g. BGESmallENV15Q).
+            // JinaEmbeddingsV2BaseCode has no quantized variant, so we
+            // continue with the full-precision weights and warn the caller.
+            tracing::warn!(
+                model = ?opts.model,
+                "quantized=true requested but no Q-variant exists for this model; \
+                 using full-precision weights. \
+                 Select a model with a Q suffix \
+                 (e.g. EmbeddingModel::BGESmallENV15Q) to get INT8 inference."
+            );
+        }
+
+        let model_info = TextEmbedding::get_model_info(&opts.model)
             .context("failed to retrieve model info")?;
         let dim = model_info.dim;
 
         let te = TextEmbedding::try_new(
-            InitOptions::new(model).with_show_download_progress(true),
+            TextInitOptions::new(opts.model)
+                .with_show_download_progress(opts.show_download_progress),
         )
         .context("failed to initialize TextEmbedding model")?;
 
         Ok(Self {
             model: std::sync::Arc::new(std::sync::Mutex::new(te)),
             dim,
+            quantized: opts.quantized,
         })
     }
 }
@@ -58,7 +119,10 @@ impl EmbedProvider for FastEmbedProvider {
     }
 
     fn name(&self) -> &str {
-        "fastembed"
+        // Return a distinct name so callers can tell which flavor they're
+        // holding. Note: "fastembed-q" does not guarantee INT8 weights are
+        // actually loaded; see FastEmbedOptions::quantized docs.
+        if self.quantized { "fastembed-q" } else { "fastembed" }
     }
 
     #[tracing::instrument(skip_all, fields(batch_size = texts.len()))]
@@ -102,7 +166,9 @@ impl EmbedProvider for FastEmbedProvider {
 
 /// Build an [`EmbedProvider`] by name, returning it boxed as a trait object.
 ///
-/// Supported names: `"fastembed"`, `"openai"` (when the `openai` feature is enabled).
+/// Supported names: `"fastembed"`, `"fastembed-q"` / `"fastembed-int8"` (quantized
+/// variant), `"openai"` (when the `openai` feature is enabled), `"voyage"`
+/// (when the `voyage` feature is enabled).
 /// Unknown names are rejected immediately with a clear error.
 ///
 /// # Errors
@@ -115,12 +181,20 @@ pub fn provider_from_name(name: &str) -> anyhow::Result<Box<dyn skelesearch_core
                 .map_err(|e| e.context("failed to initialise fastembed provider"))?;
             Ok(Box::new(p))
         }
+        "fastembed-q" | "fastembed-int8" => {
+            let p = FastEmbedProvider::with_options(FastEmbedOptions {
+                quantized: true,
+                ..Default::default()
+            })
+            .map_err(|e| e.context("failed to initialise fastembed-q provider"))?;
+            Ok(Box::new(p))
+        }
         #[cfg(feature = "openai")]
         "openai" => Ok(Box::new(skelesearch_embed_openai::OpenAIProvider::new()?)),
         #[cfg(feature = "voyage")]
         "voyage" => Ok(Box::new(skelesearch_embed_voyage::provider_voyage()?)),
         other => {
-            let mut supported = vec!["fastembed"];
+            let mut supported = vec!["fastembed", "fastembed-q", "fastembed-int8"];
             #[cfg(feature = "openai")] supported.push("openai");
             #[cfg(feature = "voyage")] supported.push("voyage");
             anyhow::bail!("unknown embedding provider: '{}'. Supported: {}", other, supported.join(", "))

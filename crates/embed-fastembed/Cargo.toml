@@ -9,6 +9,14 @@ description = "fastembed-rs EmbedProvider for skelesearch (jina-v2-base-code def
 default = ["openai", "voyage"]
 openai = ["dep:skelesearch-embed-openai"]
 voyage = ["dep:skelesearch-embed-voyage"]
+# CoreML EP for Apple Silicon inference.
+# Requires ort/coreml to be activated. Until ort is a direct dep here,
+# this flag is a marker only — configure EPs via FastEmbedOptions.execution_providers.
+# TODO(PER-99): wire "ort/coreml" once ort is added as a direct workspace dep.
+coreml = []
+# CUDA EP for NVIDIA GPU inference.
+# TODO(PER-107): wire "ort/cuda" once ort is added as a direct workspace dep.
+cuda = []
 
 [dependencies]
 skelesearch-core = { path = "../core" }

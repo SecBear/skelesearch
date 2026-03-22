@@ -1,6 +1,6 @@
 //! Cloud reranker providers for skelesearch.
 //!
-//! Supports Jina, Cohere, and Voyage reranker APIs through a unified client.
+//! Supports Jina reranker-v3, Cohere, and Voyage reranker APIs through a unified client.
 //! All three share nearly identical REST interfaces:
 //! POST { model, query, documents, top_n } → [{ index, relevance_score }]
 
@@ -11,7 +11,7 @@ use skelesearch_core::reranker::{RerankCandidate, Reranker};
 /// Supported reranker providers.
 #[derive(Debug, Clone)]
 pub enum RerankProvider {
-    /// Jina AI — code-specific model, free 10M tokens.
+    /// Jina AI — reranker-v3 (Oct 2025). Best code quality per dollar.
     Jina,
     /// Cohere — highest quality general reranker.
     Cohere,
@@ -30,7 +30,7 @@ impl RerankProvider {
 
     fn default_model(&self) -> &str {
         match self {
-            Self::Jina => "jina-reranker-v2-base-multilingual",
+            Self::Jina => "jina-reranker-v3",
             Self::Cohere => "rerank-v3.5",
             Self::Voyage => "rerank-2.5",
         }
