@@ -79,7 +79,8 @@ by the broken `::algo` crate. Use it for graph traversal instead of Rust-side BF
 
 ```datalog
 -- Forward traversal: files reachable from $start via code_edges
-reach[to_file, 1] := *code_edges[$start, _, to_file, _, _], to_file != $start
+-- NOTE: CozoDB does not allow literals in rule heads. Use d = 1 in the body.
+reach[to_file, d] := *code_edges[$start, _, to_file, _, _], to_file != $start, d = 1
 reach[to_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth,
     *code_edges[mid, _, to_file, _, _], to_file != $start
 ?[to_file, min(depth)] := reach[to_file, depth]
@@ -121,7 +122,8 @@ with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)
 | Rust BFS loop with one query per depth | Single recursive Datalog query |
 | Sequential FTS + HNSW queries | `std::thread::scope` for parallel execution |
 | `get_chunks_for_file` in a loop | `get_chunks_for_files` with `is_in` batch query |
-| `is_in(fp, $fps)` then filter by chunk_idx in Rust | `key <- $keys, key = [fp, ci]` for exact key fetch |
+| `is_in(fp, $fps)` then filter by chunk_idx in Rust | Batch fetch with `is_in` and filter Rust-side, or use specific key queries |
+| Literal values in rule heads (`reach[x, 1] := ...`) | Bind in body instead: `reach[x, d] := ..., d = 1` |
 | Omitting `score_kind: 'tf_idf'` on FTS queries | Always specify — default is raw TF, not TF-IDF |
 | Using `!ignore_link` as negation-as-failure | Bind `ignore_link: false` in the relation pattern |
 | Using `fr_k` / `fr__field` for HNSW graph columns | Use `fr_{column_name}` (e.g., `fr_file_path`, `fr_chunk_idx`) |

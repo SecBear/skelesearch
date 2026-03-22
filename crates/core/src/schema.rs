@@ -181,13 +181,19 @@ impl CozoBackend {
     fn run_mut(&self, script: &str, params: BTreeMap<String, DataValue>) -> anyhow::Result<NamedRows> {
         self.db
             .run_script(script, params, cozo::ScriptMutability::Mutable)
-            .map_err(|e| anyhow::anyhow!("{}", e))
+            .map_err(|e| {
+                tracing::debug!(script = %script, error = %e, "CozoDB write query failed");
+                anyhow::anyhow!("{}", e)
+            })
     }
 
     fn run_imm(&self, script: &str, params: BTreeMap<String, DataValue>) -> anyhow::Result<NamedRows> {
         self.db
             .run_script(script, params, cozo::ScriptMutability::Immutable)
-            .map_err(|e| anyhow::anyhow!("{}", e))
+            .map_err(|e| {
+                tracing::debug!(script = %script, error = %e, "CozoDB read query failed");
+                anyhow::anyhow!("{}", e)
+            })
     }
 
     /// Run a script, ignoring errors that indicate idempotent creation (e.g. schema
@@ -664,14 +670,14 @@ impl StorageBackend for CozoBackend {
         let script = if let Some(types) = edge_types {
             let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
             p.insert("edge_types".into(), types_dv);
-            "reach[to_file, 1] := *code_edges[$start, _, to_file, edge_type, _], \
-                 is_in(edge_type, $edge_types), to_file != $start\n\
+            "reach[to_file, d] := *code_edges[$start, _, to_file, edge_type, _], \
+                 is_in(edge_type, $edge_types), to_file != $start, d = 1\n\
              reach[to_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
                  *code_edges[mid, _, to_file, edge_type, _], \
                  is_in(edge_type, $edge_types), to_file != $start\n\
              ?[to_file, min(depth)] := reach[to_file, depth]"
         } else {
-            "reach[to_file, 1] := *code_edges[$start, _, to_file, _, _], to_file != $start\n\
+            "reach[to_file, d] := *code_edges[$start, _, to_file, _, _], to_file != $start, d = 1\n\
              reach[to_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
                  *code_edges[mid, _, to_file, _, _], to_file != $start\n\
              ?[to_file, min(depth)] := reach[to_file, depth]"
@@ -704,14 +710,14 @@ impl StorageBackend for CozoBackend {
         let script = if let Some(types) = edge_types {
             let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
             p.insert("edge_types".into(), types_dv);
-            "reach[from_file, 1] := *code_edges[from_file, _, $start, edge_type, _], \
-                 is_in(edge_type, $edge_types), from_file != $start\n\
+            "reach[from_file, d] := *code_edges[from_file, _, $start, edge_type, _], \
+                 is_in(edge_type, $edge_types), from_file != $start, d = 1\n\
              reach[from_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
                  *code_edges[from_file, _, mid, edge_type, _], \
                  is_in(edge_type, $edge_types), from_file != $start\n\
              ?[from_file, min(depth)] := reach[from_file, depth]"
         } else {
-            "reach[from_file, 1] := *code_edges[from_file, _, $start, _, _], from_file != $start\n\
+            "reach[from_file, d] := *code_edges[from_file, _, $start, _, _], from_file != $start, d = 1\n\
              reach[from_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
                  *code_edges[from_file, _, mid, _, _], from_file != $start\n\
              ?[from_file, min(depth)] := reach[from_file, depth]"
@@ -967,25 +973,20 @@ impl StorageBackend for CozoBackend {
             return Ok(vec![]);
         }
 
-        // Build list of [fp, ci] pairs for exact primary-key lookup.
-        // Each element is a two-item list so CozoDB can destructure it.
-        let keys_dv = DataValue::List(
-            keys.iter()
-                .map(|(fp, ci)| {
-                    DataValue::List(vec![
-                        Self::dv_str(fp),
-                        DataValue::Num(cozo::Num::Int(*ci as i64)),
-                    ])
-                })
-                .collect(),
-        );
-        let mut p = BTreeMap::new();
-        p.insert("keys".into(), keys_dv);
+        // Collect unique file paths for the batched is_in() query.
+        let unique_fps: Vec<DataValue> = keys
+            .iter()
+            .map(|(fp, _)| fp.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|fp| Self::dv_str(fp))
+            .collect();
 
-        // Destructure each [fp, ci] pair and hit the primary key index directly.
-        // This is O(N) point lookups instead of a full-table scan + is_in filter.
+        let mut p = BTreeMap::new();
+        p.insert("fps".into(), DataValue::List(unique_fps));
+
         let rows = self.run_imm(
-            "?[fp, ci, emb] := key <- $keys, key = [fp, ci], *chunks[fp, ci, _, _, _, _, _, emb]",
+            "?[fp, ci, emb] := *chunks[fp, ci, _, _, _, _, _, emb], is_in(fp, $fps)",
             p,
         )?;
 
