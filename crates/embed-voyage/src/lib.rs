@@ -78,6 +78,8 @@ pub struct VoyageProvider {
     model: String,
     dim: usize,
     api_url: String,
+    /// Cumulative token usage across all embed_batch calls.
+    total_tokens_used: std::sync::atomic::AtomicU64,
 }
 
 impl VoyageProvider {
@@ -111,6 +113,7 @@ impl VoyageProvider {
             model: model.to_string(),
             dim,
             api_url: "https://api.voyageai.com/v1/embeddings".to_string(),
+            total_tokens_used: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -188,8 +191,11 @@ impl VoyageProvider {
                 .await
                 .context("failed to deserialize Voyage AI embedding response")?;
 
-            tracing::trace!(
-                total_tokens = parsed.usage.total_tokens,
+            let tokens = parsed.usage.total_tokens;
+            let cumulative = self.total_tokens_used.fetch_add(tokens, std::sync::atomic::Ordering::Relaxed) + tokens;
+            tracing::info!(
+                batch_tokens = tokens,
+                cumulative_tokens = cumulative,
                 "Voyage AI embedding usage"
             );
 
