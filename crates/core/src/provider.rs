@@ -23,6 +23,13 @@ pub trait EmbedProvider: Send + Sync {
     /// Returns an error if the underlying model call fails or the returned
     /// vector count does not match `texts.len()`.
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>>;
+
+    /// Embed queries specifically (as opposed to documents).
+    /// Providers that distinguish query vs document embeddings (e.g. Voyage AI
+    /// with `input_type`) should override this. Default delegates to `embed_batch`.
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_batch(texts).await
+    }
 }
 
 
@@ -44,5 +51,9 @@ impl<T: EmbedProvider + ?Sized> EmbedProvider for Box<T> {
 
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         (**self).embed_batch(texts).await
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        (**self).embed_queries(texts).await
     }
 }

@@ -60,6 +60,10 @@ impl EmbedProvider for ArcProvider {
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         self.0.embed_batch(texts).await
     }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.0.embed_queries(texts).await
+    }
 }
 
 // ---------------------------------------------------------------------------

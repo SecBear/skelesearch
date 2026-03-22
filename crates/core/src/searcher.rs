@@ -299,7 +299,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     Some(prefix) => format!("{prefix}{normalized_query}"),
                     None => normalized_query.clone(),
                 };
-                let embeddings = self.provider.embed_batch(vec![query_text]).await?;
+                let embeddings = self.provider.embed_queries(vec![query_text]).await?;
                 let vec = embeddings
                     .into_iter()
                     .next()
