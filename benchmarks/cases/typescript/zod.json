@@ -251,7 +251,7 @@
     "notes": "The conversion logic (truthy/falsy arrays, case-insensitive matching, truthySet/falsySet) lives in core/api.ts _stringbool(). classic/schemas.ts exports a thin wrapper that calls core._stringbool() with the classic schema classes injected."
   },
   {
-    "query": "How does zod generate deterministic hash IDs for schema objects used in deduplication",
+    "query": "How does zod track schemas for deduplication in the registry using WeakMap and what is the globalRegistry singleton pattern",
     "expected_files": [
       "packages/zod/src/v4/core/registries.ts"
     ],
@@ -259,7 +259,7 @@
     "notes": "Zod does NOT use deterministic hash IDs for schema deduplication. Schemas are tracked by WeakMap object reference in $ZodRegistry._map; user-supplied 'id' strings are stored in $ZodRegistry._idmap for reverse lookup. util.ts has HashAlgorithm types but those are for validating hash string formats (md5, sha256), not schema identity. The globalRegistry deduplication is a singleton-on-globalThis trick to survive dual CJS/ESM package loading."
   },
   {
-    "query": "How does the doc utility attach structured documentation metadata to schemas",
+    "query": "How does the globalRegistry API enable schema metadata attachment using WeakMap and what does the meta check in api.ts do",
     "expected_files": [
       "packages/zod/src/v4/core/registries.ts",
       "packages/zod/src/v4/core/api.ts"
