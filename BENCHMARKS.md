@@ -52,11 +52,29 @@ Custom benchmark: 40 cases per repo across mini-redis, hyperfine, hono, zod,
 httpx, cobra. Categories: implementation, cross_file, symbol_lookup,
 error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 
-| Date | Commit | Provider | Profile | R@5 | R@10 | MRR | P@5 | Cases |
-|---|---|---|---|---|---|---|---|---|
-| 2026-03-15 | `e931f51` | voyage-code-3 | voyage-full | 86.7% | 89.5% | 80.6% | — | 240 |
+| Date | Commit | Provider | Reranker | Profile | R@5 | R@10 | MRR | P@5 | Cases |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-03-22 | `0946db3` | fastembed (jina-v2-base-code) | Voyage (auto-detected) | fastembed-full | 88.2% | 89.6% | 85.9% | — | 200/240 |
+| 2026-03-15 | `e931f51` | voyage-code-3 | Voyage | voyage-full | 86.7% | 89.5% | 80.6% | — | 240 |
 
-**Per-repo breakdown (voyage-full, 240 cases):**
+**2026-03-22 per-repo breakdown (fastembed + Voyage reranker, 200 cases — zod rate-limited):**
+
+| Repo | Language | R@5 | R@10 | MRR | Cases |
+|---|---|---|---|---|---|
+| mini-redis | Rust | 93.8% | 95.0% | 91.3% | 40 |
+| cobra | Go | 90.4% | 90.4% | 93.8% | 40 |
+| httpx | Python | 89.0% | 89.0% | 84.2% | 40 |
+| hono | TypeScript | 86.3% | 86.3% | 80.3% | 40 |
+| hyperfine | Rust | 81.3% | 87.5% | 80.1% | 40 |
+| zod | TypeScript | — | — | — | rate-limited |
+
+> **Note:** The 2026-03-22 run used fastembed (local) for embeddings but Voyage
+> reranker (cloud) was auto-detected from `VOYAGE_API_KEY` in the environment.
+> A true fully-local run (no cloud reranker) is needed to measure the local-only
+> pipeline. The `fastembed-full.toml` config has no reranker section, but the CLI
+> auto-detects cloud rerankers from env vars.
+
+**2026-03-15 per-repo breakdown (voyage-full, 240 cases):**
 
 | Repo | Language | R@5 | R@10 | MRR | Cases |
 |---|---|---|---|---|---|
@@ -100,5 +118,9 @@ bun benchmarks/scripts/run-eval.ts \
 
 ## Changelog
 
+- **2026-03-22** — Post-CozoDB optimization run (fastembed + Voyage reranker auto-detected).
+  R@5=88.2%, MRR=0.859 (200 cases, zod rate-limited). Key changes since baseline:
+  TF-IDF scoring fix (was raw TF), HNSW proximity graph expansion, recursive Datalog
+  traversal, batch chunk fetching, parallel FTS+HNSW, LSH dedup.
 - **2026-03-18** — First CoIR run (CoSQA, fastembed). nDCG@10 = 0.442.
 - **2026-03-15** — Internal eval baseline (240 cases, voyage-full). R@5 = 86.7%.
