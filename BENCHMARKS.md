@@ -81,8 +81,9 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 > - Recommended: cloud reranker when key available, no reranker otherwise.
 >
 > **LSH dedup (fixed in `bf04d4e`):** Was broken since introduction (CozoDB `:rm` syntax).
-> Now working: mini-redis removes 8 chunks, hyperfine removes 64 (22%), hono removes ~180+.
-> R@10 improved +2.5pp on hono with dedup active.
+> Now working. Impact is mixed: hono R@10 +2.5pp, zod R@5 -1.2pp. The 0.85 similarity
+> threshold may be too aggressive for code — similar-looking validators in zod are
+> semantically distinct. Average: -0.2pp R@5, +0.1pp R@10 (net neutral). Needs threshold tuning.
 **2026-03-15 per-repo breakdown (voyage-full, 240 cases):**
 
 | Repo | Language | R@5 | R@10 | MRR | Cases |
