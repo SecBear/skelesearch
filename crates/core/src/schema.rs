@@ -56,7 +56,7 @@ pub struct SearchResult {
     /// Relative quality label: `"high"`, `"moderate"`, or `"low"`.
     /// Set by `Searcher`; empty string until shaped.
     pub match_quality: String,
-    /// Retrieval provenance: `"vector"`, `"fts"`, or `"hybrid"`.
+    /// Retrieval provenance: `"vector"`, `"fts"`, `"hybrid"`, `"graph"`, or `"hnsw_proximity"`.
     /// Set by `Searcher`; empty string until shaped.
     pub why: String,
 }
@@ -491,56 +491,6 @@ impl StorageBackend for CozoBackend {
         const BATCH_SIZE: usize = 500;
 
         for batch in chunks.chunks(BATCH_SIZE) {
-            // Filter near-duplicates using the LSH index before insertion.
-            // Query happens before the :put so we compare against already-indexed content.
-            // Re-indexing the same file always passes (same file_path check).
-            // If the LSH index doesn't exist yet, run_imm returns Err and we keep the chunk.
-            let batch: Vec<&ChunkRecord> = batch
-                .iter()
-                .filter(|c| {
-                    // Always keep chunks with no meaningful normalized content (headers, etc.).
-                    if c.normalized.trim().is_empty() {
-                        return true;
-                    }
-                    let mut p = BTreeMap::new();
-                    p.insert("content".into(), Self::dv_str(&c.normalized));
-                    match self.run_imm(
-                        "?[fp, ci] := ~chunks:dedup{fp, ci | query: $content, k: 1}",
-                        p,
-                    ) {
-                        Ok(rows) if !rows.rows.is_empty() => {
-                            match (
-                                Self::str_col(&rows.rows[0][0]),
-                                Self::int_col(&rows.rows[0][1]),
-                            ) {
-                                (Ok(existing_fp), Ok(existing_ci)) => {
-                                    if existing_fp == c.file_path {
-                                        // Same file re-index — always allow update.
-                                        true
-                                    } else {
-                                        tracing::debug!(
-                                            chunk_file = %c.file_path,
-                                            chunk_idx = c.chunk_idx,
-                                            dup_file = %existing_fp,
-                                            dup_idx = existing_ci,
-                                            "skipping near-duplicate chunk",
-                                        );
-                                        false
-                                    }
-                                }
-                                // Parse error on LSH result — keep the chunk.
-                                _ => true,
-                            }
-                        }
-                        // No duplicate found or LSH index not yet available — keep the chunk.
-                        _ => true,
-                    }
-                })
-                .collect();
-
-            if batch.is_empty() {
-                continue;
-            }
 
             let rows: Vec<Vec<DataValue>> = batch
                 .into_iter()
@@ -1263,16 +1213,15 @@ impl StorageBackend for CozoBackend {
         p.insert("max_dist".into(), DataValue::Num(cozo::Num::Float(max_dist)));
 
         // Query layer 0 of the HNSW proximity graph.
-        // CozoDB maps the first key column of the indexed relation to `fr_k`/`to_k`
-        // (file_path: String) and the second key column to `fr__field`/`to__field`
-        // (chunk_idx: Int).
+        // CozoDB names HNSW adjacency columns as fr_{key_col_name} / to_{key_col_name}.
+        // For chunks{file_path: String, chunk_idx: Int}, this yields:
+        //   fr_file_path, fr_chunk_idx, to_file_path, to_chunk_idx
         let script = format!(
             r#"?[to_fp, to_ci, dist] :=
                 seed <- $seeds,
                 seed = [fp, ci],
-                *chunks:semantic{{layer: 0, fr_k: fp, fr__field: ci, to_k: to_fp, to__field: to_ci, dist}},
-                dist < $max_dist,
-                !ignore_link
+                *chunks:semantic{{layer: 0, fr_file_path: fp, fr_chunk_idx: ci, to_file_path: to_fp, to_chunk_idx: to_ci, dist, ignore_link: false}},
+                dist < $max_dist
             :limit {limit}
             :order dist"#
         );

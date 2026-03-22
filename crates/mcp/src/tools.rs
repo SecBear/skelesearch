@@ -88,7 +88,7 @@ pub struct SearchCodeRow {
     pub score: f64,
     /// Relative quality label: `"high"`, `"moderate"`, or `"low"`.
     pub match_quality: String,
-    /// Retrieval provenance: `"vector"`, `"fts"`, or `"hybrid"`.
+    /// Retrieval provenance: `"vector"`, `"fts"`, `"hybrid"`, `"graph"`, or `"hnsw_proximity"`.
     pub why: String,
 }
 
@@ -97,6 +97,8 @@ pub struct SearchCodeRow {
 pub struct SearchCodeResponse {
     pub results: Vec<SearchCodeRow>,
     /// Per-phase latency breakdown of the search pipeline.
+    /// Hidden from both JSON schema and wire output — exposed only via tracing.
+    #[serde(skip)]
     #[schemars(skip)]
     pub _timings: skelesearch_core::SearchTimings,
 }
