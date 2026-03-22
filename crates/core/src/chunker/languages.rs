@@ -456,3 +456,56 @@ pub fn config_for_extension(extension: &str) -> Option<Box<dyn LanguageConfig>> 
         _ => None,
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nix_config_chunks_and_imports() {
+        let cfg = NixConfig;
+        assert_eq!(cfg.file_extensions(), &["nix"]);
+        assert!(cfg.chunk_node_kinds().contains(&"function_expression"));
+        assert!(cfg.chunk_node_kinds().contains(&"let_expression"));
+        assert!(cfg.chunk_node_kinds().contains(&"attrset_expression"));
+
+        // Verify the import query parses without error
+        let lang = cfg.language();
+        let query = tree_sitter::Query::new(&lang, cfg.import_query());
+        assert!(query.is_ok(), "import query failed to parse: {:?}", query.err());
+    }
+
+    #[test]
+    fn nix_import_query_captures_path() {
+        use streaming_iterator::StreamingIterator;
+
+        let cfg = NixConfig;
+        let lang = cfg.language();
+        let query = tree_sitter::Query::new(&lang, cfg.import_query()).unwrap();
+
+        let source = r#"{ pkgs ? import <nixpkgs> {}, lib ? import ./lib.nix }:
+        let utils = import ./utils/default.nix;
+        in { inherit utils; }"#;
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let path_idx = query.capture_index_for_name("path").unwrap();
+        let mut paths: Vec<String> = Vec::new();
+        while let Some(m) = matches.next() {
+            for cap in m.captures {
+                if cap.index == path_idx {
+                    paths.push(cap.node.utf8_text(source.as_bytes()).unwrap().to_string());
+                }
+            }
+        }
+
+        assert!(paths.len() >= 2, "expected at least 2 import paths, got: {:?}", paths);
+        assert!(paths.iter().any(|p| p.contains("lib.nix")), "missing lib.nix in {:?}", paths);
+        assert!(paths.iter().any(|p| p.contains("utils")), "missing utils in {:?}", paths);
+    }
+}
