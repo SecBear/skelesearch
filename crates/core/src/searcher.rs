@@ -664,7 +664,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 continue;
             }
             let depth = *depth_map.get(&chunk.file_path).unwrap_or(&1);
-            let score = best_score * sim * 0.7_f64.powi(depth as i32);
+            let score = (best_score * sim * 0.7_f64.powi(depth as i32)).min(best_score * 0.5);
             hits.push(SearchResult {
                 file_path: chunk.file_path,
                 chunk_idx: chunk.chunk_idx,
@@ -704,6 +704,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     if let Some((_, dist)) = targets.iter().find(|(ci, _)| *ci == chunk.chunk_idx) {
                         let key = (chunk.file_path.clone(), chunk.chunk_idx);
                         if seen_chunks.insert(key) {
+                            // Apply same relevance gate as Phase 4a.
+                            if let Some(ref emb) = chunk.embedding {
+                                if !emb.is_empty() {
+                                    let sim = cosine_sim(query_vec, emb) as f64;
+                                    if sim < GRAPH_SIM_THRESHOLD {
+                                        continue;
+                                    }
+                                }
+                            }
                             // Score proportional to proximity: closer neighbor → higher score.
                             // Capped at 0.4× best_score to rank below import-graph results.
                             let prox_score = best_score * 0.4 * (1.0_f64 - dist).max(0.0);

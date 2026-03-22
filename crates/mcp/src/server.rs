@@ -287,6 +287,19 @@ impl SkeleSearchServer {
         let (expander, reranker) = self.auto_configure_pipeline();
         let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
         let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
+        // Apply pagerank_boost preference from project config if detectable.
+        let searcher = {
+            let root = self.backend.list_indexed_paths().await
+                .ok()
+                .and_then(|p| common_ancestor(&p))
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            let config = Config::load(&root).unwrap_or_default();
+            if config.search.pagerank_boost == Some(false) {
+                searcher.with_pagerank_boost(false)
+            } else {
+                searcher
+            }
+        };
         let top_k = input.top_k.max(1);
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
