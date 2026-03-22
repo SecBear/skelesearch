@@ -198,10 +198,25 @@ where
             .or_else(|| std::env::var("VOYAGE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("voyage", k)));
         match auto {
             Some((name, key)) => match skelesearch_rerank_api::reranker_from_name(name, key) {
-                Ok(r)  => searcher.with_reranker(Box::new(r)),
+                Ok(r)  => {
+                    tracing::info!(provider = name, "cloud reranker enabled");
+                    searcher.with_reranker(Box::new(r))
+                }
                 Err(_) => searcher,
             },
-            None => searcher,
+            None => {
+                // No cloud API keys — try local ONNX reranker as final fallback.
+                match skelesearch_rerank_local::LocalReranker::default_model() {
+                    Ok(r) => {
+                        tracing::info!("local reranker enabled (gte-modernbert-base)");
+                        searcher.with_reranker(Box::new(r))
+                    }
+                    Err(_) => {
+                        tracing::debug!("local reranker model not found, continuing without reranker");
+                        searcher
+                    }
+                }
+            }
         }
     }
 }

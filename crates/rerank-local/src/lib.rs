@@ -46,9 +46,10 @@ const DEFAULT_MODEL_CACHE_NAME: &str = "gte-modernbert-base";
 
 /// Maximum token sequence length fed to the model.
 ///
-/// Cross-encoder models are typically trained on 512-token windows. Inputs
-/// longer than this are truncated from the document end (query is preserved).
-const MAX_SEQ_LEN: usize = 512;
+/// gte-reranker-modernbert-base supports 8192 tokens. Inputs longer than this
+/// are truncated from the document end (query tokens are preserved via
+/// LongestFirst truncation strategy).
+const MAX_SEQ_LEN: usize = 8192;
 
 /// Local ONNX cross-encoder reranker.
 ///
@@ -407,7 +408,7 @@ mod tests {
         }
         let result = LocalReranker::default_model();
         assert!(result.is_err(), "expected error when model is absent");
-        let msg = result.unwrap_err().to_string();
+        let msg = result.err().expect("expected error").to_string();
         assert!(msg.contains("huggingface-cli download"), "expected download hint in: {msg}");
         assert!(msg.contains(DEFAULT_MODEL_REPO), "expected repo name in: {msg}");
     }

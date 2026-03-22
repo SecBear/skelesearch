@@ -17,6 +17,7 @@ skelesearch-core = { path = "../core" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 skelesearch-embed-openai = { path = "../embed-openai" }
 skelesearch-rerank-api = { path = "../rerank-api" }
+skelesearch-rerank-local = { path = "../rerank-local" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

@@ -18,6 +18,7 @@ skelesearch-core = { path = "../core" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 skelesearch-embed-openai = { path = "../embed-openai" }
 skelesearch-rerank-api = { path = "../rerank-api" }
+skelesearch-rerank-local = { path = "../rerank-local" }
 rmcp = { workspace = true }
 clap = { workspace = true }
 axum = { version = "0.8", default-features = false, features = [

@@ -237,13 +237,27 @@ impl SkeleSearchServer {
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("voyage", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
+            })
+            .or_else(|| {
+                // No cloud API keys — try local ONNX reranker as final fallback.
+                skelesearch_rerank_local::LocalReranker::default_model()
+                    .ok()
+                    .map(|r| -> Box<dyn Reranker> { Box::new(r) })
             });
 
         if expander.is_some() {
             tracing::info!("query expansion enabled (OPENAI_API_KEY detected)");
         }
-        if reranker.is_some() {
-            tracing::info!("reranking enabled (API key detected)");
+        if let Some(ref _r) = reranker {
+            let source = if std::env::var("JINA_API_KEY").ok().filter(|k| !k.is_empty()).is_some()
+                || std::env::var("COHERE_API_KEY").ok().filter(|k| !k.is_empty()).is_some()
+                || std::env::var("VOYAGE_API_KEY").ok().filter(|k| !k.is_empty()).is_some()
+            {
+                "cloud API key detected"
+            } else {
+                "local model (gte-modernbert-base)"
+            };
+            tracing::info!(source, "reranking enabled");
         }
 
         (expander, reranker)
