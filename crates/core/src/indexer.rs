@@ -625,6 +625,20 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             }
         });
 
+        // Spawn LSH deduplication as a background task.  Near-duplicate chunks
+        // across different files waste HNSW graph capacity; removing them improves
+        // retrieval diversity.  Like PageRank, this is a quality boost — stale
+        // duplicates degrade gracefully (slightly lower recall) until the next
+        // full re-index.
+        let backend2 = Arc::clone(&self.backend);
+        tokio::spawn(async move {
+            match backend2.deduplicate_chunks().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(removed = n, "background LSH deduplication completed"),
+                Err(e) => tracing::warn!(error = %e, "background LSH deduplication failed"),
+            }
+        });
+
         Ok(result)
     }
 }

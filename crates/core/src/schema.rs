@@ -145,6 +145,13 @@ pub trait StorageBackend: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<(String, usize, f64)>>;
 
+
+    /// Remove near-duplicate chunks across different files using the LSH index.
+    /// Chunks sharing an LSH hash bucket but from different files are collapsed:
+    /// one representative is kept (lowest file_path, then lowest chunk_idx),
+    /// the rest are deleted.  Returns the number of chunks removed.
+    /// No-op if the LSH index does not exist or contains no cross-file duplicates.
+    async fn deduplicate_chunks(&self) -> anyhow::Result<usize>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1267,97 @@ impl StorageBackend for CozoBackend {
         }
         Ok(results)
     }
+
+    async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
+        // The LSH index relation `chunks:dedup` groups chunks by MinHash bucket.
+        // Schema: { hash: Bytes, src_file_path: String, src_chunk_idx: Int }.
+        // Chunks sharing a hash bucket from *different* files are near-duplicates.
+        //
+        // Strategy: for each hash bucket with entries from >1 file, keep the
+        // representative with the lowest (file_path, chunk_idx) and delete the rest.
+
+        // Step 1: Find all (hash, file_path, chunk_idx) triples where the hash
+        // bucket contains entries from more than one file.
+        let find_dups = r#"
+            dup_hash[hash] :=
+                *chunks:dedup{hash, src_file_path: fp1},
+                *chunks:dedup{hash, src_file_path: fp2},
+                fp1 != fp2
+
+            ?[hash, fp, ci] :=
+                dup_hash[hash],
+                *chunks:dedup{hash, src_file_path: fp, src_chunk_idx: ci}
+            :order hash, fp, ci
+        "#;
+
+        let rows = match self.run_imm(find_dups, BTreeMap::new()) {
+            Ok(r) => r,
+            Err(e) => {
+                // LSH index may not exist (old database). Not an error.
+                tracing::debug!(error = %e, "deduplicate_chunks: LSH index query failed");
+                return Ok(0);
+            }
+        };
+
+        if rows.rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Step 2: Group by hash, keep the first entry (lowest fp/ci), collect
+        // the rest as deletion targets.
+        let mut to_delete: Vec<(String, usize)> = Vec::new();
+        let mut current_hash: Option<DataValue> = None;
+
+        for row in &rows.rows {
+            let hash = &row[0];
+            let fp = match Self::str_col(&row[1]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let ci = match Self::int_col(&row[2]) {
+                Ok(i) => i as usize,
+                Err(_) => continue,
+            };
+
+            if current_hash.as_ref() == Some(hash) {
+                // Same bucket — this is a duplicate; mark for deletion.
+                to_delete.push((fp, ci));
+            } else {
+                // New bucket — this entry is the representative; skip it.
+                current_hash = Some(hash.clone());
+            }
+        }
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let count = to_delete.len();
+
+        // Step 3: Delete duplicate chunks in batches.
+        for batch in to_delete.chunks(200) {
+            let keys = DataValue::List(
+                batch
+                    .iter()
+                    .map(|(fp, ci)| {
+                        DataValue::List(vec![
+                            Self::dv_str(fp),
+                            DataValue::Num(cozo::Num::Int(*ci as i64)),
+                        ])
+                    })
+                    .collect(),
+            );
+            let mut p = BTreeMap::new();
+            p.insert("keys".into(), keys);
+            self.run_mut(
+                "?[fp, ci] <- $keys :rm chunks { file_path: fp, chunk_idx: ci }",
+                p,
+            )?;
+        }
+
+        tracing::info!(removed = count, "deduplicated near-duplicate chunks across files");
+        Ok(count)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,5 +1464,9 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         limit: usize,
     ) -> anyhow::Result<Vec<(String, usize, f64)>> {
         (**self).hnsw_neighbors(seeds, max_dist, limit).await
+    }
+
+    async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
+        (**self).deduplicate_chunks().await
     }
 }
