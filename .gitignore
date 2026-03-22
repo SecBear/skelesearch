@@ -13,3 +13,4 @@ benchmarks/runs/
 benchmarks/tmp/.worktrees
 __pycache__/
 .direnv/
+swebench-repos/
