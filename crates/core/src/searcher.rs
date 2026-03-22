@@ -530,9 +530,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     /// `file_path`.  Returns empty arrays for files not in the index — never
     /// an error.
     pub async fn file_context(&self, file_path: &str) -> anyhow::Result<FileContext> {
-        let chunks = self.backend.get_chunks_for_file(file_path).await?;
-        let imports = self.backend.get_imports(file_path).await?;
-        let imported_by = self.backend.get_importers(file_path).await?;
+        let (chunks_res, imports_res, importers_res) = tokio::join!(
+            self.backend.get_chunks_for_file(file_path),
+            self.backend.get_imports(file_path),
+            self.backend.get_importers(file_path),
+        );
+        let chunks = chunks_res?;
+        let imports = imports_res?;
+        let imported_by = importers_res?;
         Ok(FileContext { chunks, imports, imported_by })
     }
 
@@ -591,45 +596,88 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             .map(|h| (h.file_path.clone(), h.chunk_idx))
             .collect();
 
+        // Phase 1: Collect all graph-reachable files with their minimum depth.
+        // Multiple seed files may reach the same target; keep the shortest path.
+        let mut depth_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for file_path in &present {
             let reachable = self.backend.traverse_imports(file_path, max_depth, None).await?;
             for (target, depth) in reachable {
-                // Depth-decay: 0.6 × 0.7^depth (depth 1 ≈ 0.42, depth 2 ≈ 0.29, depth 3 ≈ 0.21).
-                let graph_score = best_score * 0.6 * 0.7_f64.powi(depth as i32);
-                let chunks = self.backend.get_chunks_for_file(&target).await?;
-                for chunk in chunks {
-                    let key = (chunk.file_path.clone(), chunk.chunk_idx);
-                    if seen_chunks.insert(key) {
-                        hits.push(SearchResult {
-                            file_path: chunk.file_path,
-                            chunk_idx: chunk.chunk_idx,
-                            content: chunk.content,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            chunk_type: chunk.chunk_type,
-                            score: graph_score,
-                            match_quality: "graph".to_string(),
-                            why: "graph".to_string(),
-                        });
-                    }
-                }
+                depth_map.entry(target).and_modify(|d| { if depth < *d { *d = depth; } }).or_insert(depth);
             }
         }
 
-        // HNSW proximity expansion: find vector-similar chunks without re-embedding.
+        // Phase 2: HNSW proximity expansion — collect specific (fp, ci) targets.
         // Walks layer 0 of the HNSW graph using seed chunks from the original hits.
         // Cosine distance threshold 0.3: captures semantically close neighbors
         // while excluding weakly related chunks.
+        let mut hnsw_map: std::collections::HashMap<(String, usize), f64> = std::collections::HashMap::new();
         if !seed_chunks.is_empty() {
             let neighbors = self.backend.hnsw_neighbors(&seed_chunks, 0.3, 50).await?;
             for (fp, ci, dist) in neighbors {
-                let key = (fp.clone(), ci);
-                if seen_chunks.insert(key) {
-                    // Score proportional to proximity: closer neighbor → higher score.
-                    // Capped at 0.4× best_score to rank below import-graph results.
-                    let prox_score = best_score * 0.4 * (1.0_f64 - dist).max(0.0);
-                    if let Ok(chunks) = self.backend.get_chunks_for_file(&fp).await {
-                        if let Some(chunk) = chunks.into_iter().find(|c| c.chunk_idx == ci) {
+                // Keep closest distance (smallest dist = most similar) for each chunk.
+                hnsw_map.entry((fp, ci)).and_modify(|d| { if dist < *d { *d = dist; } }).or_insert(dist);
+            }
+        }
+
+        // Phase 3: Batch fetch ALL chunks for all graph-reachable files in one query.
+        // HNSW files that are also graph-reachable get all chunks fetched here too.
+        // Pure HNSW files (not in depth_map) are omitted intentionally — we only
+        // need the specific (fp, ci) chunk, so we avoid pulling every chunk for those files.
+        let graph_file_list: Vec<&str> = depth_map.keys().map(|s| s.as_str()).collect();
+        let all_graph_chunks = self.backend.get_chunks_for_files(&graph_file_list).await?;
+
+        // Phase 4a: Distribute graph chunks with depth-decay scores.
+        // Depth-decay: 0.6 × 0.7^depth (depth 1 ≈ 0.42, depth 2 ≈ 0.29, depth 3 ≈ 0.21).
+        for chunk in all_graph_chunks {
+            let key = (chunk.file_path.clone(), chunk.chunk_idx);
+            if !seen_chunks.insert(key) {
+                continue;
+            }
+            // depth_map is keyed by file_path, so this lookup is always Some.
+            let depth = *depth_map.get(&chunk.file_path).unwrap_or(&1);
+            let score = best_score * 0.6 * 0.7_f64.powi(depth as i32);
+            hits.push(SearchResult {
+                file_path: chunk.file_path,
+                chunk_idx: chunk.chunk_idx,
+                content: chunk.content,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                chunk_type: chunk.chunk_type,
+                score,
+                match_quality: "graph".to_string(),
+                why: "graph".to_string(),
+            });
+        }
+
+        // Phase 4b: Fetch and score HNSW-only chunks (specific (fp, ci) pairs not already seen).
+        // These are chunks in files that are NOT graph-reachable — pure proximity neighbors.
+        // We only need one specific chunk per HNSW hit, so fetch file-by-file here.
+        // In practice hnsw_map is small (≤50 entries) so this is cheap.
+        let hnsw_only: Vec<(&String, usize, f64)> = hnsw_map
+            .iter()
+            .filter(|((fp, ci), _)| {
+                // Skip if already added (either as a seed or via graph augmentation).
+                !seen_chunks.contains(&(fp.clone(), *ci))
+                    // Also skip if the file is graph-reachable — that fetch is already done.
+                    && !depth_map.contains_key(fp)
+            })
+            .map(|((fp, ci), dist)| (fp, *ci, *dist))
+            .collect();
+
+        // Group HNSW-only targets by file to minimise repeated backend calls.
+        let mut hnsw_by_file: std::collections::HashMap<&String, Vec<(usize, f64)>> = std::collections::HashMap::new();
+        for (fp, ci, dist) in hnsw_only {
+            hnsw_by_file.entry(fp).or_default().push((ci, dist));
+        }
+        for (fp, targets) in hnsw_by_file {
+            if let Ok(chunks) = self.backend.get_chunks_for_file(fp).await {
+                for chunk in chunks {
+                    if let Some((_, dist)) = targets.iter().find(|(ci, _)| *ci == chunk.chunk_idx) {
+                        let key = (chunk.file_path.clone(), chunk.chunk_idx);
+                        if seen_chunks.insert(key) {
+                            // Score proportional to proximity: closer neighbor → higher score.
+                            // Capped at 0.4× best_score to rank below import-graph results.
+                            let prox_score = best_score * 0.4 * (1.0_f64 - dist).max(0.0);
                             hits.push(SearchResult {
                                 file_path: chunk.file_path,
                                 chunk_idx: chunk.chunk_idx,
@@ -650,6 +698,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         tracing::debug!(
             seed_files = present.len(),
             hnsw_seeds = seed_chunks.len(),
+            graph_files = depth_map.len(),
             total_hits = hits.len(),
             "graph augmentation complete"
         );

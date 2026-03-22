@@ -88,6 +88,8 @@ pub trait StorageBackend: Send + Sync {
     async fn upsert_chunks(&self, chunks: &[ChunkRecord]) -> anyhow::Result<()>;
     async fn delete_chunks_for_file(&self, file_path: &str) -> anyhow::Result<()>;
     async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<ChunkRecord>>;
+    /// Batch fetch chunks for multiple files in a single query.
+    async fn get_chunks_for_files(&self, file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>>;
 
     async fn upsert_edges(&self, edges: &[EdgeRecord]) -> anyhow::Result<()>;
     async fn delete_edges_for_file(&self, file_path: &str) -> anyhow::Result<()>;
@@ -556,6 +558,22 @@ impl StorageBackend for CozoBackend {
         rows.rows.iter().map(|r| Self::row_to_chunk(r)).collect()
     }
 
+    async fn get_chunks_for_files(&self, file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> {
+        if file_paths.is_empty() {
+            return Ok(vec![]);
+        }
+        let fps = DataValue::List(file_paths.iter().map(|fp| Self::dv_str(fp)).collect());
+        let mut p = BTreeMap::new();
+        p.insert("fps".into(), fps);
+        let rows = self.run_imm(
+            "?[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding] \
+             := *chunks[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding], \
+             is_in(file_path, $fps)",
+            p,
+        )?;
+        rows.rows.iter().map(|r| Self::row_to_chunk(r)).collect()
+    }
+
     async fn upsert_edges(&self, edges: &[EdgeRecord]) -> anyhow::Result<()> {
         if edges.is_empty() {
             return Ok(());
@@ -627,7 +645,6 @@ impl StorageBackend for CozoBackend {
     }
 
     async fn traverse_imports(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> {
-        use std::collections::HashSet;
         // edge_types=Some(&[]) means caller wants zero edge types: no results.
         if let Some(types) = edge_types {
             if types.is_empty() {
@@ -637,48 +654,37 @@ impl StorageBackend for CozoBackend {
         if max_depth == 0 {
             return Ok(vec![]);
         }
-        let mut visited: HashSet<String> = HashSet::new();
-        visited.insert(file_path.to_string());
-        let mut frontier = vec![file_path.to_string()];
-        let mut result: Vec<(String, usize)> = Vec::new();
 
-        for depth in 1..=max_depth {
-            if frontier.is_empty() {
-                break;
-            }
-            // Build frontier as DataValue::List for CozoDB's is_in() predicate.
-            let frontier_dv = DataValue::List(
-                frontier.iter().map(|k| Self::dv_str(k)).collect(),
-            );
-            let mut p = BTreeMap::new();
-            p.insert("frontier".into(), frontier_dv);
+        let mut p = BTreeMap::new();
+        p.insert("start".into(), Self::dv_str(file_path));
+        p.insert("max_depth".into(), DataValue::Num(cozo::Num::Int(max_depth as i64)));
 
-            let query = if let Some(types) = edge_types {
-                let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
-                p.insert("edge_types".into(), types_dv);
-                "?[to_file] := *code_edges[from_file, _, to_file, edge_type, _], is_in(from_file, $frontier), is_in(edge_type, $edge_types)"
-            } else {
-                "?[to_file] := *code_edges[from_file, _, to_file, _, _], is_in(from_file, $frontier)"
-            };
+        // Single recursive Datalog query replaces the Rust BFS loop.
+        // CozoDB handles cycles via stratification; min(depth) keeps shortest path.
+        let script = if let Some(types) = edge_types {
+            let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
+            p.insert("edge_types".into(), types_dv);
+            "reach[to_file, 1] := *code_edges[$start, _, to_file, edge_type, _], \
+                 is_in(edge_type, $edge_types), to_file != $start\n\
+             reach[to_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
+                 *code_edges[mid, _, to_file, edge_type, _], \
+                 is_in(edge_type, $edge_types), to_file != $start\n\
+             ?[to_file, min(depth)] := reach[to_file, depth]"
+        } else {
+            "reach[to_file, 1] := *code_edges[$start, _, to_file, _, _], to_file != $start\n\
+             reach[to_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
+                 *code_edges[mid, _, to_file, _, _], to_file != $start\n\
+             ?[to_file, min(depth)] := reach[to_file, depth]"
+        };
 
-            let rows = self.run_imm(query, p)?;
-
-            frontier.clear();
-            for row in &rows.rows {
-                if let Ok(to_file) = Self::str_col(&row[0]) {
-                    if !visited.contains(&to_file) {
-                        visited.insert(to_file.clone());
-                        result.push((to_file.clone(), depth));
-                        frontier.push(to_file);
-                    }
-                }
-            }
-        }
-        Ok(result)
+        let rows = self.run_imm(script, p)?;
+        rows.rows
+            .iter()
+            .map(|r| Ok((Self::str_col(&r[0])?, Self::int_col(&r[1])? as usize)))
+            .collect()
     }
 
     async fn traverse_importers(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> {
-        use std::collections::HashSet;
         // edge_types=Some(&[]) means caller wants zero edge types: no results.
         if let Some(types) = edge_types {
             if types.is_empty() {
@@ -688,44 +694,34 @@ impl StorageBackend for CozoBackend {
         if max_depth == 0 {
             return Ok(vec![]);
         }
-        let mut result = Vec::new();
-        let mut visited: HashSet<String> = HashSet::new();
-        visited.insert(file_path.to_string());
-        let mut frontier = vec![file_path.to_string()];
 
-        for depth in 1..=max_depth {
-            if frontier.is_empty() {
-                break;
-            }
-            // Build frontier as DataValue::List for CozoDB's is_in() predicate —
-            // single batched query instead of N+1 per-node get_importers() calls.
-            let frontier_dv = DataValue::List(
-                frontier.iter().map(|k| Self::dv_str(k)).collect(),
-            );
-            let mut p = BTreeMap::new();
-            p.insert("frontier".into(), frontier_dv);
+        let mut p = BTreeMap::new();
+        p.insert("start".into(), Self::dv_str(file_path));
+        p.insert("max_depth".into(), DataValue::Num(cozo::Num::Int(max_depth as i64)));
 
-            let query = if let Some(types) = edge_types {
-                let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
-                p.insert("edge_types".into(), types_dv);
-                "?[from_file] := *code_edges[from_file, _, to_file, edge_type, _], is_in(to_file, $frontier), is_in(edge_type, $edge_types)"
-            } else {
-                "?[from_file] := *code_edges[from_file, _, to_file, _, _], is_in(to_file, $frontier)"
-            };
+        // Single recursive Datalog query — reverse direction (to_file → from_file).
+        // CozoDB handles cycles; min(depth) keeps shortest path to each importer.
+        let script = if let Some(types) = edge_types {
+            let types_dv = DataValue::List(types.iter().map(|t| Self::dv_str(t)).collect());
+            p.insert("edge_types".into(), types_dv);
+            "reach[from_file, 1] := *code_edges[from_file, _, $start, edge_type, _], \
+                 is_in(edge_type, $edge_types), from_file != $start\n\
+             reach[from_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
+                 *code_edges[from_file, _, mid, edge_type, _], \
+                 is_in(edge_type, $edge_types), from_file != $start\n\
+             ?[from_file, min(depth)] := reach[from_file, depth]"
+        } else {
+            "reach[from_file, 1] := *code_edges[from_file, _, $start, _, _], from_file != $start\n\
+             reach[from_file, d] := reach[mid, prev], d = prev + 1, d <= $max_depth, \
+                 *code_edges[from_file, _, mid, _, _], from_file != $start\n\
+             ?[from_file, min(depth)] := reach[from_file, depth]"
+        };
 
-            let rows = self.run_imm(query, p)?;
-
-            frontier.clear();
-            for row in &rows.rows {
-                if let Ok(from_file) = Self::str_col(&row[0]) {
-                    if visited.insert(from_file.clone()) {
-                        result.push((from_file.clone(), depth));
-                        frontier.push(from_file);
-                    }
-                }
-            }
-        }
-        Ok(result)
+        let rows = self.run_imm(script, p)?;
+        rows.rows
+            .iter()
+            .map(|r| Ok((Self::str_col(&r[0])?, Self::int_col(&r[1])? as usize)))
+            .collect()
     }
 
     #[tracing::instrument(skip_all, fields(top_k))]
@@ -735,37 +731,25 @@ impl StorageBackend for CozoBackend {
         query_str: &str,
         top_k: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        // Guard: if no chunks exist, searches will fail on empty index.
-        let count_rows = self.run_imm(
-            "?[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]",
+        // Single round-trip: count total chunks and chunks-with-embeddings together.
+        let guard_rows = self.run_imm(
+            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]\n\
+             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)\n\
+             ?[t, e] := total[t], with_emb[e]",
             BTreeMap::new(),
         )?;
-        let count = count_rows
+        let (total, emb_count) = guard_rows
             .rows
             .first()
-            .and_then(|r| match &r[0] {
-                DataValue::Num(cozo::Num::Int(n)) => Some(*n),
-                _ => None,
+            .map(|r| {
+                let t = match &r[0] { DataValue::Num(cozo::Num::Int(n)) => *n, _ => 0 };
+                let e = match &r[1] { DataValue::Num(cozo::Num::Int(n)) => *n, _ => 0 };
+                (t, e)
             })
-            .unwrap_or(0);
-        if count == 0 {
+            .unwrap_or((0, 0));
+        if total == 0 {
             return Ok(vec![]);
         }
-
-        // Check whether any chunk has an embedding (HNSW requires at least one).
-        let emb_count_rows = self.run_imm(
-            "?[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)",
-            BTreeMap::new(),
-        )?;
-        let emb_count = emb_count_rows
-            .rows
-            .first()
-            .and_then(|r| match &r[0] {
-                DataValue::Num(cozo::Num::Int(n)) => Some(*n),
-                _ => None,
-            })
-            .unwrap_or(0);
-
         if emb_count == 0 {
             // No embeddings yet — fall back to FTS only.
             return self.fts_only_search(query_str, top_k);
@@ -774,8 +758,17 @@ impl StorageBackend for CozoBackend {
         // Fetch extra candidates from each leg so the fusion has material to rank.
         let fetch_k = (top_k * 2).max(50);
 
-        let fts_results = self.fts_search(query_str, fetch_k)?;
-        let vec_results = self.vector_search(query_vec, fetch_k)?;
+        // Run FTS and HNSW concurrently. CozoBackend wraps a DbInstance which is
+        // Send + Sync, so scoped threads give us true parallelism on the RocksDB
+        // backend. On SQLite the gain is smaller (single shared connection) but
+        // the code is still correct either way.
+        let (fts_results, vec_results) = std::thread::scope(|s| {
+            let fts_handle = s.spawn(|| self.fts_search(query_str, fetch_k));
+            let vec_handle = s.spawn(|| self.vector_search(query_vec, fetch_k));
+            (fts_handle.join().unwrap(), vec_handle.join().unwrap())
+        });
+        let fts_results = fts_results?;
+        let vec_results = vec_results?;
 
         // Rank maps: (file_path, chunk_idx) -> 1-indexed rank.
         // FTS: rank 1 = highest bm25 (results arrive score-descending).
@@ -844,48 +837,41 @@ impl StorageBackend for CozoBackend {
     }
 
     async fn stats(&self) -> anyhow::Result<IndexStats> {
-        let file_rows = self.run_imm(
-            "?[count(fp)] := *files[fp, _, _, _, _]",
+        // Single query: fc and cc use count (returns 0 on empty), ml uses max
+        // (returns nothing on empty). When files is empty the join yields no rows;
+        // unwrap_or covers that case.
+        let rows = self.run_imm(
+            "fc[count(fp)] := *files[fp, _, _, _, _]\n\
+             cc[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]\n\
+             ml[max(li)] := *files[_, _, _, li, _]\n\
+             ?[f, c, m] := fc[f], cc[c], ml[m]",
             BTreeMap::new(),
         )?;
-        let indexed_files = file_rows
-            .rows
-            .first()
-            .and_then(|r| match &r[0] {
-                DataValue::Num(cozo::Num::Int(n)) => Some(*n as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
 
-        let chunk_rows = self.run_imm(
-            "?[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]",
-            BTreeMap::new(),
-        )?;
-        let total_chunks = chunk_rows
+        let (indexed_files, total_chunks, max_li) = rows
             .rows
             .first()
-            .and_then(|r| match &r[0] {
-                DataValue::Num(cozo::Num::Int(n)) => Some(*n as usize),
-                _ => None,
+            .map(|r| {
+                let f = match &r[0] {
+                    DataValue::Num(cozo::Num::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                let c = match &r[1] {
+                    DataValue::Num(cozo::Num::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                let m = match &r[2] {
+                    DataValue::Num(cozo::Num::Int(n)) => *n,
+                    _ => 0,
+                };
+                (f, c, m)
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0, 0));
 
         let last_indexed = if indexed_files == 0 {
             None
         } else {
-            let li_rows = self.run_imm(
-                "?[max(li)] := *files[_, _, _, li, _]",
-                BTreeMap::new(),
-            )?;
-            li_rows
-                .rows
-                .first()
-                .and_then(|r| match &r[0] {
-                    DataValue::Num(cozo::Num::Int(ts)) => {
-                        DateTime::from_timestamp(*ts, 0)
-                    }
-                    _ => None,
-                })
+            DateTime::from_timestamp(max_li, 0)
         };
 
         Ok(IndexStats {
@@ -981,20 +967,25 @@ impl StorageBackend for CozoBackend {
             return Ok(vec![]);
         }
 
-        // Collect unique file paths for the batched is_in() query.
-        let unique_fps: Vec<DataValue> = keys
-            .iter()
-            .map(|(fp, _)| fp.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .map(|fp| Self::dv_str(fp))
-            .collect();
-
+        // Build list of [fp, ci] pairs for exact primary-key lookup.
+        // Each element is a two-item list so CozoDB can destructure it.
+        let keys_dv = DataValue::List(
+            keys.iter()
+                .map(|(fp, ci)| {
+                    DataValue::List(vec![
+                        Self::dv_str(fp),
+                        DataValue::Num(cozo::Num::Int(*ci as i64)),
+                    ])
+                })
+                .collect(),
+        );
         let mut p = BTreeMap::new();
-        p.insert("fps".into(), DataValue::List(unique_fps));
+        p.insert("keys".into(), keys_dv);
 
+        // Destructure each [fp, ci] pair and hit the primary key index directly.
+        // This is O(N) point lookups instead of a full-table scan + is_in filter.
         let rows = self.run_imm(
-            "?[fp, ci, emb] := *chunks[fp, ci, _, _, _, _, _, emb], is_in(fp, $fps)",
+            "?[fp, ci, emb] := key <- $keys, key = [fp, ci], *chunks[fp, ci, _, _, _, _, _, emb]",
             p,
         )?;
 
@@ -1029,8 +1020,7 @@ impl StorageBackend for CozoBackend {
             .iter()
             .map(|(fp, ci)| {
                 emb_map
-                    .get(&(fp.clone(), *ci))
-                    .cloned()
+                    .remove(&(fp.clone(), *ci))
                     .unwrap_or_else(|| zero.clone())
             })
             .collect();
@@ -1392,6 +1382,10 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
 
     async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> {
         (**self).get_chunks_for_file(file_path).await
+    }
+
+    async fn get_chunks_for_files(&self, file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> {
+        (**self).get_chunks_for_files(file_paths).await
     }
 
     async fn upsert_edges(&self, edges: &[EdgeRecord]) -> anyhow::Result<()> {
