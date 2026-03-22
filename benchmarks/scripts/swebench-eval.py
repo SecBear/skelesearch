@@ -200,9 +200,13 @@ def main():
 
     results = []
     # Group by repo — clone once, checkout per instance.
+    # Sort by created_at within each repo to minimize incremental re-indexing
+    # (consecutive commits change fewer files than random jumps).
     repo_groups = defaultdict(list)
     for inst in instances:
         repo_groups[inst["repo"]].append(inst)
+    for repo in repo_groups:
+        repo_groups[repo].sort(key=lambda i: i.get("created_at", ""))
 
     completed = 0
     skipped = 0
