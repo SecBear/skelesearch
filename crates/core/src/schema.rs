@@ -1280,16 +1280,7 @@ impl StorageBackend for CozoBackend {
 
         // Step 1: Find all (hash, file_path, chunk_idx) triples where the hash
         // bucket contains entries from more than one file.
-        let find_dups = r#"
-            dup_hash[hash] :=
-                *chunks:dedup{hash, src_file_path: fp1},
-                *chunks:dedup{hash, src_file_path: fp2},
-                fp1 != fp2
-            ?[hash, fp, ci] :=
-                dup_hash[hash],
-                *chunks:dedup{hash, src_file_path: fp, src_chunk_idx: ci}
-            :order hash, fp, ci
-        "#;
+        let find_dups = "?[hash, fp, ci] := *chunks:dedup{hash, src_file_path: fp, src_chunk_idx: ci} :order hash, fp, ci";
 
         let rows = match self.run_imm(find_dups, BTreeMap::new()) {
             Ok(r) => r,
@@ -1304,10 +1295,20 @@ impl StorageBackend for CozoBackend {
             return Ok(0);
         }
 
-        // Step 2: Group by hash, keep the first entry (lowest fp/ci), collect
-        // the rest as deletion targets.
+        // Step 2: Group by hash bucket. For each bucket with entries from >1 file,
+        // keep the first entry (lowest fp/ci) and mark the rest for deletion.
         let mut to_delete: Vec<(String, usize)> = Vec::new();
         let mut current_hash: Option<DataValue> = None;
+        let mut bucket_representative: Option<String> = None;
+        let mut bucket_has_multi_files = false;
+        let mut bucket_extras: Vec<(String, usize)> = Vec::new();
+
+        let flush_bucket = |has_multi: bool, extras: &mut Vec<(String, usize)>, deletions: &mut Vec<(String, usize)>| {
+            if has_multi {
+                deletions.append(extras);
+            }
+            extras.clear();
+        };
 
         for row in &rows.rows {
             let hash = &row[0];
@@ -1321,13 +1322,22 @@ impl StorageBackend for CozoBackend {
             };
 
             if current_hash.as_ref() == Some(hash) {
-                // Same bucket — this is a duplicate; mark for deletion.
-                to_delete.push((fp, ci));
+                // Same bucket — check if from a different file.
+                if bucket_representative.as_deref() != Some(&fp) {
+                    bucket_has_multi_files = true;
+                }
+                bucket_extras.push((fp, ci));
             } else {
-                // New bucket — this entry is the representative; skip it.
+                // New bucket — flush previous.
+                flush_bucket(bucket_has_multi_files, &mut bucket_extras, &mut to_delete);
                 current_hash = Some(hash.clone());
+                bucket_representative = Some(fp);
+                bucket_has_multi_files = false;
             }
         }
+
+        // Flush last bucket.
+        flush_bucket(bucket_has_multi_files, &mut bucket_extras, &mut to_delete);
 
         if to_delete.is_empty() {
             return Ok(0);
@@ -1351,7 +1361,7 @@ impl StorageBackend for CozoBackend {
             let mut p = BTreeMap::new();
             p.insert("keys".into(), keys);
             self.run_mut(
-                "?[fp, ci] <- $keys :rm chunks { file_path: fp, chunk_idx: ci }",
+                "?[file_path, chunk_idx] <- $keys :rm chunks",
                 p,
             )?;
         }
