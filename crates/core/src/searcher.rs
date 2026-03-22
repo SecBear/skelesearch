@@ -255,7 +255,12 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 tracing::debug!("query embedding cache hit");
                 vec
             } else {
-                let embeddings = self.provider.embed_batch(vec![normalized_query.clone()]).await?;
+                // Apply model-specific query prefix (e.g. CodeRankEmbed instruction prefix).
+                let query_text = match self.provider.query_prefix() {
+                    Some(prefix) => format!("{prefix}{normalized_query}"),
+                    None => normalized_query.clone(),
+                };
+                let embeddings = self.provider.embed_batch(vec![query_text]).await?;
                 let vec = embeddings
                     .into_iter()
                     .next()

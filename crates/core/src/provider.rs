@@ -12,6 +12,11 @@ pub trait EmbedProvider: Send + Sync {
     /// Human-readable provider name for manifest storage.
     fn name(&self) -> &str { "unknown" }
 
+    /// Optional prefix to prepend to query text before embedding.
+    /// Models like CodeRankEmbed require instruction prefixes for
+    /// query-document alignment. Default implementation returns `None`.
+    fn query_prefix(&self) -> Option<&str> { None }
+
     /// Embed a batch of texts, returning one vector per input in order.
     ///
     /// # Errors
@@ -31,6 +36,10 @@ impl<T: EmbedProvider + ?Sized> EmbedProvider for Box<T> {
 
     fn name(&self) -> &str {
         (**self).name()
+    }
+
+    fn query_prefix(&self) -> Option<&str> {
+        (**self).query_prefix()
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {

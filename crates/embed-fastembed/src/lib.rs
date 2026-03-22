@@ -243,11 +243,26 @@ impl FastEmbedProvider {
         let user_model = UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files)
             .with_pooling(Pooling::Mean);
 
-        let te = TextEmbedding::try_new_from_user_defined(
+        let mut te = TextEmbedding::try_new_from_user_defined(
             user_model,
             InitOptionsUserDefined::new().with_max_length(max_length),
         )
         .with_context(|| format!("failed to initialise TextEmbedding from '{repo}'"))?;
+
+        // Verify that the model actually produces vectors of the declared
+        // dimension. A mismatch is silent and corrupts every search result.
+        {
+            let probe = te
+                .embed(vec!["dim probe".to_string()], None)
+                .context("dimension probe failed")?;
+            if let Some(first) = probe.first() {
+                anyhow::ensure!(
+                    first.len() == dim,
+                    "declared dim={dim} but model produced {}-dim vectors",
+                    first.len()
+                );
+            }
+        }
 
         Ok(Self {
             model: std::sync::Arc::new(std::sync::Mutex::new(te)),
@@ -265,6 +280,16 @@ impl EmbedProvider for FastEmbedProvider {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn query_prefix(&self) -> Option<&str> {
+        // CodeRankEmbed uses instruction-style embeddings for retrieval.
+        // Without this prefix the query embedding lands in the wrong space.
+        if self.name == "coderankembed" {
+            Some("Represent this query for searching relevant code: ")
+        } else {
+            None
+        }
     }
 
     #[tracing::instrument(skip_all, fields(batch_size = texts.len()))]
@@ -310,7 +335,7 @@ impl EmbedProvider for FastEmbedProvider {
 /// Cache location precedence (mirrors fastembed's own convention):
 /// 1. `$HF_HOME`
 /// 2. `$FASTEMBED_CACHE_DIR`
-/// 3. `.fastembed_cache` in the current working directory
+/// 3. `~/.cache/fastembed` (stable cross-CWD fallback)
 ///
 /// The HF API endpoint can be overridden via `$HF_ENDPOINT`.
 fn pull_from_hf(
@@ -324,7 +349,14 @@ fn pull_from_hf(
         .unwrap_or_else(|_| {
             std::env::var("FASTEMBED_CACHE_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(".fastembed_cache"))
+                .unwrap_or_else(|_| {
+                    // Stable cross-CWD fallback: ~/.cache/fastembed
+                    std::env::var("HOME")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(".cache")
+                        .join("fastembed")
+                })
         });
 
     let endpoint = std::env::var("HF_ENDPOINT")
