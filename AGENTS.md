@@ -45,6 +45,8 @@ Full design: `docs/superpowers/specs/2026-03-17-skelesearch-design.md`
 
 Future improvements and deferred research: `docs/future-improvements.md`
 
+Architecture evolution (progressive materialization, Datalog-powered retrieval): `docs/architecture-evolution.md`
+
 ## Build notes
 
 - Use `storage-sqlite` feature during development (fast compile). Switch to `storage-rocksdb` for release.
