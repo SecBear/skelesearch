@@ -218,7 +218,7 @@ impl Chunker {
 /// # Example
 /// ```
 /// use skelesearch_core::chunker::normalize_for_fts;
-/// assert_eq!(normalize_for_fts("parseHTTPResponse_json"), "parse http response json");
+/// assert_eq!(normalize_for_fts("parseHTTPResponse_json"), "parse http response json parsehttp httpresponse responsejson");
 /// ```
 pub fn normalize_for_fts(text: &str) -> String {
     let mut words: Vec<String> = Vec::new();
@@ -228,7 +228,21 @@ pub fn normalize_for_fts(text: &str) -> String {
         }
         split_camel(segment, &mut words);
     }
-    words.join(" ")
+
+    // Generate contiguous bigrams for partial identifier matching.
+    // e.g., ["get", "user", "by", "id"] → also adds "getuser", "userby", "byid"
+    // This lets BM25 match queries like "userById" against an identifier
+    // that was split into separate words.
+    let bigrams: Vec<String> = words.windows(2)
+        .map(|w| format!("{}{}", w[0], w[1]))
+        .collect();
+
+    let mut result = words.join(" ");
+    if !bigrams.is_empty() {
+        result.push(' ');
+        result.push_str(&bigrams.join(" "));
+    }
+    result
 }
 
 /// Split a single alphanumeric segment at camelCase / PascalCase / acronym
@@ -311,16 +325,16 @@ mod tests {
 
     #[test]
     fn normalize_camel_case() {
-        assert_eq!(normalize_for_fts("parseHTTPResponse_json"), "parse http response json");
+        assert_eq!(normalize_for_fts("parseHTTPResponse_json"), "parse http response json parsehttp httpresponse responsejson");
     }
 
     #[test]
     fn normalize_pascal() {
-        assert_eq!(normalize_for_fts("MyStruct"), "my struct");
+        assert_eq!(normalize_for_fts("MyStruct"), "my struct mystruct");
     }
 
     #[test]
     fn normalize_snake_case() {
-        assert_eq!(normalize_for_fts("foo_bar_baz"), "foo bar baz");
+        assert_eq!(normalize_for_fts("foo_bar_baz"), "foo bar baz foobar barbaz");
     }
 }

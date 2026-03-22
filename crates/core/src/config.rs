@@ -28,6 +28,10 @@ pub struct IndexConfig {
 #[serde(default)]
 pub struct SearchConfig {
     pub default_top_k: usize,
+    /// Enable PageRank boost on search results.  Default: `true` (absent = enabled).
+    /// Set to `false` in a benchmark config to ablate the PageRank signal.
+    #[serde(default)]
+    pub pagerank_boost: Option<bool>,
     /// Reranker configuration.
     #[serde(default)]
     pub reranker: RerankerConfig,
@@ -84,6 +88,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             default_top_k: 5,
+            pagerank_boost: None,
             reranker: RerankerConfig::default(),
             expansion: ExpansionConfig::default(),
             graph: GraphConfig::default(),
@@ -185,5 +190,30 @@ enabled = false
         let cfg = Config::from_str(toml).unwrap();
         assert!(cfg.index.symbol_enrichment);
         assert_eq!(cfg.search.graph.enabled, Some(false));
+    }
+
+    #[test]
+    fn parse_no_pagerank_toml() {
+        // Simulates loading benchmarks/configs/no-pagerank.toml
+        let toml = r#"
+[index]
+symbol_enrichment = true
+
+[search]
+pagerank_boost = false
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = false
+"#;
+        let cfg = Config::from_str(toml).unwrap();
+        assert!(cfg.index.symbol_enrichment);
+        assert_eq!(cfg.search.pagerank_boost, Some(false));
+        assert_eq!(cfg.search.expansion.enabled, Some(false));
+        assert_eq!(cfg.search.graph.enabled, Some(false));
+        // Unset fields should remain at default.
+        assert_eq!(cfg.search.default_top_k, 5);
     }
 }

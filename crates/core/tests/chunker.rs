@@ -16,7 +16,7 @@ fn beta() { println!("b"); }
 
 #[test]
 fn normalization_splits_mixed_identifiers() {
-    assert_eq!(normalize_for_fts("parseHTTPResponse_json"), "parse http response json");
+    assert_eq!(normalize_for_fts("parseHTTPResponse_json"), "parse http response json parsehttp httpresponse responsejson");
 }
 
 #[test]
@@ -78,9 +78,9 @@ function world() {
 
 #[test]
 fn normalize_fts_examples() {
-    assert_eq!(normalize_for_fts("MyStruct"), "my struct");
-    assert_eq!(normalize_for_fts("foo_bar_baz"), "foo bar baz");
-    assert_eq!(normalize_for_fts("getHTTPSUrl"), "get https url");
+    assert_eq!(normalize_for_fts("MyStruct"), "my struct mystruct");
+    assert_eq!(normalize_for_fts("foo_bar_baz"), "foo bar baz foobar barbaz");
+    assert_eq!(normalize_for_fts("getHTTPSUrl"), "get https url gethttps httpsurl");
 }
 
 #[test]
