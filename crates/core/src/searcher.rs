@@ -960,13 +960,20 @@ fn is_doc_file(path: &str) -> bool {
 /// files that are *both* doc-typed *and* live under a dedicated docs tree
 /// are almost never the right answer for a code query.
 ///
-/// Matches (case-insensitive): `docs/`, `doc/`, `/docs/`, `/doc/`,
-/// `/documentation/` path segments.
+/// Matches top-level docs roots and well-known nested doc tree patterns.
+/// Deliberately avoids `contains("/docs/")` and `contains("/doc/")` which
+/// are too broad — they flag source directories like `src/validator/doc/`.
 fn is_docs_directory(path: &str) -> bool {
     let lower = path.to_lowercase();
     let norm = lower.replace('\\', "/");
+    // Top-level docs roots
     norm.starts_with("docs/") || norm.starts_with("doc/")
-        || norm.contains("/docs/") || norm.contains("/doc/")
+        || norm.starts_with("documentation/")
+        // Common monorepo pattern: packages/docs/content/
+        || norm.contains("/docs/content/")
+        // Versioned docs directories: packages/docs-v3/
+        || norm.contains("/docs-v")
+        // Nested /documentation/ segment
         || norm.contains("/documentation/")
 }
 
@@ -1277,11 +1284,16 @@ mod tests {
 
     #[test]
     fn docs_directory_positive() {
+        // Top-level roots.
         assert!(is_docs_directory("docs/api.md"));
         assert!(is_docs_directory("doc/guide.rst"));
-        assert!(is_docs_directory("packages/docs/intro.md"));
+        assert!(is_docs_directory("documentation/overview.md"));
+        // Nested /documentation/ segment.
         assert!(is_docs_directory("src/documentation/overview.md"));
-        assert!(is_docs_directory("apps/web/docs/readme.md"));
+        // Common monorepo content pattern.
+        assert!(is_docs_directory("packages/docs/content/intro.md"));
+        // Versioned docs directories.
+        assert!(is_docs_directory("packages/docs-v3/guide.md"));
     }
 
     #[test]
@@ -1293,6 +1305,11 @@ mod tests {
         assert!(!is_docs_directory("src/parser.ts"));
         // 'doc' appearing only in a filename stem must not match.
         assert!(!is_docs_directory("src/docstring.rs"));
+        // Nested /docs/ that are NOT top-level and NOT content/ — no longer flagged.
+        assert!(!is_docs_directory("packages/docs/intro.md"));
+        assert!(!is_docs_directory("apps/web/docs/readme.md"));
+        // Source dirs with 'doc' component must not match.
+        assert!(!is_docs_directory("src/validator/doc/schema.ts"));
     }
 
 }
