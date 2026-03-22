@@ -31,14 +31,13 @@ function run(args: string[], cwd?: string, env?: Record<string, string | undefin
     cwd,
     env: env ?? undefined,
     stdout: "pipe",
-    stderr: "pipe",
+    stderr: "inherit",  // Flow through to parent — enables 2>file telemetry capture
   });
   const stdout = new TextDecoder().decode(proc.stdout).trimEnd();
-  const stderr = new TextDecoder().decode(proc.stderr).trimEnd();
   return {
     ok: proc.exitCode === 0,
     stdout,
-    stderr,
+    stderr: "",  // stderr went to parent, not captured here
     code: proc.exitCode ?? 1,
   };
 }
@@ -47,7 +46,7 @@ function runOrDie(args: string[], cwd?: string, context?: string, env?: Record<s
   const r = run(args, cwd, env);
   if (!r.ok) {
     const ctx = context ? ` (${context})` : "";
-    const detail = r.stderr || r.stdout;
+    const detail = r.stdout;  // stderr already inherited to parent
     process.stderr.write(
       `\nERROR: Command failed${ctx}:\n  ${args.join(" ")}\n${detail}\n`
     );

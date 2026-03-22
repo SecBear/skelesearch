@@ -44,12 +44,19 @@ const DEFAULT_MODEL_REPO: &str = "Alibaba-NLP/gte-reranker-modernbert-base";
 /// Cache directory name used for the default model.
 const DEFAULT_MODEL_CACHE_NAME: &str = "gte-modernbert-base";
 
-/// Maximum token sequence length fed to the model.
+/// Default max token sequence length.
 ///
-/// gte-reranker-modernbert-base supports 8192 tokens. Inputs longer than this
-/// are truncated from the document end (query tokens are preserved via
-/// LongestFirst truncation strategy).
-const MAX_SEQ_LEN: usize = 8192;
+/// skelesearch chunks are capped at 1500 non-whitespace chars (~750 tokens).
+/// 1024 provides headroom for query + special tokens while keeping inference
+/// fast. gte-reranker-modernbert-base supports up to 8192, but padding all
+/// candidates to that length is prohibitively slow on CPU.
+const DEFAULT_MAX_SEQ_LEN: usize = 1024;
+
+/// Default sub-batch size for ONNX forward passes.
+///
+/// Large batches create huge [N, seq_len] tensors that thrash CPU cache.
+/// 64 keeps each forward pass fast while amortizing tokenization overhead.
+const DEFAULT_SUB_BATCH: usize = 64;
 
 /// Local ONNX cross-encoder reranker.
 ///
@@ -58,7 +65,7 @@ const MAX_SEQ_LEN: usize = 8192;
 /// - `tokenizer.json` — HuggingFace tokenizer configuration
 ///
 /// The model receives `(query, document)` pairs and returns relevance scores.
-/// All candidates are processed in a single batched ONNX forward pass.
+/// Candidates are split into sub-batches for inference efficiency.
 ///
 /// # Architecture notes
 ///
@@ -76,6 +83,10 @@ pub struct LocalReranker {
     tokenizer: Arc<Tokenizer>,
     /// True when the ONNX model's input list includes `token_type_ids`.
     has_token_type_ids: bool,
+    /// Max token length per (query, candidate) pair. Longer inputs are truncated.
+    max_seq_len: usize,
+    /// Max candidates per ONNX forward pass.
+    sub_batch_size: usize,
 }
 
 impl LocalReranker {
@@ -122,7 +133,7 @@ impl LocalReranker {
         //   query tokens as much as possible — important for relevance.
         tokenizer
             .with_truncation(Some(TruncationParams {
-                max_length: MAX_SEQ_LEN,
+                max_length: DEFAULT_MAX_SEQ_LEN,
                 strategy: TruncationStrategy::LongestFirst,
                 stride: 0,
                 direction: TruncationDirection::Right,
@@ -143,7 +154,32 @@ impl LocalReranker {
             session: Arc::new(std::sync::Mutex::new(session)),
             tokenizer: Arc::new(tokenizer),
             has_token_type_ids,
+            max_seq_len: DEFAULT_MAX_SEQ_LEN,
+            sub_batch_size: DEFAULT_SUB_BATCH,
         })
+    }
+
+    /// Set the maximum token sequence length per (query, candidate) pair.
+    /// Default: 1024. gte-modernbert-base supports up to 8192.
+    pub fn with_max_seq_len(mut self, len: usize) -> Self {
+        self.max_seq_len = len;
+        // Re-apply truncation with the new length.
+        Arc::get_mut(&mut self.tokenizer)
+            .expect("tokenizer Arc not unique during configuration")
+            .with_truncation(Some(TruncationParams {
+                max_length: len,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+                direction: TruncationDirection::Right,
+            }))
+            .expect("truncation configuration failed");
+        self
+    }
+
+    /// Set the sub-batch size for ONNX inference. Default: 64.
+    pub fn with_sub_batch_size(mut self, size: usize) -> Self {
+        self.sub_batch_size = size;
+        self
     }
 
     /// Load the default reranker model (gte-reranker-modernbert-base).
@@ -322,15 +358,44 @@ impl Reranker for LocalReranker {
         let tokenizer = Arc::clone(&self.tokenizer);
         let query = query.to_string();
         let has_token_type_ids = self.has_token_type_ids;
+        let sub_batch_size = self.sub_batch_size;
+        let total_candidates = candidates.len();
 
         // ort inference is synchronous and CPU-bound; move it off the async executor.
-        tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let scores = tokio::task::spawn_blocking(move || {
             let mut session_guard = session.lock()
                 .map_err(|_| anyhow::anyhow!("session mutex poisoned"))?;
-            run_inference(&mut session_guard, &tokenizer, &query, &candidates, has_token_type_ids)
+
+            if total_candidates <= sub_batch_size {
+                // Small enough for a single pass.
+                return run_inference(
+                    &mut session_guard, &tokenizer, &query, &candidates, has_token_type_ids,
+                );
+            }
+
+            // Sub-batch: split candidates into chunks to keep tensors small.
+            let mut all_scores = Vec::with_capacity(total_candidates);
+            for chunk in candidates.chunks(sub_batch_size) {
+                let batch_scores = run_inference(
+                    &mut session_guard, &tokenizer, &query, chunk, has_token_type_ids,
+                )?;
+                all_scores.extend(batch_scores);
+            }
+            Ok(all_scores)
         })
         .await
-        .context("reranker inference thread panicked")?
+        .context("reranker inference thread panicked")??;
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            candidates = total_candidates,
+            sub_batches = total_candidates.div_ceil(sub_batch_size),
+            elapsed_ms,
+            "local rerank complete"
+        );
+
+        Ok(scores)
     }
 }
 
