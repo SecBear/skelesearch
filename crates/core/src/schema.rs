@@ -445,9 +445,20 @@ impl StorageBackend for CozoBackend {
         )?;
 
         // Create LSH index for near-duplicate chunk detection — idempotent.
-        self.run_mut_ignore(
+        match self.run_mut(
             "::lsh create chunks:dedup { extractor: normalized, tokenizer: Simple, n_gram: 5, n_perm: 128, target_threshold: 0.85 }",
-        )?;
+            BTreeMap::new(),
+        ) {
+            Ok(_) => tracing::debug!("LSH dedup index created"),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("already exists") || msg.contains("conflicts") {
+                    tracing::debug!("LSH dedup index already exists");
+                } else {
+                    tracing::warn!(error = %e, "LSH dedup index creation failed — dedup disabled");
+                }
+            }
+        }
 
         // Create symbols relation — idempotent.
         self.run_mut_ignore(
@@ -1274,7 +1285,6 @@ impl StorageBackend for CozoBackend {
                 *chunks:dedup{hash, src_file_path: fp1},
                 *chunks:dedup{hash, src_file_path: fp2},
                 fp1 != fp2
-
             ?[hash, fp, ci] :=
                 dup_hash[hash],
                 *chunks:dedup{hash, src_file_path: fp, src_chunk_idx: ci}
