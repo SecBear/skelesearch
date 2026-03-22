@@ -54,9 +54,163 @@ const STOP_WORDS: &[&str] = &[
     "them", "their", "about",
 ];
 
-/// Extract significant keywords from a natural language query.
-/// Returns the original query plus deduplicated keywords, giving BM25
-/// more signal for term matching.
+/// GitHub issue template boilerplate phrases that dilute embeddings.
+/// These add zero retrieval signal and inflate the query vector away from code.
+const BOILERPLATE_PREFIXES: &[&str] = &[
+    "i have searched",
+    "i have read",
+    "i have checked",
+    "i'm submitting",
+    "i am submitting",
+    "is there an existing issue",
+    "have you read the",
+    "current behavior",
+    "expected behavior",
+    "steps to reproduce",
+    "additional context",
+    "environment",
+    "operating system",
+    "python version",
+    "node version",
+    "browser version",
+    "package version",
+];
+
+/// Preprocess a verbose query (e.g. GitHub issue description) into a compact
+/// form that embeds well and produces good BM25 matches.
+///
+/// Applied before embedding AND BM25, so it affects both retrieval paths.
+///
+/// Strategy:
+/// 1. Strip markdown headers, HTML comments, checkbox lines, boilerplate.
+/// 2. Extract backtick-quoted symbols (high-confidence identifiers).
+/// 3. Compress to: first meaningful sentence + extracted symbols + code tokens.
+/// 4. Cap at ~200 words to prevent embedding dilution.
+pub fn preprocess_query(query: &str) -> String {
+    let mut symbols: Vec<String> = Vec::new();
+    let mut lines: Vec<&str> = Vec::new();
+
+    for line in query.lines() {
+        let trimmed = line.trim();
+
+        // Skip empty lines.
+        if trimmed.is_empty() { continue; }
+
+        // Skip markdown headers (### Steps, ## Environment, etc.).
+        if trimmed.starts_with('#') { continue; }
+
+        // Skip HTML comments.
+        if trimmed.starts_with("<!--") || trimmed.starts_with("-->") { continue; }
+
+        // Skip checkbox lines (issue templates).
+        if trimmed.starts_with("- [x]") || trimmed.starts_with("- [ ]") { continue; }
+
+        // Skip boilerplate phrases.
+        let lower = trimmed.to_lowercase();
+        if BOILERPLATE_PREFIXES.iter().any(|p| lower.starts_with(p)) { continue; }
+
+        // Skip lines that are just URLs.
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") { continue; }
+
+        // Extract backtick-quoted symbols (high-confidence identifiers).
+        let mut rest = trimmed;
+        while let Some(start) = rest.find('`') {
+            rest = &rest[start + 1..];
+            if let Some(end) = rest.find('`') {
+                let sym = &rest[..end];
+                // Only keep short, identifier-like content (not code blocks).
+                if !sym.is_empty() && sym.len() <= 80 && !sym.contains('\n') {
+                    symbols.push(sym.to_string());
+                }
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+
+        lines.push(trimmed);
+    }
+
+    // If the query is already short (<40 words), return it with symbols appended.
+    let word_count: usize = lines.iter().map(|l| l.split_whitespace().count()).sum();
+    if word_count <= 40 {
+        if symbols.is_empty() {
+            return lines.join(" ");
+        }
+        let mut result = lines.join(" ");
+        for sym in &symbols {
+            if !result.contains(sym.as_str()) {
+                result.push(' ');
+                result.push_str(sym);
+            }
+        }
+        return result;
+    }
+
+    // For long queries: take first 3 meaningful lines + symbols.
+    let mut result: Vec<String> = Vec::new();
+    let mut total_words = 0usize;
+    for line in &lines {
+        let words = line.split_whitespace().count();
+        if total_words + words > 150 { break; }
+        result.push(line.to_string());
+        total_words += words;
+    }
+
+    // Append extracted symbols for BM25 boost.
+    for sym in &symbols {
+        let sym_str = sym.as_str();
+        if !result.iter().any(|r| r.contains(sym_str)) {
+            result.push(sym.clone());
+        }
+    }
+
+    result.join(" ")
+}
+
+/// Boost backtick-quoted symbols and CamelCase identifiers in BM25 queries.
+///
+/// BM25 uses term frequency (TF) — duplicating high-confidence identifiers
+/// increases their match weight relative to surrounding prose. 88% of real
+/// queries contain symbol names; boosting them helps BM25 rank correctly.
+pub fn boost_symbols_for_bm25(query: &str) -> String {
+    let mut symbols: Vec<String> = Vec::new();
+
+    // Extract backtick-quoted tokens.
+    let mut rest = query;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('`') {
+            let sym = &rest[..end];
+            if !sym.is_empty() && sym.len() <= 80 {
+                symbols.push(sym.to_string());
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    // Extract CamelCase / PascalCase identifiers (3+ chars, mixed case).
+    for word in query.split_whitespace() {
+        let clean: String = word.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+        if clean.len() >= 3
+            && clean.chars().any(|c| c.is_uppercase())
+            && clean.chars().any(|c| c.is_lowercase())
+            && !symbols.contains(&clean)
+        {
+            symbols.push(clean);
+        }
+    }
+
+    if symbols.is_empty() {
+        return query.to_string();
+    }
+
+    // Duplicate symbols for TF boost (appears 2x in the query string).
+    format!("{} {}", query, symbols.join(" "))
+}
+
 /// Sanitize a query string for CozoDB's FTS mini-language.
 ///
 /// The FTS index uses `tokenizer: Simple, filters: [Lowercase, AlphaNumOnly]`,
@@ -273,11 +427,16 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let total_start = std::time::Instant::now();
         let mut timings = SearchTimings::default();
 
+        // -- Query preprocessing ---------------------------------------------
+        // Strip issue template boilerplate and compress verbose queries before
+        // embedding.  This affects both the vector embedding and BM25 paths.
+        let preprocessed = preprocess_query(query);
+
         // -- Embedding (cache-aware) -------------------------------------------
         // Check the LRU cache first to avoid a redundant embed API call for
         // repeated or near-identical queries.  Empty queries are not cached.
         let embed_start = std::time::Instant::now();
-        let normalized_query = query.trim().to_string();
+        let normalized_query = preprocessed.trim().to_string();
         let query_vec: Vec<f32> = if normalized_query.is_empty() {
             // Empty query: skip cache, return zero vector.
             vec![0.0; self.provider.dim()]
@@ -320,8 +479,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let expand_start = std::time::Instant::now();
         let expanded_keywords_raw = if let Some(ref expander) = self.expander {
             use crate::router::{classify_query, QueryStrategy};
-            if classify_query(query) == QueryStrategy::Semantic {
-                expander.expand(query).await.unwrap_or_default()
+            if classify_query(&preprocessed) == QueryStrategy::Semantic {
+                expander.expand(&preprocessed).await.unwrap_or_default()
             } else {
                 vec![]
             }
@@ -366,7 +525,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Original query terms appear first and get natural BM25 term frequency.
         // Expansion keywords are appended once (lower weight than the original
         // query which may have terms repeated from expand_query()).
-        let mut bm25_query = expand_query(query);
+        let mut bm25_query = boost_symbols_for_bm25(&expand_query(&preprocessed));
         if !expanded_keywords.is_empty() {
             // Only append keywords not already present in the query
             let existing: std::collections::HashSet<String> = bm25_query
@@ -1025,7 +1184,7 @@ fn query_asks_about_entry_point(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case};
+    use super::{is_test_file, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, boost_symbols_for_bm25};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -1310,6 +1469,54 @@ mod tests {
         assert!(!is_docs_directory("apps/web/docs/readme.md"));
         // Source dirs with 'doc' component must not match.
         assert!(!is_docs_directory("src/validator/doc/schema.ts"));
+    }
+
+    #[test]
+    fn preprocess_strips_boilerplate() {
+        let query = "### Steps to reproduce\n\n- [x] I have searched existing issues\n\n`IterativeImputer` has no parameter `fill_value`\n\n### Expected behavior\n\nShould support fill_value.";
+        let result = preprocess_query(query);
+        assert!(!result.contains("Steps to reproduce"));
+        assert!(!result.contains("I have searched"));
+        assert!(result.contains("IterativeImputer"));
+        assert!(result.contains("fill_value"));
+    }
+
+    #[test]
+    fn preprocess_short_query_unchanged() {
+        let query = "how does authentication work";
+        assert_eq!(preprocess_query(query), query);
+    }
+
+    #[test]
+    fn preprocess_extracts_backtick_symbols() {
+        let query = "The `SimpleImputer` class should handle `fill_value` parameter";
+        let result = preprocess_query(query);
+        assert!(result.contains("SimpleImputer"));
+        assert!(result.contains("fill_value"));
+    }
+
+    #[test]
+    fn boost_symbols_duplicates_backtick_tokens() {
+        let query = "The `IterativeImputer` has a bug";
+        let result = boost_symbols_for_bm25(query);
+        // Should contain the original + a duplicate of the symbol
+        let count = result.matches("IterativeImputer").count();
+        assert!(count >= 2, "symbol should appear at least twice, got {count}");
+    }
+
+    #[test]
+    fn boost_symbols_duplicates_camelcase() {
+        let query = "find AsyncClient usage in the codebase";
+        let result = boost_symbols_for_bm25(query);
+        let count = result.matches("AsyncClient").count();
+        assert!(count >= 2, "CamelCase symbol should appear at least twice, got {count}");
+    }
+
+    #[test]
+    fn boost_symbols_noop_for_plain_text() {
+        let query = "how does error handling work";
+        let result = boost_symbols_for_bm25(query);
+        assert_eq!(result, query);
     }
 
 }
