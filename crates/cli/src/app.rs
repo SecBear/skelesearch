@@ -167,6 +167,12 @@ where
         _ => searcher,
     };
 
+    // Unified Datalog retrieval: single round-trip FTS + HNSW + graph + PageRank.
+    let searcher = match config.search.unified_search {
+        Some(true) => searcher.with_unified_search(true),
+        _ => searcher,
+    };
+
     // Query expansion: skip if explicitly disabled; otherwise attach LLMExpander
     // when OPENAI_API_KEY is available.
     let searcher = match config.search.expansion.enabled {

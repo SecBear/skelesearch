@@ -32,6 +32,10 @@ pub struct SearchConfig {
     /// Set to `false` in a benchmark config to ablate the PageRank signal.
     #[serde(default)]
     pub pagerank_boost: Option<bool>,
+    /// Use unified single-Datalog retrieval (FTS + HNSW + graph + PageRank in one query).
+    /// Default: `false` (experimental). Enable with `unified_search = true` under `[search]`.
+    #[serde(default)]
+    pub unified_search: Option<bool>,
     /// Reranker configuration.
     #[serde(default)]
     pub reranker: RerankerConfig,
@@ -89,6 +93,7 @@ impl Default for SearchConfig {
         Self {
             default_top_k: 5,
             pagerank_boost: None,
+            unified_search: None,
             reranker: RerankerConfig::default(),
             expansion: ExpansionConfig::default(),
             graph: GraphConfig::default(),
