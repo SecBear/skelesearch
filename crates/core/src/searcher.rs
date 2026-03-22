@@ -538,9 +538,18 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             if is_test_file(&hit.file_path) {
                 hit.score *= 0.3;
             } else if is_doc_file(&hit.file_path) {
-                hit.score *= 0.5;
+                if is_docs_directory(&hit.file_path) {
+                    hit.score *= 0.2; // Docs-directory files are almost never the right answer
+                } else {
+                    hit.score *= 0.35; // Inline docs (README.md in root) — still penalized but less
+                }
             } else if is_barrel_file(&hit.file_path) {
-                hit.score *= 0.4;
+                let barrel_penalty = if query_asks_about_entry_point(query) {
+                    0.85 // Mild penalty — barrel files are likely the answer
+                } else {
+                    0.4 // Strong penalty — barrel files are structural noise
+                };
+                hit.score *= barrel_penalty;
             }
         }
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -945,6 +954,22 @@ fn is_doc_file(path: &str) -> bool {
     )
 }
 
+/// Returns `true` when `path` is inside a documentation directory.
+///
+/// Used together with [`is_doc_file`] to apply an aggressive tiered penalty:
+/// files that are *both* doc-typed *and* live under a dedicated docs tree
+/// are almost never the right answer for a code query.
+///
+/// Matches (case-insensitive): `docs/`, `doc/`, `/docs/`, `/doc/`,
+/// `/documentation/` path segments.
+fn is_docs_directory(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let norm = lower.replace('\\', "/");
+    norm.starts_with("docs/") || norm.starts_with("doc/")
+        || norm.contains("/docs/") || norm.contains("/doc/")
+        || norm.contains("/documentation/")
+}
+
 /// Returns `true` when `path` looks like a barrel/re-export file.
 ///
 /// Barrel files primarily re-export symbols from other modules without
@@ -964,6 +989,31 @@ fn is_barrel_file(path: &str) -> bool {
             | "mod.rs" | "__init__.py"
             | "barrel.ts" | "barrel.js" | "exports.ts" | "exports.js"
     )
+}
+
+/// Returns true when the query signals the user wants to know about
+/// entry points, exported API surface, or module initialization.
+/// Used to soften the barrel-file penalty when those files ARE the answer.
+fn query_asks_about_entry_point(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    [
+        "entry point",
+        "entrypoint",
+        "exports",
+        "exported",
+        "re-export",
+        "reexport",
+        "initializ", // matches initialize, initialization (US)
+        "initialis", // matches initialise, initialisation (UK)
+        "public api",
+        "api surface",
+        "imported from",
+        "barrel",
+        "module entry",
+        "package entry",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
 }
 
 #[cfg(test)]
