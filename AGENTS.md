@@ -52,3 +52,19 @@ Architecture evolution (progressive materialization, Datalog-powered retrieval):
 - Use `storage-sqlite` feature during development (fast compile). Switch to `storage-rocksdb` for release.
 - RocksDB requires cmake and a C++20 compiler. On macOS: `CXXFLAGS="-std=c++20"` if needed.
 - Cold RocksDB build: ~10 minutes. Subsequent builds are incremental.
+
+
+## Linear project tracking
+
+All issues for this repo live in one place — use these values directly instead of
+calling `list_teams` or searching for the project:
+
+- **Team:** Personal Development
+- **Project:** skelesearch
+- **Repo URL:** https://github.com/SecBear/skelesearch
+
+Parent epic structure:
+- `PER-72` — skelesearch top-level epic
+- `PER-109` — Benchmarks & eval parent
+- `PER-73` — Hosted service parent
+- `PER-98` — Model configurations parent
