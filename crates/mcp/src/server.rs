@@ -268,7 +268,16 @@ impl SkeleSearchServer {
         let (mut results, timings) = searcher
             .search_with_timings(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
             .await?;
-        tracing::info!(results = results.len(), "search_code complete");
+        tracing::info!(
+            embed_ms = timings.embed_ms,
+            retrieve_ms = timings.retrieve_ms,
+            expand_ms = timings.expand_ms,
+            rerank_ms = timings.rerank_ms,
+            graph_ms = timings.graph_ms,
+            total_ms = timings.total_ms,
+            results = results.len(),
+            "search_code pipeline timings"
+        );
 
         // Filter to branch-changed files if requested.
         if input.branch_scope {

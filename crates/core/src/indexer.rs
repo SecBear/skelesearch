@@ -120,6 +120,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
     /// only — no file content is loaded until Phase 2.
     #[tracing::instrument(skip_all, fields(root = %root.display()))]
     pub async fn index_path(&self, root: &Path) -> anyhow::Result<IndexResult> {
+        let index_start = std::time::Instant::now();
         let dim = self.provider.dim();
         self.backend.initialize(dim).await?;
 
@@ -638,6 +639,15 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 Err(e) => tracing::warn!(error = %e, "background LSH deduplication failed"),
             }
         });
+
+        tracing::info!(
+            files_indexed = result.indexed_files,
+            files_deleted = result.deleted_files,
+            chunks_embedded = result.total_chunks,
+            parse_errors = result.parse_errors,
+            elapsed_ms = index_start.elapsed().as_millis() as u64,
+            "index complete"
+        );
 
         Ok(result)
     }

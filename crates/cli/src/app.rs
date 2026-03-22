@@ -32,8 +32,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,
-        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens, branch } => {
-            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens, branch).await
+        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens, branch, timings } => {
+            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens, branch, timings).await
         }
         Commands::Context { file } => run_context(file).await,
         Commands::Status { path, json } => run_status(path, json).await,
@@ -249,6 +249,7 @@ async fn run_search(
     provider_name: String,
     max_tokens: Option<usize>,
     branch_scope: bool,
+    show_timings: bool,
 ) -> anyhow::Result<()> {
     let root = std::env::current_dir().context("failed to get current directory")?;
     let dir = index_dir(&root);
@@ -281,9 +282,30 @@ async fn run_search(
     } else {
         0
     };
-    let mut results = searcher.search(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await?;
+    let (mut results, timings) = searcher.search_with_timings(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await?;
     let elapsed = start.elapsed();
-    tracing::info!(elapsed_ms = elapsed.as_millis() as u64, results = results.len(), "search complete");
+    tracing::info!(
+        embed_ms = timings.embed_ms,
+        retrieve_ms = timings.retrieve_ms,
+        expand_ms = timings.expand_ms,
+        rerank_ms = timings.rerank_ms,
+        graph_ms = timings.graph_ms,
+        total_ms = timings.total_ms,
+        results = results.len(),
+        "search complete",
+    );
+
+    if show_timings {
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr();
+        writeln!(stderr, "Pipeline timings:").ok();
+        writeln!(stderr, "  embed:    {}ms", timings.embed_ms).ok();
+        writeln!(stderr, "  retrieve: {}ms", timings.retrieve_ms).ok();
+        writeln!(stderr, "  expand:   {}ms", timings.expand_ms).ok();
+        writeln!(stderr, "  rerank:   {}ms", timings.rerank_ms).ok();
+        writeln!(stderr, "  graph:    {}ms", timings.graph_ms).ok();
+        writeln!(stderr, "  total:    {}ms", timings.total_ms).ok();
+    }
 
     // Filter to branch-changed files if requested.
     if branch_scope {
