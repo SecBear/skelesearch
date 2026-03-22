@@ -15,6 +15,13 @@ Supports two evaluation modes:
 
 Primary metric: nDCG@10 (higher is better).
 
+Timeout and resilience:
+  Each task runs with a per-task timeout (--task-timeout, default 7200s = 2h).
+  With --skip-failing, tasks that error or time out are logged and skipped;
+  all other tasks continue and partial results are saved.  Without
+  --skip-failing, the first failure aborts the run (still saves partial
+  results for completed tasks).
+
 Usage:
   # Embed-only — no binary needed, fast smoke test
   uv run --with coir-eval --with fastembed --with numpy \\
@@ -48,12 +55,13 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -92,6 +100,18 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Timeout support (POSIX-only: macOS and Linux)
+# ---------------------------------------------------------------------------
+
+class _TaskTimeout(Exception):
+    """Raised when a per-task SIGALRM fires."""
+
+
+def _sigalrm_handler(signum: int, frame) -> None:  # noqa: ANN001
+    raise _TaskTimeout("Task exceeded time limit")
 
 
 # ---------------------------------------------------------------------------
@@ -381,44 +401,52 @@ def load_tasks(task_names: List[str]) -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation runners
+# Per-task runners
 # ---------------------------------------------------------------------------
 
-def run_embed_only(
+def _run_single_embed_task(
     model: EmbedOnlyModel,
-    tasks: Dict,
+    task_name: str,
+    task_data: Tuple,
     tasks_output_dir: Path,
     batch_size: int,
-) -> Dict[str, Dict]:
-    """Run embed-only evaluation via the COIR class (wraps DRES internally)."""
+) -> Dict:
+    """Run COIR embed-only evaluation for a single task.
+
+    COIR.run() saves {tasks_output_dir}/{task_name}.json internally.
+    If the file already exists COIR skips the task and returns an empty dict,
+    so we always reload from disk to get the actual metrics.
+    """
     from coir.evaluation import COIR  # type: ignore[import-untyped]
 
-    tasks_output_dir.mkdir(parents=True, exist_ok=True)
-    evaluator = COIR(tasks, batch_size=batch_size)
+    evaluator = COIR({task_name: task_data}, batch_size=batch_size)
     raw = evaluator.run(model, output_folder=str(tasks_output_dir))
 
-    # COIR.run() skips tasks whose per-task JSON already exists but doesn't
-    # reload them into its return value.  Load cached results so the caller
-    # always gets the full picture, enabling clean resume behaviour.
-    for task_name in tasks:
-        if task_name not in raw:
-            cached = tasks_output_dir / f"{task_name}.json"
-            if cached.exists():
-                with open(cached) as f:
-                    raw[task_name] = json.load(f).get("metrics", {})
+    if task_name in raw:
+        return raw[task_name]
 
-    return raw
+    # COIR returned empty dict because the file already existed — load it.
+    cached = tasks_output_dir / f"{task_name}.json"
+    if cached.exists():
+        with open(cached) as f:
+            return json.load(f).get("metrics", {})
+
+    logger.warning("Task '%s': COIR returned no results and no cached file found.", task_name)
+    return {}
 
 
-def run_hybrid(
+def _run_single_hybrid_task(
     backend: HybridSearch,
-    tasks: Dict,
+    task_name: str,
+    task_data: Tuple,
     tasks_output_dir: Path,
     top_k: int,
-) -> Dict[str, Dict]:
-    """Run hybrid evaluation via EvaluateRetrieval + HybridSearch."""
+) -> Dict:
+    """Run hybrid evaluation for a single task; returns nested metrics dict."""
     from coir.beir.retrieval.evaluation import EvaluateRetrieval  # type: ignore[import-untyped]
     from coir.beir.retrieval.search.base import BaseSearch  # type: ignore[import-untyped]
+
+    corpus, queries, qrels = task_data
 
     # Wrap HybridSearch in an ABC-conforming adapter so EvaluateRetrieval is
     # satisfied without coupling the class definition to coir imports at
@@ -427,36 +455,187 @@ def run_hybrid(
         def search(self, corpus, queries, top_k, **kwargs):
             return backend.search(corpus, queries, top_k, **kwargs)
 
-    tasks_output_dir.mkdir(parents=True, exist_ok=True)
     retriever = EvaluateRetrieval(_Adapter(), k_values=[1, 3, 5, 10, 100])
-    raw: Dict[str, Dict] = {}
 
-    for task_name, (corpus, queries, qrels) in tasks.items():
+    logger.info(
+        "Task '%s': hybrid search over %d docs / %d queries...",
+        task_name, len(corpus), len(queries),
+    )
+    retrieved = retriever.retrieve(corpus, queries)
+    ndcg, map_, recall, precision = retriever.evaluate(
+        qrels, retrieved, retriever.k_values
+    )
+    return {"NDCG": ndcg, "MAP": map_, "Recall": recall, "Precision": precision}
+
+
+# ---------------------------------------------------------------------------
+# Unified evaluation loop — timeout, skip-failing, incremental saves
+# ---------------------------------------------------------------------------
+
+def _with_task_timeout(timeout_secs: int, fn: Callable, *args, **kwargs):
+    """Run fn(*args, **kwargs) with a SIGALRM-based timeout.
+
+    Raises _TaskTimeout if the deadline is exceeded.
+    Only available on POSIX systems (Linux, macOS).
+    """
+    old_handler = signal.signal(signal.SIGALRM, _sigalrm_handler)
+    signal.alarm(timeout_secs)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def run_all_tasks(
+    tasks: Dict,
+    run_single_fn: Callable,
+    tasks_output_dir: Path,
+    output_path: Path,
+    mode: str,
+    provider: str,
+    task_timeout: int,
+    skip_failing: bool,
+) -> Dict[str, Dict]:
+    """Iterate tasks with per-task timeout, incremental saves, and skip-failing.
+
+    run_single_fn(task_name, task_data) -> metrics_dict
+
+    Saves a partial aggregated JSON to output_path after each task so progress
+    survives a mid-run crash or keyboard interrupt.
+    """
+    tasks_output_dir.mkdir(parents=True, exist_ok=True)
+    results: Dict[str, Dict] = {}
+    failed: List[str] = []
+
+    total = len(tasks)
+    for idx, (task_name, task_data) in enumerate(tasks.items(), 1):
+        logger.info(
+            "─── Task %d/%d: %s ───", idx, total, task_name
+        )
+
+        # Resume: load already-completed task from disk.
         cached = tasks_output_dir / f"{task_name}.json"
         if cached.exists():
-            logger.info("Task '%s': loading cached results.", task_name)
+            logger.info("Task '%s': cached — loading from disk.", task_name)
             with open(cached) as f:
-                raw[task_name] = json.load(f).get("metrics", {})
+                results[task_name] = json.load(f).get("metrics", {})
             continue
 
-        logger.info(
-            "Task '%s': hybrid search over %d docs / %d queries...",
-            task_name, len(corpus), len(queries),
-        )
         t0 = time.time()
-        retrieved = retriever.retrieve(corpus, queries)
-        ndcg, map_, recall, precision = retriever.evaluate(
-            qrels, retrieved, retriever.k_values
-        )
-        elapsed = time.time() - t0
-        logger.info("Task '%s' done in %.1fs.", task_name, elapsed)
+        try:
+            metrics = _with_task_timeout(
+                task_timeout, run_single_fn, task_name, task_data
+            )
+        except _TaskTimeout:
+            elapsed = time.time() - t0
+            logger.error(
+                "Task '%s': TIMED OUT after %.0fs (limit=%ds).",
+                task_name, elapsed, task_timeout,
+            )
+            failed.append(f"{task_name} (timeout)")
+            if not skip_failing:
+                _save_partial(output_path, mode, provider, results)
+                raise RuntimeError(
+                    f"Task '{task_name}' timed out. "
+                    "Use --skip-failing to continue past failures."
+                )
+            continue
+        except Exception as exc:
+            elapsed = time.time() - t0
+            logger.error(
+                "Task '%s': FAILED after %.0fs: %s",
+                task_name, elapsed, exc,
+            )
+            failed.append(f"{task_name} ({type(exc).__name__})")
+            if not skip_failing:
+                _save_partial(output_path, mode, provider, results)
+                raise
+            continue
 
-        metrics = {"NDCG": ndcg, "MAP": map_, "Recall": recall, "Precision": precision}
+        elapsed = time.time() - t0
+        logger.info("Task '%s': done in %.1fs.", task_name, elapsed)
+
+        results[task_name] = metrics
+
+        # Persist per-task JSON (enables resume and cross-run analysis).
+        # For embed-only, COIR may have already written this file; we
+        # overwrite with the same data in a canonical format.
         with open(cached, "w") as f:
             json.dump({"metrics": metrics}, f, indent=2)
-        raw[task_name] = metrics
 
-    return raw
+        # Persist partial aggregated output so progress survives a crash.
+        _save_partial(output_path, mode, provider, results)
+
+    if failed:
+        logger.warning(
+            "%d task(s) failed/timed-out: %s", len(failed), ", ".join(failed)
+        )
+
+    return results
+
+
+def _save_partial(
+    output_path: Path,
+    mode: str,
+    provider: str,
+    results: Dict[str, Dict],
+) -> None:
+    """Write partial aggregated output (best-effort; never raises)."""
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = build_output(mode, provider, results)
+        output_path.write_text(json.dumps(partial, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Could not save partial results: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Public evaluation entry points
+# ---------------------------------------------------------------------------
+
+def run_embed_only(
+    model: EmbedOnlyModel,
+    tasks: Dict,
+    tasks_output_dir: Path,
+    output_path: Path,
+    batch_size: int,
+    task_timeout: int,
+    skip_failing: bool,
+) -> Dict[str, Dict]:
+    """Run embed-only evaluation, one task at a time."""
+    def _run(task_name: str, task_data) -> Dict:
+        return _run_single_embed_task(
+            model, task_name, task_data, tasks_output_dir, batch_size
+        )
+
+    return run_all_tasks(
+        tasks, _run, tasks_output_dir, output_path,
+        mode="embed-only", provider=model.provider,
+        task_timeout=task_timeout, skip_failing=skip_failing,
+    )
+
+
+def run_hybrid(
+    backend: HybridSearch,
+    tasks: Dict,
+    tasks_output_dir: Path,
+    output_path: Path,
+    top_k: int,
+    task_timeout: int,
+    skip_failing: bool,
+) -> Dict[str, Dict]:
+    """Run hybrid evaluation, one task at a time."""
+    def _run(task_name: str, task_data) -> Dict:
+        return _run_single_hybrid_task(
+            backend, task_name, task_data, tasks_output_dir, top_k
+        )
+
+    return run_all_tasks(
+        tasks, _run, tasks_output_dir, output_path,
+        mode="hybrid", provider=backend.provider,
+        task_timeout=task_timeout, skip_failing=skip_failing,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +733,13 @@ Examples:
     --tasks all \\
     --output benchmarks/runs/coir-fastembed-full.json
 
+  # Full run, skip tasks that fail or hang (2h limit each):
+  uv run --with coir-eval --with fastembed --with numpy \\
+    python3 benchmarks/scripts/coir-eval.py \\
+    --mode embed-only --provider fastembed \\
+    --tasks all --skip-failing \\
+    --output benchmarks/runs/coir-fastembed-full.json
+
   # Hybrid mode:
   uv run --with coir-eval --with fastembed --with numpy \\
     python3 benchmarks/scripts/coir-eval.py \\
@@ -620,6 +806,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--task-timeout",
+        type=int,
+        default=7200,
+        help=(
+            "Per-task wall-clock timeout in seconds (default: 7200 = 2h). "
+            "Requires POSIX (Linux/macOS). 0 disables the timeout."
+        ),
+    )
+    parser.add_argument(
+        "--skip-failing",
+        action="store_true",
+        help=(
+            "Continue past tasks that error or time out. Partial results are "
+            "saved; failed tasks are logged. Without this flag, the first "
+            "failure aborts the run."
+        ),
+    )
+    parser.add_argument(
         "--list-tasks",
         action="store_true",
         help="Print available task names and exit",
@@ -650,6 +854,27 @@ def main() -> None:
         else output_path.parent / (output_path.stem + "-tasks")
     )
 
+    # Validate timeout option.
+    task_timeout = args.task_timeout
+    if task_timeout < 0:
+        parser.error("--task-timeout must be >= 0")
+    if task_timeout == 0:
+        # Disable timeout: use a very large value that signal.alarm won't overflow.
+        # signal.alarm takes an unsigned int (max ~136 years on 64-bit systems).
+        task_timeout = 2**31 - 1
+
+    # SIGALRM is POSIX-only.  Check early so the error is clear.
+    if not hasattr(signal, "SIGALRM"):
+        if args.task_timeout != 0:
+            logger.warning(
+                "SIGALRM not available on this platform (Windows?). "
+                "--task-timeout is ignored; tasks will run without a timeout."
+            )
+        # Replace _with_task_timeout with a pass-through on non-POSIX.
+        global _with_task_timeout  # noqa: PLW0603
+        def _with_task_timeout(timeout_secs, fn, *a, **kw):  # type: ignore[misc]
+            return fn(*a, **kw)
+
     # Parse and validate tasks.
     task_names = resolve_task_names(
         [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -659,16 +884,26 @@ def main() -> None:
     # Evaluate.
     if args.mode == "embed-only":
         model = EmbedOnlyModel(args.provider)
-        raw_results = run_embed_only(model, tasks, tasks_output_dir, args.batch_size)
+        raw_results = run_embed_only(
+            model, tasks, tasks_output_dir, output_path,
+            batch_size=args.batch_size,
+            task_timeout=task_timeout,
+            skip_failing=args.skip_failing,
+        )
     else:  # hybrid
         backend = HybridSearch(args.binary, args.provider, top_k=args.top_k)
-        raw_results = run_hybrid(backend, tasks, tasks_output_dir, top_k=args.top_k)
+        raw_results = run_hybrid(
+            backend, tasks, tasks_output_dir, output_path,
+            top_k=args.top_k,
+            task_timeout=task_timeout,
+            skip_failing=args.skip_failing,
+        )
 
     if not raw_results:
         logger.error("No results produced — check tasks and connectivity.")
         sys.exit(1)
 
-    # Write aggregated output.
+    # Write final aggregated output (also written incrementally during the run).
     output = build_output(args.mode, args.provider, raw_results)
     output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
 

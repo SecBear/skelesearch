@@ -102,7 +102,7 @@ def run_skelesearch(
     top_k: int = 10,
     use_cache: bool = True,
     index_timeout: int = 3600,
-    max_files: int = 50000,
+    max_files: int = 20000,
 ) -> list[dict]:
     """Index (if needed) and search with skelesearch.
 
@@ -149,10 +149,14 @@ def run_skelesearch(
             return []
 
     # Search
-    search_result = subprocess.run(
-        [binary, "search", query, "--top-k", str(top_k), "--json"],
-        capture_output=True, timeout=60, env=env, cwd=str(project_dir),
-    )
+    try:
+        search_result = subprocess.run(
+            [binary, "search", query, "--top-k", str(top_k), "--json"],
+            capture_output=True, timeout=120, env=env, cwd=str(project_dir),
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  TIMEOUT: search exceeded 120s, skipping", file=sys.stderr)
+        return []
     if search_result.returncode != 0:
         print(f"  WARN: search failed: {search_result.stderr[:200]}", file=sys.stderr)
         return []
@@ -289,8 +293,8 @@ def main():
     parser.add_argument(
         "--max-files",
         type=int,
-        default=50000,
-        help="Skip repos with more source files than this (default: 50000)",
+        default=20000,
+        help="Skip repos with more source files than this (default: 20000)",
     )
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
@@ -349,6 +353,23 @@ def main():
             max_files=args.max_files,
         )
         elapsed = time.time() - t0
+
+        # Record skipped instances (too large or timed out) without zeroing metrics
+        if not chunks and gold_files:
+            print(f"  SKIPPED: no results returned, recording as skipped", file=sys.stderr)
+            results.append({
+                "instance_id": instance_id, "language": lang,
+                "repo": repo,
+                "status": "skipped",
+                "r5": None, "r10": None, "p5": None, "mrr": None,
+                "file_precision": None, "file_recall": None, "file_f1": None,
+                "line_precision": None, "line_recall": None, "line_f1": None,
+                "gold_files": gold_files,
+                "retrieved_files": [],
+                "elapsed_s": round(elapsed, 1),
+            })
+            lang_metrics[lang].append(results[-1])
+            continue
 
         retrieved_files = [c["file"] for c in chunks]
 
