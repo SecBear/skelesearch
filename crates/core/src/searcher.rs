@@ -158,6 +158,11 @@ pub struct Searcher<B, P> {
     /// Whether to apply the log-dampened PageRank score boost.  Enabled by
     /// default; set to `false` via `with_pagerank_boost(false)` to ablate.
     pagerank_boost: bool,
+    /// When true, delegate retrieval to `unified_search` which fuses FTS + HNSW +
+    /// graph + PageRank in a single Datalog round-trip.  MMR and cross-encoder
+    /// reranking still run in Rust after the unified query returns.
+    /// Disabled by default; enable via `with_unified_search(true)`.
+    use_unified_search: bool,
     /// LRU cache for query embeddings.  Bounded at 256 entries.
     ///
     /// ASSUMPTION: `provider` is fixed at construction time, so cached
@@ -174,6 +179,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             reranker: None,
             expander: None,
             pagerank_boost: true,
+            use_unified_search: false,
             query_embed_cache: std::sync::Mutex::new(
                 lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
             ),
@@ -184,6 +190,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     /// Pass `false` to disable for ablation benchmarks.
     pub fn with_pagerank_boost(mut self, enabled: bool) -> Self {
         self.pagerank_boost = enabled;
+        self
+    }
+
+    /// Enable single-query unified retrieval (FTS + HNSW + graph + PageRank in one
+    /// Datalog round-trip).  MMR and cross-encoder reranking still run in Rust.
+    /// Default: `false` (uses the multi-phase hybrid pipeline for compatibility).
+    pub fn with_unified_search(mut self, enabled: bool) -> Self {
+        self.use_unified_search = enabled;
         self
     }
 
@@ -360,18 +374,27 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let bm25_query = sanitize_fts_query(&bm25_query);
 
         // -- Hybrid retrieval --------------------------------------------------
+        // When `use_unified_search` is true, a single Datalog round-trip handles
+        // FTS + HNSW + PageRank boost + optional graph walk together.  The separate
+        // pagerank_boost and graph augmentation steps are skipped in that case.
         let retrieve_start = std::time::Instant::now();
-        let mut hits = self
-            .backend
-            .hybrid_search(&query_vec, &bm25_query, top_k)
-            .await?;
+        let mut hits = if self.use_unified_search {
+            let gd = if include_graph { max_depth } else { 0 };
+            self.backend
+                .unified_search(&query_vec, &bm25_query, top_k, gd)
+                .await?
+        } else {
+            self.backend
+                .hybrid_search(&query_vec, &bm25_query, top_k)
+                .await?
+        };
         timings.retrieve_ms = retrieve_start.elapsed().as_millis() as u64;
 
         // PageRank boost: structurally important files get a mild score uplift.
         // Log-dampened to prevent hub files from dominating all queries.
         // Applied before graph augmentation so expanded hits inherit consistent scaling.
         // Gated on `self.pagerank_boost` so benchmarks can ablate this signal.
-        if self.pagerank_boost {
+        if !self.use_unified_search && self.pagerank_boost {
             let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
             let ranks = self.backend.get_file_ranks(&file_paths).await.unwrap_or_default();
             if !ranks.is_empty() {
@@ -410,7 +433,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Pull in chunks from files reachable via resolved import edges.
         // Runs after hybrid search (so we have seed hits) but before MMR +
         // reranker (so expanded results participate in filtering).
-        if include_graph && max_depth > 0 {
+        if !self.use_unified_search && include_graph && max_depth > 0 {
             let graph_start = std::time::Instant::now();
             let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
             hits = self.augment_with_graph(hits, max_depth, best_score, &query_vec).await?;

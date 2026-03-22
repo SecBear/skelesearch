@@ -148,6 +148,23 @@ pub trait StorageBackend: Send + Sync {
     ) -> anyhow::Result<Vec<(String, usize, f64)>>;
 
 
+    /// Single-query retrieval combining FTS + HNSW + graph walk + PageRank boost.
+    /// Returns results with provenance (\"hybrid\", \"graph\").
+    /// `graph_depth > 0` enables a single-hop graph walk in the Datalog query;
+    /// 0 skips the graph rule entirely.
+    ///
+    /// Non-Cozo backends delegate to `hybrid_search` (no graph walk).
+    async fn unified_search(
+        &self,
+        query_vec: &[f32],
+        query_str: &str,
+        top_k: usize,
+        graph_depth: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        let _ = graph_depth;
+        self.hybrid_search(query_vec, query_str, top_k).await
+    }
+
     /// Remove near-duplicate chunks across different files using the LSH index.
     /// Chunks sharing an LSH hash bucket but from different files are collapsed:
     /// one representative is kept (lowest file_path, then lowest chunk_idx),
@@ -853,6 +870,276 @@ impl StorageBackend for CozoBackend {
             .collect()
     }
 
+    /// Unified single-RTT retrieval: FTS + HNSW fused with score-based weighting,
+    /// optional single-hop graph expansion, and PageRank boost - all in one Datalog
+    /// round-trip.  Post-processing in Rust: dedup by (file_path, chunk_idx) keeping
+    /// the highest score, then truncate to `top_k`.
+    ///
+    /// Fallbacks:
+    /// - `file_ranks` always exists after `initialize()` so the boost join is safe.
+    /// - If the graph produces no edges, the graph rule contributes zero rows;
+    ///   the base union still returns FTS+HNSW results.
+    ///
+    /// CozoDB constraints applied:
+    /// - Proximity search patterns (`~chunks:text`, `~chunks:semantic`) require
+    ///   the actual column names (`file_path`, `chunk_idx`), not arbitrary vars.
+    /// - Expressions are computed in rule bodies (no expressions in rule heads).
+    #[tracing::instrument(skip_all, fields(top_k, graph_depth))]
+    async fn unified_search(
+        &self,
+        query_vec: &[f32],
+        query_str: &str,
+        top_k: usize,
+        graph_depth: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        // Guard: empty index - nothing to search.
+        let guard_rows = self.run_imm(
+            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]
+\
+             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)
+\
+             ?[t, e] := total[t], with_emb[e]",
+            BTreeMap::new(),
+        )?;
+        let (total, emb_count) = guard_rows
+            .rows
+            .first()
+            .map(|r| {
+                let t = match &r[0] { DataValue::Num(cozo::Num::Int(n)) => *n, _ => 0 };
+                let e = match &r[1] { DataValue::Num(cozo::Num::Int(n)) => *n, _ => 0 };
+                (t, e)
+            })
+            .unwrap_or((0, 0));
+        if total == 0 {
+            return Ok(vec![]);
+        }
+        if emb_count == 0 {
+            return self.fts_only_search(query_str, top_k);
+        }
+
+        let fetch_k = (top_k * 3).max(100);
+        let result_limit = fetch_k * 2;
+
+        let query_vec_dv: DataValue = {
+            let arr = ndarray::Array1::from(query_vec.to_vec());
+            DataValue::Vec(cozo::Vector::F32(arr))
+        };
+
+        // Build the combined Datalog script. Rules are newline-separated.
+        //
+        // Key constraints satisfied:
+        // 1. Proximity searches use actual column names (file_path, chunk_idx).
+        // 2. All expressions in rule BODIES (CozoDB forbids head expressions).
+        // 3. Aggregations (sum, max) are valid in rule heads.
+        // 4. NAF `not *file_ranks[file_path, _]` is valid because file_ranks
+        //    always exists after initialize() and file_path is grounded.
+        //
+        // Scoring:
+        //   FTS BM25: norm = bm25 / (bm25 + 1.0) -> [0,1)
+        //   HNSW cosine dist [0,2]: sim = 1.0 - dist -> (-1,1]
+        //   base fuses: 0.55 * fts + 0.45 * vec (mirrors hybrid_search RRF weights).
+        //   PageRank boost: 1.0 + 0.1 * pr (linear; avoids ln() availability).
+        //   Graph: 0.3 * parent_score for depth-1 import neighbors.
+        let with_graph = graph_depth > 0;
+        let script = if with_graph {
+            format!(
+                concat!(
+                    "fts[file_path, chunk_idx, norm] :=
+",
+                    "    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: {fk}, score_kind: 'tf_idf', bind_score: bm25 }},
+",
+                    "    norm = bm25 / (bm25 + 1.0)
+",
+                    "
+",
+                    "vec[file_path, chunk_idx, sim] :=
+",
+                    "    ~chunks:semantic{{ file_path, chunk_idx | query: $qv, k: {fk}, ef: 64, bind_distance: dist }},
+",
+                    "    sim = 1.0 - dist
+",
+                    "
+",
+                    "base[file_path, chunk_idx, sum(s)] :=
+",
+                    "    fts[file_path, chunk_idx, raw], s = 0.55 * raw
+",
+                    "base[file_path, chunk_idx, sum(s)] :=
+",
+                    "    vec[file_path, chunk_idx, raw], s = 0.45 * raw
+",
+                    "
+",
+                    "graph[file_path, chunk_idx, max(s)] :=
+",
+                    "    base[target_fp, _, parent_score], parent_score > 0.005,
+",
+                    "    *code_edges[file_path, _, target_fp, _, _],
+",
+                    "    *chunks[file_path, chunk_idx, _, _, _, _, _, emb], !is_null(emb),
+",
+                    "    s = parent_score * 0.3
+",
+                    "
+",
+                    "boosted[file_path, chunk_idx, bscore] :=
+",
+                    "    base[file_path, chunk_idx, score], *file_ranks[file_path, pr],
+",
+                    "    boost = 1.0 + 0.1 * pr, bscore = score * boost
+",
+                    "boosted[file_path, chunk_idx, score] :=
+",
+                    "    base[file_path, chunk_idx, score], not *file_ranks[file_path, _]
+",
+                    "
+",
+                    "?[file_path, chunk_idx, content, chunk_type, start_line, end_line, score, why] :=
+",
+                    "    boosted[file_path, chunk_idx, score],
+",
+                    "    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _],
+",
+                    "    why = 'hybrid'
+",
+                    "?[file_path, chunk_idx, content, chunk_type, start_line, end_line, score, why] :=
+",
+                    "    graph[file_path, chunk_idx, score],
+",
+                    "    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _],
+",
+                    "    why = 'graph'
+",
+                    ":order -score
+",
+                    ":limit {rl}"
+                ),
+                fk = fetch_k,
+                rl = result_limit,
+            )
+        } else {
+            format!(
+                concat!(
+                    "fts[file_path, chunk_idx, norm] :=
+",
+                    "    ~chunks:text{{ file_path, chunk_idx | query: $qs, k: {fk}, score_kind: 'tf_idf', bind_score: bm25 }},
+",
+                    "    norm = bm25 / (bm25 + 1.0)
+",
+                    "
+",
+                    "vec[file_path, chunk_idx, sim] :=
+",
+                    "    ~chunks:semantic{{ file_path, chunk_idx | query: $qv, k: {fk}, ef: 64, bind_distance: dist }},
+",
+                    "    sim = 1.0 - dist
+",
+                    "
+",
+                    "base[file_path, chunk_idx, sum(s)] :=
+",
+                    "    fts[file_path, chunk_idx, raw], s = 0.55 * raw
+",
+                    "base[file_path, chunk_idx, sum(s)] :=
+",
+                    "    vec[file_path, chunk_idx, raw], s = 0.45 * raw
+",
+                    "
+",
+                    "boosted[file_path, chunk_idx, bscore] :=
+",
+                    "    base[file_path, chunk_idx, score], *file_ranks[file_path, pr],
+",
+                    "    boost = 1.0 + 0.1 * pr, bscore = score * boost
+",
+                    "boosted[file_path, chunk_idx, score] :=
+",
+                    "    base[file_path, chunk_idx, score], not *file_ranks[file_path, _]
+",
+                    "
+",
+                    "?[file_path, chunk_idx, content, chunk_type, start_line, end_line, score] :=
+",
+                    "    boosted[file_path, chunk_idx, score],
+",
+                    "    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _]
+",
+                    ":order -score
+",
+                    ":limit {rl}"
+                ),
+                fk = fetch_k,
+                rl = result_limit,
+            )
+        };
+
+        let mut p = BTreeMap::new();
+        p.insert("qs".into(), Self::dv_str(query_str));
+        p.insert("qv".into(), query_vec_dv);
+
+        let rows = match self.run_imm(&script, p) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                // Some CozoDB errors surface when a query leg returns zero results.
+                if msg.contains("no results") || msg.contains("empty") {
+                    return Ok(vec![]);
+                }
+                return Err(e);
+            }
+        };
+
+        // Parse raw rows. Column layout:
+        //   with_graph:    [file_path, chunk_idx, content, chunk_type, start_line, end_line, score, why]
+        //   without_graph: [file_path, chunk_idx, content, chunk_type, start_line, end_line, score]
+        // Dedup by (file_path, chunk_idx) keeping highest score (handles base/graph overlap).
+        use std::collections::HashMap;
+        let mut seen: HashMap<(String, usize), SearchResult> = HashMap::new();
+        for row in &rows.rows {
+            let file_path = match Self::str_col(&row[0]) { Ok(v) => v, Err(_) => continue };
+            let chunk_idx = match Self::int_col(&row[1]) { Ok(v) => v as usize, Err(_) => continue };
+            let content = match Self::str_col(&row[2]) { Ok(v) => v, Err(_) => continue };
+            let chunk_type = match Self::str_col(&row[3]) { Ok(v) => v, Err(_) => continue };
+            let start_line = match Self::int_col(&row[4]) { Ok(v) => v as usize, Err(_) => continue };
+            let end_line = match Self::int_col(&row[5]) { Ok(v) => v as usize, Err(_) => continue };
+            let score = match &row[6] {
+                DataValue::Num(cozo::Num::Float(f)) => *f,
+                DataValue::Num(cozo::Num::Int(i)) => *i as f64,
+                _ => continue,
+            };
+            let why = if with_graph {
+                match Self::str_col(&row[7]) {
+                    Ok(v) => v,
+                    Err(_) => "hybrid".to_string(),
+                }
+            } else {
+                "hybrid".to_string()
+            };
+            let key = (file_path.clone(), chunk_idx);
+            let entry = seen.entry(key).or_insert_with(|| SearchResult {
+                file_path,
+                chunk_idx,
+                content,
+                start_line,
+                end_line,
+                chunk_type,
+                score,
+                match_quality: String::new(),
+                why,
+            });
+            // Keep the highest-scored representation if duplicated across rules.
+            if score > entry.score {
+                entry.score = score;
+            }
+        }
+
+        let mut results: Vec<SearchResult> = seen.into_values().collect();
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_k);
+        Ok(results)
+    }
+
+
     async fn stats(&self) -> anyhow::Result<IndexStats> {
         // Single query: fc and cc use count (returns 0 on empty), ml uses max
         // (returns nothing on empty). When files is empty the join yields no rows;
@@ -1479,6 +1766,16 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         limit: usize,
     ) -> anyhow::Result<Vec<(String, usize, f64)>> {
         (**self).hnsw_neighbors(seeds, max_dist, limit).await
+    }
+
+    async fn unified_search(
+        &self,
+        query_vec: &[f32],
+        query_str: &str,
+        top_k: usize,
+        graph_depth: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        (**self).unified_search(query_vec, query_str, top_k, graph_depth).await
     }
 
     async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {

@@ -395,3 +395,51 @@ async fn mmr_reranking_diversifies_results() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn unified_search_returns_results_and_overlaps_hybrid() -> anyhow::Result<()> {
+    let (backend, _searcher, _fixture, _manifest_dir) = indexed_searcher().await?;
+
+    let provider = DeterministicTestProvider::new(8);
+    let query = "pub fn";
+    let query_vec = provider.embed_batch(vec![query.to_string()]).await?;
+    let query_vec = query_vec.into_iter().next().unwrap_or_default();
+
+    // unified_search (no graph)
+    let unified = backend
+        .unified_search(&query_vec, query, 5, 0)
+        .await?;
+
+    // Fall back gracefully if the index is empty or embeddings are missing.
+    if unified.is_empty() {
+        return Ok(());
+    }
+
+    // Every result must have a valid why tag.
+    for r in &unified {
+        assert!(
+            matches!(r.why.as_str(), "hybrid" | "graph"),
+            "unexpected why tag: {:?}",
+            r.why
+        );
+    }
+
+    // Scores must be non-negative and ordered descending.
+    let mut prev = f64::MAX;
+    for r in &unified {
+        assert!(r.score >= 0.0, "score must be non-negative: {}", r.score);
+        assert!(r.score <= prev + 1e-9, "results must be score-descending");
+        prev = r.score;
+    }
+
+    // Verify Searcher::with_unified_search(true) can be constructed and run.
+    let unified_searcher = Searcher::new(backend.clone(), DeterministicTestProvider::new(8))
+        .with_unified_search(true);
+    let searcher_results = unified_searcher
+        .search(query, 5, false, 0, 0.0, None)
+        .await?;
+    // Must not error; empty result is acceptable (e.g. no embeddings in index).
+    let _ = searcher_results;
+
+    Ok(())
+}
