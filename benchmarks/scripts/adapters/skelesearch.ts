@@ -26,9 +26,10 @@ interface RunResult {
   code: number;
 }
 
-function run(args: string[], cwd?: string): RunResult {
+function run(args: string[], cwd?: string, env?: Record<string, string | undefined>): RunResult {
   const proc = Bun.spawnSync(args, {
     cwd,
+    env: env ?? undefined,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -42,8 +43,8 @@ function run(args: string[], cwd?: string): RunResult {
   };
 }
 
-function runOrDie(args: string[], cwd?: string, context?: string): string {
-  const r = run(args, cwd);
+function runOrDie(args: string[], cwd?: string, context?: string, env?: Record<string, string | undefined>): string {
+  const r = run(args, cwd, env);
   if (!r.ok) {
     const ctx = context ? ` (${context})` : "";
     const detail = r.stderr || r.stdout;
@@ -162,6 +163,21 @@ export const skelesearchAdapter: BenchmarkAdapter = {
     const tomlDest = join(repoPath, ".skelesearch.toml");
     await Bun.write(tomlDest, profileSrc);
 
+    // --- Build clean env for skelesearch subprocesses ---
+    // If the profile doesn't explicitly configure a cloud reranker, strip cloud
+    // API keys so auto-detection doesn't silently activate one. This prevents
+    // benchmark results from being contaminated by environment-leaked keys.
+    const rerankerCfg = tomlGet(profileDoc, "search", "reranker", "provider");
+    const skelEnv: Record<string, string | undefined> = { ...process.env };
+    if (!rerankerCfg) {
+      // No explicit reranker in profile — strip all cloud reranker keys
+      for (const key of ["VOYAGE_API_KEY", "JINA_API_KEY", "COHERE_API_KEY"]) {
+        delete skelEnv[key];
+      }
+    }
+    // Always set RUST_LOG for telemetry capture
+    skelEnv["RUST_LOG"] = skelEnv["RUST_LOG"] ?? "skelesearch=info";
+
     // --- Wipe index unless --reuse-index ---
     const indexDir = join(repoPath, ".skelesearch");
     if (!reuseIndex && existsSync(indexDir)) {
@@ -170,11 +186,11 @@ export const skelesearchAdapter: BenchmarkAdapter = {
 
     // --- Index ---
     console.log(`[index] ${repoId} with provider=${provider}`);
-    runOrDie([binary, "index", repoPath, "--provider", provider], repoPath, "index");
+    runOrDie([binary, "index", repoPath, "--provider", provider], repoPath, "index", skelEnv);
 
     // --- Status ---
     console.log(`[status] reading index statistics`);
-    const statusResult = run([binary, "status", "--json"], repoPath);
+    const statusResult = run([binary, "status", "--json"], repoPath, skelEnv);
     if (!statusResult.ok) {
       process.stderr.write(
         `status command failed:\n${statusResult.stderr || statusResult.stdout}\n`
@@ -202,7 +218,8 @@ export const skelesearchAdapter: BenchmarkAdapter = {
     console.log(`[eval] running eval set: ${evalPath}`);
     const evalResult = run(
       [binary, "eval", evalPath, "--provider", provider, "--json"],
-      repoPath
+      repoPath,
+      skelEnv
     );
     if (!evalResult.ok) {
       process.stderr.write(
@@ -254,7 +271,9 @@ export const skelesearchAdapter: BenchmarkAdapter = {
 
     const environment = {
       provider,
-      reranker: typeof rerankerProvider === "string" ? rerankerProvider : null,
+      reranker: typeof rerankerProvider === "string"
+        ? rerankerProvider
+        : rerankerCfg ? String(rerankerCfg) : null,
       expansion: typeof expansionEnabled === "boolean" ? expansionEnabled : null,
       graph: graphEnabled === true,
       symbol_enrichment: symbolEnrichment !== false, // default true per profile convention
