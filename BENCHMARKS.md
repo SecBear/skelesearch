@@ -71,10 +71,18 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 
 > **Analysis:** Reranker adds +10.9pp R@5 on average. Impact is uneven: httpx/cobra
 > gain nothing, mini-redis loses 1.3pp, but hono (-17.1pp) and hyperfine (-11.3pp)
-> regress significantly. TypeScript repos are weakest overall. Local cross-encoder
-> reranker (gte-reranker-modernbert-base) should recover Voyage-level quality at
-> ~50ms/query instead of 400ms. The adapter now strips cloud API keys from subprocess
-> env when the profile has no explicit reranker config (commit `d509642`).
+> regress significantly. TypeScript repos are weakest overall.
+>
+> **Reranker findings (2026-03-22):**
+> - MiniLM-L6-v2 (22M, CPU): **hurts results** (-3.8pp R@5 avg). Demotes code below docs.
+> - gte-modernbert-base (149M, CPU): 3-5s/query. Unusable without GPU.
+> - gte-modernbert-base (149M, CoreML M4 Pro): ~342ms warm, but 12s cold start per CLI invocation.
+> - No open-weight code-aware CPU reranker exists in the ecosystem (PER-110).
+> - Recommended: cloud reranker when key available, no reranker otherwise.
+>
+> **LSH dedup (fixed in `bf04d4e`):** Was broken since introduction (CozoDB `:rm` syntax).
+> Now working: mini-redis removes 8 chunks, hyperfine removes 64 (22%), hono removes ~180+.
+> R@10 improved +2.5pp on hono with dedup active.
 **2026-03-15 per-repo breakdown (voyage-full, 240 cases):**
 
 | Repo | Language | R@5 | R@10 | MRR | Cases |
