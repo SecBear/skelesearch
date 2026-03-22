@@ -159,7 +159,7 @@ def main():
     parser.add_argument("--provider", default="fastembed")
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--top-k", type=int, default=20, help="Top-k results from search (pre-filter)")
     parser.add_argument("--limit", type=int, default=None, help="Max instances to evaluate")
     parser.add_argument("--index-timeout", type=int, default=900)
     parser.add_argument("--max-files", type=int, default=20000)
@@ -256,14 +256,19 @@ def main():
                 skipped += 1
                 continue
 
-            # Deduplicate retrieved files (multiple chunks from same file)
+            # Deduplicate retrieved files and filter to source code only.
+            # SWE-bench gold files are always .py — docs/tests/configs pollute results.
+            source_exts = {'.py', '.pyx', '.pyi'}
             seen = set()
             retrieved_files = []
             for c in chunks:
                 fp = c.get("file_path", c.get("file", ""))
                 if fp and fp not in seen:
                     seen.add(fp)
-                    retrieved_files.append(fp)
+                    # Filter: only source files, skip docs/tests/configs
+                    ext = os.path.splitext(fp)[1]
+                    if ext in source_exts:
+                        retrieved_files.append(fp)
 
             # Compute metrics
             a1 = acc_at_k(retrieved_files, gold, 1)
