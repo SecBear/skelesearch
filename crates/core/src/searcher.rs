@@ -163,11 +163,12 @@ pub struct Searcher<B, P> {
     /// reranking still run in Rust after the unified query returns.
     /// Disabled by default; enable via `with_unified_search(true)`.
     use_unified_search: bool,
+    /// Tuning parameters for the unified search query.
+    fts_weight: f64,
+    graph_score_factor: f64,
+    graph_min_score: f64,
+    pagerank_factor: f64,
     /// LRU cache for query embeddings.  Bounded at 256 entries.
-    ///
-    /// ASSUMPTION: `provider` is fixed at construction time, so cached
-    /// vectors always match the current provider's dimension.  If the
-    /// provider were hot-swapped this cache would need to be flushed.
     query_embed_cache: std::sync::Mutex<lru::LruCache<String, Vec<f32>>>,
 }
 
@@ -180,6 +181,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             expander: None,
             pagerank_boost: true,
             use_unified_search: false,
+            fts_weight: 0.55,
+            graph_score_factor: 0.3,
+            graph_min_score: 0.005,
+            pagerank_factor: 0.1,
             query_embed_cache: std::sync::Mutex::new(
                 lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
             ),
@@ -198,6 +203,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     /// Default: `false` (uses the multi-phase hybrid pipeline for compatibility).
     pub fn with_unified_search(mut self, enabled: bool) -> Self {
         self.use_unified_search = enabled;
+        self
+    }
+
+    /// Apply tuning parameters from a `SearchConfig`.
+    pub fn with_search_tuning(mut self, config: &crate::Config) -> Self {
+        self.fts_weight = config.search.fts_weight();
+        self.graph_score_factor = config.search.graph_score_factor();
+        self.graph_min_score = config.search.graph_min_score();
+        self.pagerank_factor = config.search.pagerank_factor();
         self
     }
 
@@ -381,7 +395,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let mut hits = if self.use_unified_search {
             let gd = if include_graph { max_depth } else { 0 };
             self.backend
-                .unified_search(&query_vec, &bm25_query, top_k, gd)
+                .unified_search(
+                    &query_vec, &bm25_query, top_k, gd,
+                    self.fts_weight, self.graph_score_factor,
+                    self.graph_min_score, self.pagerank_factor,
+                )
                 .await?
         } else {
             self.backend

@@ -28,14 +28,27 @@ pub struct IndexConfig {
 #[serde(default)]
 pub struct SearchConfig {
     pub default_top_k: usize,
-    /// Enable PageRank boost on search results.  Default: `true` (absent = enabled).
-    /// Set to `false` in a benchmark config to ablate the PageRank signal.
+    /// Enable PageRank boost on search results. Default: `true` (absent = enabled).
     #[serde(default)]
     pub pagerank_boost: Option<bool>,
     /// Use unified single-Datalog retrieval (FTS + HNSW + graph + PageRank in one query).
-    /// Default: `false` (experimental). Enable with `unified_search = true` under `[search]`.
+    /// Default: `false` (experimental).
     #[serde(default)]
     pub unified_search: Option<bool>,
+
+    // -- Tuning knobs (unified search) ------------------------------------
+
+    /// BM25 weight in score fusion. Default: 0.55. vec_weight = 1.0 - fts_weight.
+    pub fts_weight: Option<f64>,
+    /// Graph-expanded chunk score = parent_score * graph_score_factor. Default: 0.3.
+    pub graph_score_factor: Option<f64>,
+    /// Minimum parent score to trigger graph expansion. Default: 0.005.
+    pub graph_min_score: Option<f64>,
+    /// PageRank linear boost coefficient: 1.0 + factor * pr. Default: 0.1.
+    pub pagerank_factor: Option<f64>,
+
+    // -- Sub-configs -------------------------------------------------------
+
     /// Reranker configuration.
     #[serde(default)]
     pub reranker: RerankerConfig,
@@ -94,11 +107,23 @@ impl Default for SearchConfig {
             default_top_k: 5,
             pagerank_boost: None,
             unified_search: None,
+            fts_weight: None,
+            graph_score_factor: None,
+            graph_min_score: None,
+            pagerank_factor: None,
             reranker: RerankerConfig::default(),
             expansion: ExpansionConfig::default(),
             graph: GraphConfig::default(),
         }
     }
+}
+
+impl SearchConfig {
+    pub fn fts_weight(&self) -> f64 { self.fts_weight.unwrap_or(0.55) }
+    pub fn vec_weight(&self) -> f64 { 1.0 - self.fts_weight() }
+    pub fn graph_score_factor(&self) -> f64 { self.graph_score_factor.unwrap_or(0.3) }
+    pub fn graph_min_score(&self) -> f64 { self.graph_min_score.unwrap_or(0.005) }
+    pub fn pagerank_factor(&self) -> f64 { self.pagerank_factor.unwrap_or(0.1) }
 }
 
 impl Default for IndexConfig {

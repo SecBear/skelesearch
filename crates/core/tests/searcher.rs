@@ -407,7 +407,7 @@ async fn unified_search_returns_results_and_overlaps_hybrid() -> anyhow::Result<
 
     // unified_search (no graph)
     let unified = backend
-        .unified_search(&query_vec, query, 5, 0)
+        .unified_search(&query_vec, query, 5, 0, 0.55, 0.3, 0.005, 0.1)
         .await?;
 
     // Fall back gracefully if the index is empty or embeddings are missing.

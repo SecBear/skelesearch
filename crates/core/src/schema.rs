@@ -160,8 +160,12 @@ pub trait StorageBackend: Send + Sync {
         query_str: &str,
         top_k: usize,
         graph_depth: usize,
+        fts_weight: f64,
+        graph_score_factor: f64,
+        graph_min_score: f64,
+        pagerank_factor: f64,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let _ = graph_depth;
+        let _ = (graph_depth, fts_weight, graph_score_factor, graph_min_score, pagerank_factor);
         self.hybrid_search(query_vec, query_str, top_k).await
     }
 
@@ -891,6 +895,10 @@ impl StorageBackend for CozoBackend {
         query_str: &str,
         top_k: usize,
         graph_depth: usize,
+        fts_weight: f64,
+        graph_score_factor: f64,
+        graph_min_score: f64,
+        pagerank_factor: f64,
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Guard: empty index - nothing to search.
         let guard_rows = self.run_imm(
@@ -962,23 +970,23 @@ impl StorageBackend for CozoBackend {
 ",
                     "base[file_path, chunk_idx, sum(s)] :=
 ",
-                    "    fts[file_path, chunk_idx, raw], s = 0.55 * raw
+                    "    fts[file_path, chunk_idx, raw], s = {fw} * raw
 ",
                     "base[file_path, chunk_idx, sum(s)] :=
 ",
-                    "    vec[file_path, chunk_idx, raw], s = 0.45 * raw
+                    "    vec[file_path, chunk_idx, raw], s = {vw} * raw
 ",
                     "
 ",
                     "graph[file_path, chunk_idx, max(s)] :=
 ",
-                    "    base[target_fp, _, parent_score], parent_score > 0.005,
+                    "    base[target_fp, _, parent_score], parent_score > {gms},
 ",
                     "    *code_edges[file_path, _, target_fp, _, _],
 ",
                     "    *chunks[file_path, chunk_idx, _, _, _, _, _, emb], !is_null(emb),
 ",
-                    "    s = parent_score * 0.3
+                    "    s = parent_score * {gsf}
 ",
                     "
 ",
@@ -986,7 +994,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    base[file_path, chunk_idx, score], *file_ranks[file_path, pr],
 ",
-                    "    boost = 1.0 + 0.1 * pr, bscore = score * boost
+                    "    boost = 1.0 + {prf} * pr, bscore = score * boost
 ",
                     "boosted[file_path, chunk_idx, score] :=
 ",
@@ -1016,6 +1024,11 @@ impl StorageBackend for CozoBackend {
                 ),
                 fk = fetch_k,
                 rl = result_limit,
+                fw = fts_weight,
+                vw = 1.0 - fts_weight,
+                gsf = graph_score_factor,
+                gms = graph_min_score,
+                prf = pagerank_factor,
             )
         } else {
             format!(
@@ -1038,11 +1051,11 @@ impl StorageBackend for CozoBackend {
 ",
                     "base[file_path, chunk_idx, sum(s)] :=
 ",
-                    "    fts[file_path, chunk_idx, raw], s = 0.55 * raw
+                    "    fts[file_path, chunk_idx, raw], s = {fw} * raw
 ",
                     "base[file_path, chunk_idx, sum(s)] :=
 ",
-                    "    vec[file_path, chunk_idx, raw], s = 0.45 * raw
+                    "    vec[file_path, chunk_idx, raw], s = {vw} * raw
 ",
                     "
 ",
@@ -1050,7 +1063,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    base[file_path, chunk_idx, score], *file_ranks[file_path, pr],
 ",
-                    "    boost = 1.0 + 0.1 * pr, bscore = score * boost
+                    "    boost = 1.0 + {prf} * pr, bscore = score * boost
 ",
                     "boosted[file_path, chunk_idx, score] :=
 ",
@@ -1070,6 +1083,9 @@ impl StorageBackend for CozoBackend {
                 ),
                 fk = fetch_k,
                 rl = result_limit,
+                fw = fts_weight,
+                vw = 1.0 - fts_weight,
+                prf = pagerank_factor,
             )
         };
 
@@ -1774,8 +1790,12 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         query_str: &str,
         top_k: usize,
         graph_depth: usize,
+        fts_weight: f64,
+        graph_score_factor: f64,
+        graph_min_score: f64,
+        pagerank_factor: f64,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        (**self).unified_search(query_vec, query_str, top_k, graph_depth).await
+        (**self).unified_search(query_vec, query_str, top_k, graph_depth, fts_weight, graph_score_factor, graph_min_score, pagerank_factor).await
     }
 
     async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {

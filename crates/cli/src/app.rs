@@ -168,9 +168,10 @@ where
     };
 
     // Unified Datalog retrieval: single round-trip FTS + HNSW + graph + PageRank.
+    // Also applies any tuning parameters from the config.
     let searcher = match config.search.unified_search {
-        Some(true) => searcher.with_unified_search(true),
-        _ => searcher,
+        Some(true) => searcher.with_unified_search(true).with_search_tuning(&config),
+        _ => searcher.with_search_tuning(&config),
     };
 
     // Query expansion: skip if explicitly disabled; otherwise attach LLMExpander
