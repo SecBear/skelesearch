@@ -73,9 +73,10 @@
             pkgs.openssl
             # Benchmark scripts (TypeScript)
             pkgs.bun
-            # ContextBench adapter (Python)
-            pkgs.uv
+            # ContextBench adapter (Python); uv also provides hf CLI
+            # for model downloads: uv tool run --from huggingface_hub hf download ...
             pkgs.python312
+            pkgs.uv
             # Repo cloning for benchmarks
             pkgs.git
           ];

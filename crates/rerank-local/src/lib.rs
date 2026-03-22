@@ -155,9 +155,12 @@ impl LocalReranker {
     ///
     /// ```sh
     /// mkdir -p ~/.cache/skelesearch/reranker/gte-modernbert-base
-    /// huggingface-cli download Alibaba-NLP/gte-reranker-modernbert-base \
+    /// uv tool run --from huggingface_hub hf download \
+    ///     Alibaba-NLP/gte-reranker-modernbert-base \
     ///     onnx/model.onnx tokenizer.json \
     ///     --local-dir ~/.cache/skelesearch/reranker/gte-modernbert-base
+    /// mv ~/.cache/skelesearch/reranker/gte-modernbert-base/onnx/model.onnx \
+    ///     ~/.cache/skelesearch/reranker/gte-modernbert-base/model.onnx
     /// ```
     ///
     /// The ONNX file (`onnx/model.onnx` from the HF repo) must be placed as
@@ -175,7 +178,8 @@ impl LocalReranker {
                     "Default reranker model not found at {path}.\n\n",
                     "Download with:\n",
                     "  mkdir -p {path}\n",
-                    "  huggingface-cli download {repo} \\\n",
+                    "  uv tool run --from huggingface_hub hf download \\\n",
+                    "      {repo} \\\n",
                     "      onnx/model.onnx tokenizer.json \\\n",
                     "      --local-dir {path}\n\n",
                     "Then: mv {path}/onnx/model.onnx {path}/model.onnx",
@@ -409,7 +413,7 @@ mod tests {
         let result = LocalReranker::default_model();
         assert!(result.is_err(), "expected error when model is absent");
         let msg = result.err().expect("expected error").to_string();
-        assert!(msg.contains("huggingface-cli download"), "expected download hint in: {msg}");
+        assert!(msg.contains("hf download"), "expected download hint in: {msg}");
         assert!(msg.contains(DEFAULT_MODEL_REPO), "expected repo name in: {msg}");
     }
 }
