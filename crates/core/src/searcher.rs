@@ -1018,7 +1018,7 @@ fn query_asks_about_entry_point(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_doc_file, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case};
+    use super::{is_test_file, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -1272,4 +1272,27 @@ mod tests {
         assert!(!is_barrel_file("src/client.ts"));
         assert!(!is_barrel_file("src/models.py"));
     }
+
+    // --- is_docs_directory tests ---
+
+    #[test]
+    fn docs_directory_positive() {
+        assert!(is_docs_directory("docs/api.md"));
+        assert!(is_docs_directory("doc/guide.rst"));
+        assert!(is_docs_directory("packages/docs/intro.md"));
+        assert!(is_docs_directory("src/documentation/overview.md"));
+        assert!(is_docs_directory("apps/web/docs/readme.md"));
+    }
+
+    #[test]
+    fn docs_directory_negative() {
+        // Source file in a docs dir: ensure is_docs_directory alone
+        // doesn't flag unrelated paths.
+        assert!(!is_docs_directory("src/config.rs"));
+        assert!(!is_docs_directory("README.md"));
+        assert!(!is_docs_directory("src/parser.ts"));
+        // 'doc' appearing only in a filename stem must not match.
+        assert!(!is_docs_directory("src/docstring.rs"));
+    }
+
 }
