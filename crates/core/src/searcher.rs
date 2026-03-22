@@ -583,6 +583,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let mut seen_chunks: std::collections::HashSet<(String, usize)> =
             hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
 
+        // Capture seed chunks from the original hits before any augmentation.
+        // Cap at 10 to limit HNSW graph traversal cost.
+        let seed_chunks: Vec<(String, usize)> = hits
+            .iter()
+            .take(10)
+            .map(|h| (h.file_path.clone(), h.chunk_idx))
+            .collect();
+
         for file_path in &present {
             let reachable = self.backend.traverse_imports(file_path, max_depth, None).await?;
             for (target, depth) in reachable {
@@ -608,8 +616,40 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             }
         }
 
+        // HNSW proximity expansion: find vector-similar chunks without re-embedding.
+        // Walks layer 0 of the HNSW graph using seed chunks from the original hits.
+        // Cosine distance threshold 0.3: captures semantically close neighbors
+        // while excluding weakly related chunks.
+        if !seed_chunks.is_empty() {
+            let neighbors = self.backend.hnsw_neighbors(&seed_chunks, 0.3, 50).await?;
+            for (fp, ci, dist) in neighbors {
+                let key = (fp.clone(), ci);
+                if seen_chunks.insert(key) {
+                    // Score proportional to proximity: closer neighbor → higher score.
+                    // Capped at 0.4× best_score to rank below import-graph results.
+                    let prox_score = best_score * 0.4 * (1.0_f64 - dist).max(0.0);
+                    if let Ok(chunks) = self.backend.get_chunks_for_file(&fp).await {
+                        if let Some(chunk) = chunks.into_iter().find(|c| c.chunk_idx == ci) {
+                            hits.push(SearchResult {
+                                file_path: chunk.file_path,
+                                chunk_idx: chunk.chunk_idx,
+                                content: chunk.content,
+                                start_line: chunk.start_line,
+                                end_line: chunk.end_line,
+                                chunk_type: chunk.chunk_type,
+                                score: prox_score,
+                                match_quality: "hnsw_proximity".to_string(),
+                                why: "hnsw_proximity".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::debug!(
             seed_files = present.len(),
+            hnsw_seeds = seed_chunks.len(),
             total_hits = hits.len(),
             "graph augmentation complete"
         );

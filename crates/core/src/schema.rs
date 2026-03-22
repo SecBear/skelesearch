@@ -133,6 +133,18 @@ pub trait StorageBackend: Send + Sync {
     /// Retrieve PageRank scores for the given file paths.
     /// Returns a HashMap; files not in the graph get score 0.0.
     async fn get_file_ranks(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>>;
+    /// Walk the HNSW proximity graph at layer 0 to find vector-similar chunks
+    /// without re-embedding. Returns `(file_path, chunk_idx, distance)` tuples
+    /// for neighbors of any seed chunk within `max_dist` (cosine distance;
+    /// 0 = identical, 1 = orthogonal). Returns an empty vec if the index does
+    /// not exist yet or no seeds are provided.
+    async fn hnsw_neighbors(
+        &self,
+        seeds: &[(String, usize)], // (file_path, chunk_idx)
+        max_dist: f64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, usize, f64)>>;
+
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +429,11 @@ impl StorageBackend for CozoBackend {
             "::fts create chunks:text { extractor: normalized, tokenizer: Simple, filters: [Lowercase, AlphaNumOnly] }",
         )?;
 
+        // Create LSH index for near-duplicate chunk detection — idempotent.
+        self.run_mut_ignore(
+            "::lsh create chunks:dedup { extractor: normalized, tokenizer: Simple, n_gram: 5, n_perm: 128, target_threshold: 0.85 }",
+        )?;
+
         // Create symbols relation — idempotent.
         self.run_mut_ignore(
             ":create symbols { file_path: String, name: String, start_line: Int => kind: String, end_line: Int }",
@@ -474,8 +491,59 @@ impl StorageBackend for CozoBackend {
         const BATCH_SIZE: usize = 500;
 
         for batch in chunks.chunks(BATCH_SIZE) {
-            let rows: Vec<Vec<DataValue>> = batch
+            // Filter near-duplicates using the LSH index before insertion.
+            // Query happens before the :put so we compare against already-indexed content.
+            // Re-indexing the same file always passes (same file_path check).
+            // If the LSH index doesn't exist yet, run_imm returns Err and we keep the chunk.
+            let batch: Vec<&ChunkRecord> = batch
                 .iter()
+                .filter(|c| {
+                    // Always keep chunks with no meaningful normalized content (headers, etc.).
+                    if c.normalized.trim().is_empty() {
+                        return true;
+                    }
+                    let mut p = BTreeMap::new();
+                    p.insert("content".into(), Self::dv_str(&c.normalized));
+                    match self.run_imm(
+                        "?[fp, ci] := ~chunks:dedup{fp, ci | query: $content, k: 1}",
+                        p,
+                    ) {
+                        Ok(rows) if !rows.rows.is_empty() => {
+                            match (
+                                Self::str_col(&rows.rows[0][0]),
+                                Self::int_col(&rows.rows[0][1]),
+                            ) {
+                                (Ok(existing_fp), Ok(existing_ci)) => {
+                                    if existing_fp == c.file_path {
+                                        // Same file re-index — always allow update.
+                                        true
+                                    } else {
+                                        tracing::debug!(
+                                            chunk_file = %c.file_path,
+                                            chunk_idx = c.chunk_idx,
+                                            dup_file = %existing_fp,
+                                            dup_idx = existing_ci,
+                                            "skipping near-duplicate chunk",
+                                        );
+                                        false
+                                    }
+                                }
+                                // Parse error on LSH result — keep the chunk.
+                                _ => true,
+                            }
+                        }
+                        // No duplicate found or LSH index not yet available — keep the chunk.
+                        _ => true,
+                    }
+                })
+                .collect();
+
+            if batch.is_empty() {
+                continue;
+            }
+
+            let rows: Vec<Vec<DataValue>> = batch
+                .into_iter()
                 .map(|c| {
                     vec![
                         Self::dv_str(&c.file_path),
@@ -1167,6 +1235,82 @@ impl StorageBackend for CozoBackend {
         }
         Ok(ranks)
     }
+
+    async fn hnsw_neighbors(
+        &self,
+        seeds: &[(String, usize)],
+        max_dist: f64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+        if seeds.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build a CozoDB list of [file_path, chunk_idx] pairs for the seeds.
+        let seeds_dv = DataValue::List(
+            seeds
+                .iter()
+                .map(|(fp, ci)| {
+                    DataValue::List(vec![
+                        Self::dv_str(fp),
+                        DataValue::Num(cozo::Num::Int(*ci as i64)),
+                    ])
+                })
+                .collect(),
+        );
+        let mut p = BTreeMap::new();
+        p.insert("seeds".into(), seeds_dv);
+        p.insert("max_dist".into(), DataValue::Num(cozo::Num::Float(max_dist)));
+
+        // Query layer 0 of the HNSW proximity graph.
+        // CozoDB maps the first key column of the indexed relation to `fr_k`/`to_k`
+        // (file_path: String) and the second key column to `fr__field`/`to__field`
+        // (chunk_idx: Int).
+        let script = format!(
+            r#"?[to_fp, to_ci, dist] :=
+                seed <- $seeds,
+                seed = [fp, ci],
+                *chunks:semantic{{layer: 0, fr_k: fp, fr__field: ci, to_k: to_fp, to__field: to_ci, dist}},
+                dist < $max_dist,
+                !ignore_link
+            :limit {limit}
+            :order dist"#
+        );
+
+        // Gracefully return empty on any error — the HNSW index may not exist
+        // yet (no embeddings indexed) or the graph may be empty.
+        let rows = match self.run_imm(&script, p) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "hnsw_neighbors: index query failed (index may not exist yet)");
+                return Ok(vec![]);
+            }
+        };
+
+        let mut results: Vec<(String, usize, f64)> = Vec::new();
+        // Deduplicate: multiple seeds may share the same neighbor.
+        let mut seen: std::collections::HashSet<(String, usize)> =
+            seeds.iter().map(|(fp, ci)| (fp.clone(), *ci)).collect();
+        for row in &rows.rows {
+            let to_fp = match &row[0] {
+                DataValue::Str(s) => s.to_string(),
+                _ => continue,
+            };
+            let to_ci = match &row[1] {
+                DataValue::Num(cozo::Num::Int(i)) => *i as usize,
+                _ => continue,
+            };
+            let dist = match &row[2] {
+                DataValue::Num(cozo::Num::Float(f)) => *f,
+                DataValue::Num(cozo::Num::Int(i)) => *i as f64,
+                _ => continue,
+            };
+            if seen.insert((to_fp.clone(), to_ci)) {
+                results.push((to_fp, to_ci, dist));
+            }
+        }
+        Ok(results)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,5 +1408,14 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         file_paths: &[&str],
     ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
         (**self).get_file_ranks(file_paths).await
+    }
+
+    async fn hnsw_neighbors(
+        &self,
+        seeds: &[(String, usize)],
+        max_dist: f64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+        (**self).hnsw_neighbors(seeds, max_dist, limit).await
     }
 }

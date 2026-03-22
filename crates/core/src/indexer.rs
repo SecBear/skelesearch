@@ -276,10 +276,12 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             struct BatchFile<'a> {
                 candidate: &'a FileCandidate,
                 hash: String,
-                source: String,
                 chunks: Vec<crate::ParsedChunk>,
                 edges: Vec<crate::ImportEdge>,
                 symbols: Vec<crate::symbols::SymbolDef>,
+                /// Call-site references extracted from source during Phase 2a.
+                /// Used in Phase 2c to emit "calls" edges.
+                references: Vec<crate::symbols::ReferenceCapture>,
             }
 
             let mut batch_files: Vec<BatchFile<'_>> = Vec::with_capacity(batch.len());
@@ -313,8 +315,10 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 };
                 let edges = chunker.extract_edges(&fc.rel_path, &source).unwrap_or_default();
                 let symbols = extract_symbols(&fc.rel_path, &source).unwrap_or_default();
+                let references = extract_references(&fc.rel_path, &source).unwrap_or_default();
+                // `source` is dropped here — only structured data retained for the batch.
 
-                batch_files.push(BatchFile { candidate: fc, hash, source, chunks, edges, symbols });
+                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols, references });
             }
 
             if batch_files.is_empty() {
@@ -518,8 +522,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 // imports (e.g. `from utils import foo; foo()`), but is cheap
                 // and produces directionally correct signal.
                 if !edge_records.is_empty() {
-                    let references = extract_references(&fc.rel_path, &bf.source)
-                        .unwrap_or_default();
+                    let references = &bf.references;
                     if !references.is_empty() {
                         let ref_names: std::collections::HashSet<&str> =
                             references.iter().map(|r| r.name.as_str()).collect();
