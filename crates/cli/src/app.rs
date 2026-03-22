@@ -205,17 +205,11 @@ where
                 Err(_) => searcher,
             },
             None => {
-                // No cloud API keys — try local ONNX reranker as final fallback.
-                match skelesearch_rerank_local::LocalReranker::default_model() {
-                    Ok(r) => {
-                        tracing::info!("local reranker enabled (MiniLM-L6-v2)");
-                        searcher.with_reranker(Box::new(r))
-                    }
-                    Err(_) => {
-                        tracing::debug!("local reranker model not found, continuing without reranker");
-                        searcher
-                    }
-                }
+                // No cloud API keys and no explicit config — skip reranking.
+                // Local CPU cross-encoders (MiniLM, gte-modernbert) are either
+                // too slow or not code-aware enough to improve results.
+                // Users can opt in via .skelesearch.toml [search.reranker].
+                searcher
             }
         }
     }

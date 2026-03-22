@@ -237,27 +237,15 @@ impl SkeleSearchServer {
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("voyage", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
-            })
-            .or_else(|| {
-                // No cloud API keys — try local ONNX reranker as final fallback.
-                skelesearch_rerank_local::LocalReranker::default_model()
-                    .ok()
-                    .map(|r| -> Box<dyn Reranker> { Box::new(r) })
             });
+            // No local reranker auto-fallback — CPU cross-encoders are either
+            // too slow (gte-modernbert) or not code-aware (MiniLM), degrading results.
 
         if expander.is_some() {
             tracing::info!("query expansion enabled (OPENAI_API_KEY detected)");
         }
-        if let Some(ref _r) = reranker {
-            let source = if std::env::var("JINA_API_KEY").ok().filter(|k| !k.is_empty()).is_some()
-                || std::env::var("COHERE_API_KEY").ok().filter(|k| !k.is_empty()).is_some()
-                || std::env::var("VOYAGE_API_KEY").ok().filter(|k| !k.is_empty()).is_some()
-            {
-                "cloud API key detected"
-            } else {
-                "local model (MiniLM-L6-v2)"
-            };
-            tracing::info!(source, "reranking enabled");
+        if reranker.is_some() {
+            tracing::info!("cloud reranker enabled");
         }
 
         (expander, reranker)
