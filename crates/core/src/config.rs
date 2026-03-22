@@ -42,12 +42,16 @@ pub struct SearchConfig {
 /// Reranker configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RerankerConfig {
-    /// Reranker provider: "jina", "cohere", "voyage", or absent for auto-detect.
+    /// Reranker provider: "jina", "cohere", "voyage", "local", or absent for auto-detect.
     #[serde(default)]
     pub provider: Option<String>,
     /// Environment variable name for the API key (default: auto-detect per provider).
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Path to local ONNX model directory (for provider = "local").
+    /// If absent, uses default cache directory.
+    #[serde(default)]
+    pub model_dir: Option<String>,
 }
 
 /// Query expansion configuration.

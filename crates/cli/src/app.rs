@@ -175,9 +175,21 @@ where
     if let Some(ref provider_name) = config.search.reranker.provider {
         if provider_name == "local" {
             // Explicit local reranker via config.
-            match skelesearch_rerank_local::LocalReranker::default_model() {
+            let result = if let Some(ref dir) = config.search.reranker.model_dir {
+                // Expand ~ to home directory
+                let expanded = if dir.starts_with("~/") {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    std::path::PathBuf::from(home).join(&dir[2..])
+                } else {
+                    std::path::PathBuf::from(dir)
+                };
+                skelesearch_rerank_local::LocalReranker::new(&expanded)
+            } else {
+                skelesearch_rerank_local::LocalReranker::default_model()
+            };
+            match result {
                 Ok(r) => {
-                    tracing::info!("local reranker enabled (explicit config)");
+                    tracing::info!("local reranker enabled");
                     searcher.with_reranker(Box::new(r))
                 }
                 Err(e) => {
