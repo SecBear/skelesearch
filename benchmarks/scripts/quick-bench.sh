@@ -10,10 +10,14 @@ set -euo pipefail
 # For coding agents: run after changes to verify no regression.
 # Exit code 0 = pass, 1 = regression, 2 = setup error.
 #
+# Performance: dataset is cached to benchmarks/data/contextbench.parquet after
+# the first run (~14s). With --cached-only, skips git checkout and re-index,
+# reducing per-instance time from 26-300s → ~2s.
+#
 # Usage:
 #   ./benchmarks/scripts/quick-bench.sh                # 10 instances, ~15s
 #   ./benchmarks/scripts/quick-bench.sh --n 20          # more instances
-#   ./benchmarks/scripts/quick-bench.sh --cached-only   # skip cloning new repos
+#   ./benchmarks/scripts/quick-bench.sh --cached-only   # skip cloning + reindex
 #   ./benchmarks/scripts/quick-bench.sh --lang rust     # Rust instances only
 #   ./benchmarks/scripts/quick-bench.sh --full          # all cached instances
 
@@ -35,14 +39,19 @@ if [[ ! -x "$BINARY" ]]; then
   exit 2
 fi
 
+# VOYAGE_API_KEY is required for search unless repos are indexed with fastembed.
 if [[ -z "${VOYAGE_API_KEY:-}" ]]; then
-  echo "ERROR: VOYAGE_API_KEY not set (needed for fast Voyage embedding)"
-  exit 2
+  echo "WARNING: VOYAGE_API_KEY not set. Search may fail if repos are indexed with Voyage."
+  echo "  Set VOYAGE_API_KEY or re-index repos with: skelesearch index <repo> --provider fastembed"
 fi
 
-exec uv run --with datasets --with huggingface_hub \
+# Data cache: parquet file avoids 14s HuggingFace download on repeated runs.
+DATA_CACHE="$(dirname "$0")/../data/contextbench.parquet"
+
+exec uv run --with datasets --with huggingface_hub --with pandas --with pyarrow \
   python3 "$(dirname "$0")/quick_bench.py" \
   --binary "$BINARY" \
   --provider voyage \
   --cache-dir "$(dirname "$0")/../swebench-repos" \
+  --data-cache "$DATA_CACHE" \
   "${ARGS[@]}"

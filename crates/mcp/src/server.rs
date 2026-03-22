@@ -73,12 +73,14 @@ impl EmbedProvider for ArcProvider {
 /// The only tricky one is the manifest: `ManifestStore` wraps a raw SQLite pointer
 /// and is therefore `!Sync`.  We avoid this by storing the manifest's file path
 /// and opening a fresh connection per index operation rather than sharing one.
+/// Type alias for the concrete searcher used by the MCP server.
+type CachedSearcher = Searcher<CozoBackend, ArcProvider>;
+
 #[derive(Clone)]
 pub struct SkeleSearchServer {
     backend: Arc<CozoBackend>,
     /// Path to the manifest SQLite database; opened fresh per index_codebase call.
     manifest_path: Arc<PathBuf>,
-    /// Provider used for query embedding in `search_code`.
     /// Provider used for query embedding in `search_code`.  Wrapped in an
     /// RwLock so `run_index` can promote it to the real provider after a
     /// successful indexing run without requiring a full server restart.
@@ -87,6 +89,10 @@ pub struct SkeleSearchServer {
     /// Tracks content hashes seen per session for dedup.
     /// TODO: add periodic cleanup for long-running servers (sessions accumulate in memory).
     sessions: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    /// Cached searcher — built once on first search, invalidated after indexing.
+    /// Keeps the LRU query-embedding cache and TCP connection pool alive across
+    /// MCP calls, eliminating cold TLS handshakes and redundant embed API calls.
+    cached_searcher: Arc<tokio::sync::RwLock<Option<Arc<CachedSearcher>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +124,7 @@ impl SkeleSearchServer {
             provider: Arc::new(RwLock::new(ArcProvider::new(provider))),
             tool_router: Self::tool_router(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -274,6 +281,58 @@ impl SkeleSearchServer {
         (expander, reranker)
     }
 
+    /// Return a cached Searcher or build one on the first call.
+    /// The searcher is invalidated (cache cleared) after indexing so
+    /// provider changes and config changes are picked up.
+    async fn get_or_build_searcher(&self) -> anyhow::Result<Arc<CachedSearcher>> {
+        // Fast path: cached searcher exists.
+        {
+            let guard = self.cached_searcher.read().await;
+            if let Some(ref s) = *guard {
+                return Ok(Arc::clone(s));
+            }
+        }
+
+        // Slow path: build and cache.
+        let mut guard = self.cached_searcher.write().await;
+        // Double-check after acquiring write lock.
+        if let Some(ref s) = *guard {
+            return Ok(Arc::clone(s));
+        }
+
+        let provider = self.prepare_search_provider().await?;
+        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
+        let (expander, reranker) = self.auto_configure_pipeline();
+        let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
+        let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
+        // Apply pagerank_boost and tuning from project config.
+        let searcher = {
+            let root = self.backend.list_indexed_paths().await
+                .ok()
+                .and_then(|p| common_ancestor(&p))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let config = Config::load(&root).unwrap_or_default();
+            let searcher = searcher.with_search_tuning(&config);
+            if config.search.pagerank_boost == Some(false) {
+                searcher.with_pagerank_boost(false)
+            } else {
+                searcher
+            }
+        };
+
+        tracing::info!("searcher built and cached (LRU + connection pool will be reused)");
+        let arc = Arc::new(searcher);
+        *guard = Some(Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// Invalidate the cached searcher (call after indexing).
+    async fn invalidate_searcher_cache(&self) {
+        let mut guard = self.cached_searcher.write().await;
+        *guard = None;
+        tracing::info!("searcher cache invalidated");
+    }
+
     /// Semantic + FTS hybrid search.
     ///
     /// Returns an error when the index is empty (via `prepare_search_provider`).
@@ -282,24 +341,7 @@ impl SkeleSearchServer {
         &self,
         input: SearchCodeInput,
     ) -> anyhow::Result<SearchCodeResponse> {
-        let provider = self.prepare_search_provider().await?;
-        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
-        let (expander, reranker) = self.auto_configure_pipeline();
-        let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
-        let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
-        // Apply pagerank_boost preference from project config if detectable.
-        let searcher = {
-            let root = self.backend.list_indexed_paths().await
-                .ok()
-                .and_then(|p| common_ancestor(&p))
-                .unwrap_or_else(|| std::path::PathBuf::from("/"));
-            let config = Config::load(&root).unwrap_or_default();
-            if config.search.pagerank_boost == Some(false) {
-                searcher.with_pagerank_boost(false)
-            } else {
-                searcher
-            }
-        };
+        let searcher = self.get_or_build_searcher().await?;
         let top_k = input.top_k.max(1);
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
@@ -424,6 +466,10 @@ impl SkeleSearchServer {
         // server never holds a provider for a failed/partial index.
         *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = provider;
 
+        // Invalidate cached searcher so the next search picks up the new provider
+        // and any config changes from the freshly indexed project.
+        self.invalidate_searcher_cache().await;
+
         Ok(IndexCodebaseOutput {
             status: "ok".to_string(),
             indexed: result.indexed_files,
@@ -466,8 +512,7 @@ impl SkeleSearchServer {
         &self,
         input: GetFileContextInput,
     ) -> anyhow::Result<FileContextOutput> {
-        let provider = self.provider.read().map_err(|_| anyhow::anyhow!("provider lock poisoned"))?.clone();
-        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
+        let searcher = self.get_or_build_searcher().await?;
         let ctx = match searcher.file_context(&input.file_path).await {
             Ok(c) => c,
             Err(ref e) if is_uninitialized_index_error(e) => {
