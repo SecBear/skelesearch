@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Local ONNX cross-encoder reranker for skelesearch"
 
+[features]
+default = []
+coreml = ["ort/coreml"]
+cuda = ["ort/cuda"]
+
 [dependencies]
 skelesearch-core = { path = "../core" }
 ort = { version = "=2.0.0-rc.11", features = ["ndarray"] }

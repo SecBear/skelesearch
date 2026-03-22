@@ -173,22 +173,36 @@ where
 
     // Reranker: explicit config wins; fall back to env-var auto-detect.
     if let Some(ref provider_name) = config.search.reranker.provider {
-        let key_env = config.search.reranker.api_key_env.as_deref().unwrap_or(
-            match provider_name.as_str() {
-                "jina"   => "JINA_API_KEY",
-                "cohere" => "COHERE_API_KEY",
-                "voyage" => "VOYAGE_API_KEY",
-                _        => "RERANKER_API_KEY",
-            },
-        );
-        match std::env::var(key_env).ok().filter(|k| !k.is_empty()) {
-            Some(key) => match skelesearch_rerank_api::reranker_from_name(provider_name, key) {
-                Ok(r)  => searcher.with_reranker(Box::new(r)),
-                Err(e) => { tracing::warn!("reranker init failed: {e}"); searcher }
-            },
-            None => {
-                tracing::warn!("reranker configured as '{provider_name}' but {key_env} not set");
-                searcher
+        if provider_name == "local" {
+            // Explicit local reranker via config.
+            match skelesearch_rerank_local::LocalReranker::default_model() {
+                Ok(r) => {
+                    tracing::info!("local reranker enabled (explicit config)");
+                    searcher.with_reranker(Box::new(r))
+                }
+                Err(e) => {
+                    tracing::warn!("local reranker failed to load: {e}");
+                    searcher
+                }
+            }
+        } else {
+            let key_env = config.search.reranker.api_key_env.as_deref().unwrap_or(
+                match provider_name.as_str() {
+                    "jina"   => "JINA_API_KEY",
+                    "cohere" => "COHERE_API_KEY",
+                    "voyage" => "VOYAGE_API_KEY",
+                    _        => "RERANKER_API_KEY",
+                },
+            );
+            match std::env::var(key_env).ok().filter(|k| !k.is_empty()) {
+                Some(key) => match skelesearch_rerank_api::reranker_from_name(provider_name, key) {
+                    Ok(r)  => searcher.with_reranker(Box::new(r)),
+                    Err(e) => { tracing::warn!("reranker init failed: {e}"); searcher }
+                },
+                None => {
+                    tracing::warn!("reranker configured as '{provider_name}' but {key_env} not set");
+                    searcher
+                }
             }
         }
     } else {

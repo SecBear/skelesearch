@@ -121,7 +121,29 @@ impl LocalReranker {
             tokenizer_path.display()
         );
 
-        let session = Session::builder()?
+        let mut builder = Session::builder()?;
+
+        // Register hardware-accelerated execution providers when feature-enabled.
+        // CoreML targets Apple Neural Engine / GPU; CUDA targets NVIDIA GPUs.
+        // If registration fails (e.g. no compatible hardware), fall back to CPU.
+        #[cfg(feature = "coreml")]
+        {
+            use ort::execution_providers::CoreMLExecutionProvider;
+            builder = builder.with_execution_providers([
+                CoreMLExecutionProvider::default().build()
+            ])?;
+            tracing::info!("CoreML execution provider registered");
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use ort::execution_providers::CUDAExecutionProvider;
+            builder = builder.with_execution_providers([
+                CUDAExecutionProvider::default().build()
+            ])?;
+            tracing::info!("CUDA execution provider registered");
+        }
+
+        let session = builder
             .commit_from_file(&model_path)
             .with_context(|| format!("failed to load ONNX model: {}", model_path.display()))?;
 
