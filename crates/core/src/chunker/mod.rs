@@ -53,8 +53,8 @@ impl Chunker {
     pub fn chunk_file(&self, rel_path: &str, source: &str) -> anyhow::Result<Vec<ParsedChunk>> {
         let ext = extension_of(rel_path);
         match config_for_extension(ext) {
-            Some(cfg) => self.chunk_tier1(cfg.as_ref(), source),
-            None => self.chunk_tier2(source),
+            Some(cfg) => self.chunk_tier1(cfg.as_ref(), rel_path, source),
+            None => self.chunk_tier2(rel_path, source),
         }
     }
 
@@ -127,6 +127,7 @@ impl Chunker {
     fn chunk_tier1(
         &self,
         cfg: &dyn languages::LanguageConfig,
+        rel_path: &str,
         source: &str,
     ) -> anyhow::Result<Vec<ParsedChunk>> {
         let language = cfg.language();
@@ -141,7 +142,7 @@ impl Chunker {
                 ParsedChunk {
                     chunk_idx: idx,
                     content: chunk_text.to_string(),
-                    normalized: normalize_for_fts(chunk_text),
+                    normalized: format!("{rel_path} code {}", normalize_for_fts(chunk_text)),
                     chunk_type: "code".to_string(),
                     start_line,
                     end_line,
@@ -156,7 +157,7 @@ impl Chunker {
             return Ok(vec![ParsedChunk {
                 chunk_idx: 0,
                 content: source.to_string(),
-                normalized: normalize_for_fts(source),
+                normalized: format!("{rel_path} code {}", normalize_for_fts(source)),
                 chunk_type: "code".to_string(),
                 start_line: 1,
                 end_line: line_count,
@@ -166,7 +167,7 @@ impl Chunker {
         Ok(chunks)
     }
 
-    fn chunk_tier2(&self, source: &str) -> anyhow::Result<Vec<ParsedChunk>> {
+    fn chunk_tier2(&self, rel_path: &str, source: &str) -> anyhow::Result<Vec<ParsedChunk>> {
         let splitter = TextSplitter::new(CHUNK_BUDGET);
         let chunks: Vec<ParsedChunk> = splitter
             .chunks(source)
@@ -176,7 +177,7 @@ impl Chunker {
                 ParsedChunk {
                     chunk_idx: idx,
                     content: chunk_text.to_string(),
-                    normalized: normalize_for_fts(chunk_text),
+                    normalized: format!("{rel_path} text {}", normalize_for_fts(chunk_text)),
                     chunk_type: "text".to_string(),
                     start_line,
                     end_line,
@@ -189,7 +190,7 @@ impl Chunker {
             return Ok(vec![ParsedChunk {
                 chunk_idx: 0,
                 content: source.to_string(),
-                normalized: normalize_for_fts(source),
+                normalized: format!("{rel_path} text {}", normalize_for_fts(source)),
                 chunk_type: "text".to_string(),
                 start_line: 1,
                 end_line: line_count,
