@@ -1,0 +1,15 @@
+# Ablation: Voyage embed + reranker + graph, but NO LLM expansion.
+# Isolates the query expansion contribution.
+
+[index]
+symbol_enrichment = true
+
+[search.reranker]
+provider = "voyage"
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = true
+max_depth = 1

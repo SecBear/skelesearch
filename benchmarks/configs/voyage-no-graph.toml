@@ -1,0 +1,14 @@
+# Ablation: Voyage embed + reranker + expansion, but NO graph augmentation.
+# Isolates the import/call graph contribution.
+
+[index]
+symbol_enrichment = true
+
+[search.reranker]
+provider = "voyage"
+
+[search.expansion]
+enabled = true
+
+[search.graph]
+enabled = false

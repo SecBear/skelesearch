@@ -155,6 +155,9 @@ pub struct Searcher<B, P> {
     /// Optional LLM-based query expander that enriches conceptual queries with
     /// code-vocabulary keywords before BM25 matching.  `None` skips expansion.
     expander: Option<Box<dyn QueryExpander>>,
+    /// Whether to apply the log-dampened PageRank score boost.  Enabled by
+    /// default; set to `false` via `with_pagerank_boost(false)` to ablate.
+    pagerank_boost: bool,
     /// LRU cache for query embeddings.  Bounded at 256 entries.
     ///
     /// ASSUMPTION: `provider` is fixed at construction time, so cached
@@ -170,10 +173,18 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             provider,
             reranker: None,
             expander: None,
+            pagerank_boost: true,
             query_embed_cache: std::sync::Mutex::new(
                 lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
             ),
         }
+    }
+
+    /// Set whether the log-dampened PageRank score boost is applied.
+    /// Pass `false` to disable for ablation benchmarks.
+    pub fn with_pagerank_boost(mut self, enabled: bool) -> Self {
+        self.pagerank_boost = enabled;
+        self
     }
 
     /// Attach an LLM-based query expander.  Called once at construction time;
@@ -359,7 +370,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // PageRank boost: structurally important files get a mild score uplift.
         // Log-dampened to prevent hub files from dominating all queries.
         // Applied before graph augmentation so expanded hits inherit consistent scaling.
-        {
+        // Gated on `self.pagerank_boost` so benchmarks can ablate this signal.
+        if self.pagerank_boost {
             let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
             let ranks = self.backend.get_file_ranks(&file_paths).await.unwrap_or_default();
             if !ranks.is_empty() {
@@ -401,7 +413,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         if include_graph && max_depth > 0 {
             let graph_start = std::time::Instant::now();
             let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
-            hits = self.augment_with_graph(hits, max_depth, best_score).await?;
+            hits = self.augment_with_graph(hits, max_depth, best_score, &query_vec).await?;
             timings.graph_ms = graph_start.elapsed().as_millis() as u64;
         }
 
@@ -577,15 +589,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
     /// Extend `hits` with chunks from files reachable via resolved import edges.
     ///
-    /// Graph-expanded results are scored using depth-decay: `best_score * 0.6 * 0.7^depth`.
-    /// Depth 1 → 0.42×, depth 2 → 0.29×, depth 3 → 0.21×.  This ensures closer
-    /// transitive imports score higher than distant ones while all graph results
-    /// rank below direct hits.
+    /// Graph-expanded results are scored using `cosine_sim × 0.7^depth × best_score`.
+    /// Chunks with cosine similarity < 0.25 to the query are dropped to prevent result
+    /// flooding from tangentially related imported files.
     async fn augment_with_graph(
         &self,
         mut hits: Vec<SearchResult>,
         max_depth: usize,
         best_score: f64,
+        query_vec: &[f32],
     ) -> anyhow::Result<Vec<SearchResult>> {
         let present: std::collections::HashSet<String> =
             hits.iter().map(|h| h.file_path.clone()).collect();
@@ -631,16 +643,28 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let graph_file_list: Vec<&str> = depth_map.keys().map(|s| s.as_str()).collect();
         let all_graph_chunks = self.backend.get_chunks_for_files(&graph_file_list).await?;
 
-        // Phase 4a: Distribute graph chunks with depth-decay scores.
-        // Depth-decay: 0.6 × 0.7^depth (depth 1 ≈ 0.42, depth 2 ≈ 0.29, depth 3 ≈ 0.21).
+        // Phase 4a: Distribute graph chunks filtered by query relevance.
+        // Chunks with cosine similarity < 0.25 are discarded to avoid flooding results
+        // with tangentially related code from imported files.
+        // Score = best_score × sim × 0.7^depth (closer import + more relevant = higher score).
+        let pre_graph_count = hits.len();
+        const GRAPH_SIM_THRESHOLD: f64 = 0.25;
         for chunk in all_graph_chunks {
             let key = (chunk.file_path.clone(), chunk.chunk_idx);
             if !seen_chunks.insert(key) {
                 continue;
             }
-            // depth_map is keyed by file_path, so this lookup is always Some.
+            // Skip chunks without embeddings — cannot assess relevance.
+            let emb = match &chunk.embedding {
+                Some(e) if !e.is_empty() => e,
+                _ => continue,
+            };
+            let sim = cosine_sim(query_vec, emb) as f64;
+            if sim < GRAPH_SIM_THRESHOLD {
+                continue;
+            }
             let depth = *depth_map.get(&chunk.file_path).unwrap_or(&1);
-            let score = best_score * 0.6 * 0.7_f64.powi(depth as i32);
+            let score = best_score * sim * 0.7_f64.powi(depth as i32);
             hits.push(SearchResult {
                 file_path: chunk.file_path,
                 chunk_idx: chunk.chunk_idx,
@@ -698,6 +722,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     }
                 }
             }
+        }
+
+        // Cap graph-added results to top 20 to prevent result flooding.
+        // Sort the graph portion by score descending before truncating so the
+        // highest-relevance graph chunks survive.
+        if hits.len() > pre_graph_count + 20 {
+            let graph_part = &mut hits[pre_graph_count..];
+            graph_part.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            hits.truncate(pre_graph_count + 20);
         }
 
         tracing::debug!(

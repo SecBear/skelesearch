@@ -161,6 +161,12 @@ where
 {
     let config = Config::load(root).unwrap_or_default();
 
+    // PageRank boost: disabled when config explicitly sets pagerank_boost = false.
+    let searcher = match config.search.pagerank_boost {
+        Some(false) => searcher.with_pagerank_boost(false),
+        _ => searcher,
+    };
+
     // Query expansion: skip if explicitly disabled; otherwise attach LLMExpander
     // when OPENAI_API_KEY is available.
     let searcher = match config.search.expansion.enabled {

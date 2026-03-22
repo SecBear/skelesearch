@@ -19,6 +19,8 @@ Notably:
   It documents CozoDB's Datalog patterns, index features, anti-patterns, and performance
   guidelines. Every past bug in this area (wrong column names, O(N) query loops, missed
   parallelism) would have been prevented by reading this document.
+- **When you encounter a CozoDB limitation or workaround**, document it in `docs/cozodb-limitations.md`.
+  That document is the spec for what a replacement database must solve. Keep it current.
 - SPLADE is intentionally absent from v1 (see ADR-003). Research is in `docs/future-improvements.md`.
 - Embedding dimensions are runtime-configurable — do not hardcode them anywhere.
 

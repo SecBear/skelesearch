@@ -1,0 +1,12 @@
+# Ablation: Voyage embed only, NO reranker, NO expansion, NO graph.
+# Pure "good embeddings + hybrid BM25/HNSW" — skelesearch's retrieval
+# without any of its differentiating features.
+
+[index]
+symbol_enrichment = true
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = false
