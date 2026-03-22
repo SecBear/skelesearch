@@ -1,26 +1,18 @@
 [
   {
-    "query": "How does Hono dispatch an incoming request to the matched route handler",
+    "query": "Hono dispatch route match handler middleware chain Context",
     "expected_files": [
       "src/hono-base.ts"
     ],
-    "category": "implementation",
+    "category": "keyword_code",
     "notes": "The private dispatch method resolves the route, creates Context, and executes the middleware chain."
-  },
-  {
-    "query": "Where is middleware composition implemented and how does it call next",
-    "expected_files": [
-      "src/compose.ts"
-    ],
-    "category": "implementation",
-    "notes": "compose.ts implements koa style recursive dispatch and guards against double next calls."
   },
   {
     "query": "What is the Context class and how does it produce HTTP responses",
     "expected_files": [
       "src/context.ts"
     ],
-    "category": "symbol_lookup",
+    "category": "symbol",
     "notes": "Context wraps Request and exposes text/json/html/body/redirect/newResponse helpers."
   },
   {
@@ -28,7 +20,7 @@
     "expected_files": [
       "src/router/smart-router/router.ts"
     ],
-    "category": "architecture",
+    "category": "conceptual",
     "notes": "SmartRouter tries candidate routers and selects the first that can build the route set."
   },
   {
@@ -46,16 +38,16 @@
       "src/http-exception.ts",
       "src/hono-base.ts"
     ],
-    "category": "error_handling",
+    "category": "cross_file",
     "notes": "HTTPException exposes getResponse and the default error handler knows how to use it."
   },
   {
-    "query": "How does the trie router match URL paths and extract named parameters",
+    "query": "TrieRouter match URL path named parameter node extraction",
     "expected_files": [
       "src/router/trie-router/router.ts",
       "src/router/trie-router/node.ts"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How does the RegExp router compile a trie into a single regular expression for route matching",
@@ -64,28 +56,28 @@
       "src/router/reg-exp-router/trie.ts",
       "src/router/reg-exp-router/matcher.ts"
     ],
-    "category": "implementation"
+    "category": "cross_file"
   },
   {
-    "query": "How does the request validator extract and validate data from JSON form query and header targets",
+    "query": "validator extract JSON form query header target validate",
     "expected_files": [
       "src/validator/validator.ts"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the CORS middleware handle preflight OPTIONS requests and origin matching",
+    "query": "CORS preflight OPTIONS origin matching Access-Control headers",
     "expected_files": [
       "src/middleware/cors/index.ts"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does JWT token verification work with both Authorization header and cookie sources",
+    "query": "JWT verify token Authorization header cookie middleware",
     "expected_files": [
       "src/middleware/jwt/jwt.ts"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How does basic auth implement timing-safe password comparison",
@@ -96,12 +88,12 @@
     "category": "cross_file"
   },
   {
-    "query": "How does the server-sent events streaming helper format and send SSE messages",
+    "query": "SSE StreamingApi format send event data stream response",
     "expected_files": [
       "src/helper/streaming/sse.ts",
       "src/helper/streaming/stream.ts"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How do the middleware combinators some every and except compose multiple middleware functions",
@@ -132,28 +124,21 @@
     "expected_files": [
       "src/request.ts"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "What functions does the html utility expose for escaping and tagging template literals",
     "expected_files": [
       "src/utils/html.ts"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "What types does types.ts export for defining Hono route handlers and middleware",
     "expected_files": [
       "src/types.ts"
     ],
-    "category": "symbol_lookup"
-  },
-  {
-    "query": "What is the LinearRouter and how does it differ from the TrieRouter for route matching",
-    "expected_files": [
-      "src/router/linear-router/router.ts"
-    ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "How does Hono support multiple runtime targets through its adapter-based architecture",
@@ -162,14 +147,14 @@
       "src/adapter/bun/index.ts",
       "src/adapter/deno/index.ts"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
-    "query": "How does the factory helper create typed route groups with shared middleware and environment",
+    "query": "factory createApp typed route group shared middleware env",
     "expected_files": [
       "src/helper/factory/index.ts"
     ],
-    "category": "architecture"
+    "category": "keyword_code"
   },
   {
     "query": "How does the preset system compose routers and middleware for quick and tiny Hono builds",
@@ -177,63 +162,49 @@
       "src/preset/quick.ts",
       "src/preset/tiny.ts"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
-    "query": "How does the pattern router match routes using an ordered list of patterns without a trie",
+    "query": "PatternRouter ordered list match route pattern scan",
     "expected_files": [
       "src/router/pattern-router/router.ts"
     ],
-    "category": "architecture"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the body-limit middleware enforce request size limits and abort oversized uploads",
+    "query": "body-limit middleware size limit abort oversized upload stream",
     "expected_files": [
       "src/middleware/body-limit/index.ts"
     ],
-    "category": "error_handling"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the ip-restriction middleware block requests from forbidden IP addresses",
+    "query": "ip-restriction block forbidden address allowlist denylist",
     "expected_files": [
       "src/middleware/ip-restriction/index.ts"
     ],
-    "category": "error_handling"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the timeout middleware cancel long-running handlers and return a 408 response",
+    "query": "timeout middleware cancel handler 408 AbortController",
     "expected_files": [
       "src/middleware/timeout/index.ts"
     ],
-    "category": "error_handling"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the cache middleware determine TTL and decide which responses to store",
+    "query": "cache middleware TTL determine store response Cache-Control",
     "expected_files": [
       "src/middleware/cache/index.ts"
     ],
-    "category": "config_init"
-  },
-  {
-    "query": "How does the CSRF middleware validate tokens and configure which HTTP methods require protection",
-    "expected_files": [
-      "src/middleware/csrf/index.ts"
-    ],
-    "category": "config_init"
-  },
-  {
-    "query": "How does the language middleware detect the preferred client locale from Accept-Language headers",
-    "expected_files": [
-      "src/middleware/language/index.ts"
-    ],
-    "category": "config_init"
+    "category": "keyword_code"
   },
   {
     "query": "What is context storage in Hono and how does it let middleware share data without prop drilling",
     "expected_files": [
       "src/middleware/context-storage/index.ts"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
     "query": "What is the ETag middleware and how does it compute and compare entity tags for caching",
@@ -241,56 +212,28 @@
       "src/middleware/etag/index.ts",
       "src/middleware/etag/digest.ts"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
     "query": "What is a Hono app's fetch handler and how do runtimes invoke it as a web-standard entry point",
     "expected_files": [
       "src/hono-base.ts"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
-    "query": "How does the cookie utility parse and serialize Set-Cookie header attributes including SameSite and Secure",
+    "query": "cookie utility parse serialize Set-Cookie SameSite Secure",
     "expected_files": [
       "src/utils/cookie.ts"
     ],
-    "category": "utility_helper"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the compress middleware select between gzip and deflate encoding based on Accept-Encoding",
+    "query": "compress middleware gzip deflate Accept-Encoding selection",
     "expected_files": [
       "src/middleware/compress/index.ts"
     ],
-    "category": "utility_helper"
-  },
-  {
-    "query": "How does the SSG helper generate static HTML files by crawling Hono route handlers",
-    "expected_files": [
-      "src/helper/ssg/ssg.ts"
-    ],
-    "category": "utility_helper"
-  },
-  {
-    "query": "How does the proxy helper forward requests upstream and rewrite response headers",
-    "expected_files": [
-      "src/helper/proxy/index.ts"
-    ],
-    "category": "utility_helper"
-  },
-  {
-    "query": "How does bearer auth middleware extract and validate tokens from the Authorization header",
-    "expected_files": [
-      "src/middleware/bearer-auth/index.ts"
-    ],
-    "category": "implementation"
-  },
-  {
-    "query": "How does the Cloudflare Pages adapter handle function routing and serve the Hono app",
-    "expected_files": [
-      "src/adapter/cloudflare-pages/handler.ts"
-    ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How does the Vercel adapter bridge Hono responses to Vercel edge function response format",
@@ -299,5 +242,71 @@
       "src/adapter/vercel/conninfo.ts"
     ],
     "category": "cross_file"
+  },
+  {
+    "query": "Hono class constructor app use route fetch handler",
+    "expected_files": [
+      "src/hono-base.ts"
+    ],
+    "category": "symbol",
+    "notes": "HonoBase class: constructor, use(), get/post/put/delete(), fetch() entry point"
+  },
+  {
+    "query": "HTTPException status message getResponse constructor",
+    "expected_files": [
+      "src/http-exception.ts"
+    ],
+    "category": "symbol",
+    "notes": "HTTPException extends Error; holds status code and optional Response override"
+  },
+  {
+    "query": "Router interface add match routes result type",
+    "expected_files": [
+      "src/types.ts"
+    ],
+    "category": "symbol",
+    "notes": "Router<T> interface: add(method, path, handler[]) and match(method, path) signatures"
+  },
+  {
+    "query": "compose fn Next dispatch middleware chain execution",
+    "expected_files": [
+      "src/compose.ts"
+    ],
+    "category": "symbol",
+    "notes": "compose() returns a ComposedMiddleware; implements koa-style recursive next() dispatch"
+  },
+  {
+    "query": "StreamingApi write writeln pipe SSE stream helper",
+    "expected_files": [
+      "src/helper/streaming/stream.ts"
+    ],
+    "category": "symbol",
+    "notes": "StreamingApi wraps ReadableStream with write/pipe/abort helpers"
+  },
+  {
+    "query": "TrieNode children wildcard param insert lookup",
+    "expected_files": [
+      "src/router/trie-router/node.ts"
+    ],
+    "category": "symbol",
+    "notes": "TrieNode holds child map, param/wildcard slots, and handlers array"
+  },
+  {
+    "query": "middleware use handler next app chain usage example",
+    "expected_files": [
+      "src/hono-base.ts",
+      "src/compose.ts"
+    ],
+    "category": "example",
+    "notes": "Shows app.use() middleware registration and how compose() runs the chain"
+  },
+  {
+    "query": "hc typed RPC client endpoint call usage example",
+    "expected_files": [
+      "src/client/client.ts",
+      "src/client/types.ts"
+    ],
+    "category": "example",
+    "notes": "hc() creates a typed client; Proxy maps endpoint types to fetch calls"
   }
 ]

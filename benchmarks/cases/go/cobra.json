@@ -1,17 +1,17 @@
 [
   {
-    "query": "How does cobra execute a command and resolve subcommands from arguments",
+    "query": "Command Execute traverse subcommands args resolve dispatch",
     "expected_files": [
       "command.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "Where are persistent flags merged and inherited by child commands",
+    "query": "persistent flags merge inherit parent FParseErrWhitelist child",
     "expected_files": [
       "command.go"
     ],
-    "category": "cross_file"
+    "category": "keyword_code"
   },
   {
     "query": "How does cobra render help text and usage output for a command",
@@ -19,21 +19,14 @@
       "command.go",
       "cobra.go"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
-    "query": "What positional argument validators does cobra provide",
-    "expected_files": [
-      "args.go"
-    ],
-    "category": "symbol_lookup"
-  },
-  {
-    "query": "How are mutually exclusive and required together flag groups validated",
+    "query": "flag_groups mutually exclusive required together validation",
     "expected_files": [
       "flag_groups.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "Where is shell completion logic for generating bash and fish scripts",
@@ -45,26 +38,18 @@
     "category": "cross_file"
   },
   {
-    "query": "How does cobra generate zsh shell completion scripts with directive handling",
+    "query": "zsh completion script directive _cobra function generation",
     "expected_files": [
       "zsh_completions.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does cobra generate PowerShell completion scripts supporting multiple completion modes",
+    "query": "PowerShell completion script PSCompletions mode generation",
     "expected_files": [
       "powershell_completions.go"
     ],
-    "category": "implementation"
-  },
-  {
-    "query": "How does cobra suggest corrections for mistyped command names",
-    "expected_files": [
-      "command.go",
-      "cobra.go"
-    ],
-    "category": "utility_helper"
+    "category": "keyword_code"
   },
   {
     "query": "How does cobra generate man pages from command definitions",
@@ -72,15 +57,15 @@
       "doc/man_docs.go",
       "doc/util.go"
     ],
-    "category": "implementation"
+    "category": "cross_file"
   },
   {
-    "query": "How does cobra generate markdown documentation for the command tree",
+    "query": "GenMarkdown command tree md_docs documentation generation",
     "expected_files": [
       "doc/md_docs.go",
       "doc/util.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How does the ActiveHelp system provide real-time help during shell completion",
@@ -88,7 +73,7 @@
       "active_help.go",
       "completions.go"
     ],
-    "category": "implementation"
+    "category": "cross_file"
   },
   {
     "query": "What is the command execution lifecycle order including persistent pre and post run hooks",
@@ -96,99 +81,92 @@
       "command.go",
       "cobra.go"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
-    "query": "How does cobra handle the Windows mousetrap for CLI programs launched from Explorer",
+    "query": "Windows mousetrap Explorer launch pause command_win",
     "expected_files": [
       "command_win.go",
       "command_notwin.go"
     ],
-    "category": "config_init"
+    "category": "keyword_code"
   },
   {
-    "query": "How does cobra mark flags as required or restrict them to filename and directory completion",
+    "query": "flags required filename directory annotation completion",
     "expected_files": [
       "shell_completions.go",
       "completions.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the completion engine resolve flag value completions and ValidArgsFunction callbacks",
+    "query": "ValidArgsFunction callback flag value completion resolve",
     "expected_files": [
       "completions.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "What types and constants define CompletionDirective values in cobra",
     "expected_files": [
       "completions.go"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "Where is the Command struct defined and what fields configure its behavior",
     "expected_files": [
       "command.go"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "What PositionalArgs type and built-in validator functions are defined in cobra",
     "expected_files": [
       "args.go"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
-    "query": "How does cobra generate bash v1 completion scripts using the legacy approach",
+    "query": "bash completions legacy v1 script generation file",
     "expected_files": [
       "bash_completions.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does cobra generate reStructuredText documentation for a command tree",
+    "query": "reStructuredText rst GenReSTTree command documentation",
     "expected_files": [
       "doc/rest_docs.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does cobra generate YAML documentation for commands and subcommands",
+    "query": "GenYamlTree YAML documentation command subcommand",
     "expected_files": [
       "doc/yaml_docs.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does cobra validate that required flags were provided before executing a command",
+    "query": "validateRequiredFlags required flags provided before execute",
     "expected_files": [
       "flag_groups.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does cobra detect and handle the --version flag to print version information",
+    "query": "version flag detect versionTemplate print command",
     "expected_files": [
       "command.go"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How does the cobra completion system wire the core completions.go engine with fish_completions.go",
     "expected_files": [
       "completions.go",
       "fish_completions.go"
-    ],
-    "category": "cross_file"
-  },
-  {
-    "query": "How do persistent pre-run and post-run hooks traverse the command parent chain during execution",
-    "expected_files": [
-      "command.go"
     ],
     "category": "cross_file"
   },
@@ -215,7 +193,7 @@
       "bash_completionsV2.go",
       "zsh_completions.go"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
     "query": "What responsibilities do cobra.go and command.go each own in the cobra package",
@@ -223,7 +201,7 @@
       "cobra.go",
       "command.go"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
     "query": "How does cobra separate platform-specific behavior between command_win.go and command_notwin.go",
@@ -231,14 +209,7 @@
       "command_win.go",
       "command_notwin.go"
     ],
-    "category": "architecture"
-  },
-  {
-    "query": "How does cobra report unknown flag errors and mistyped subcommand names to the user",
-    "expected_files": [
-      "command.go"
-    ],
-    "category": "error_handling"
+    "category": "cross_file"
   },
   {
     "query": "What error is returned when positional argument validation fails in cobra",
@@ -246,56 +217,94 @@
       "args.go",
       "command.go"
     ],
-    "category": "error_handling"
-  },
-  {
-    "query": "How does cobra propagate errors from RunE back to the caller and when does it print usage",
-    "expected_files": [
-      "command.go"
-    ],
-    "category": "error_handling"
-  },
-  {
-    "query": "How does cobra configure default output writers for help text and error messages",
-    "expected_files": [
-      "command.go",
-      "cobra.go"
-    ],
-    "category": "config_init"
-  },
-  {
-    "query": "How do global configuration variables like EnableCommandSorting affect cobra behavior",
-    "expected_files": [
-      "cobra.go"
-    ],
-    "category": "config_init"
+    "category": "cross_file"
   },
   {
     "query": "What is a persistent flag in cobra and how does it differ from a local flag",
     "expected_files": [
       "command.go"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
     "query": "What does TraverseChildren mean in cobra and when should it be enabled on a command",
     "expected_files": [
       "command.go"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
-    "query": "Where are Levenshtein distance and command-name suggestion helpers implemented in cobra",
+    "query": "FlagGroup required exclusive oneRequired struct fields",
+    "expected_files": [
+      "flag_groups.go"
+    ],
+    "category": "symbol",
+    "notes": "flagGroup struct: commands, flags; mutuallyExclusiveGroup and requiredAsGroup"
+  },
+  {
+    "query": "cobra.go EnableCommandSorting EnablePrefixMatching globals",
+    "expected_files": [
+      "cobra.go"
+    ],
+    "category": "symbol",
+    "notes": "Package-level vars: EnableCommandSorting, EnablePrefixMatching, MousetrapHelpText"
+  },
+  {
+    "query": "args.go MinimumNArgs MaximumNArgs ExactArgs RangeArgs",
+    "expected_files": [
+      "args.go"
+    ],
+    "category": "symbol",
+    "notes": "PositionalArgs validator constructors: MinimumNArgs(n), ExactArgs(n), RangeArgs(min,max)"
+  },
+  {
+    "query": "CompletionOptions DisableDefaultCmd HiddenDefaultCmd fields",
     "expected_files": [
       "command.go"
     ],
-    "category": "utility_helper"
+    "category": "symbol",
+    "notes": "CompletionOptions struct embedded in Command: DisableDefaultCmd, DisableNoDescFlag"
   },
   {
-    "query": "How does cobra detect whether a command invocation is a tab-completion call versus a normal run",
+    "query": "AppendActiveHelp env variable annotation marker constant",
     "expected_files": [
-      "completions.go"
+      "active_help.go"
     ],
-    "category": "utility_helper"
+    "category": "symbol",
+    "notes": "AppendActiveHelp() appends ACTIVE_HELP marker; env var controls active help"
+  },
+  {
+    "query": "BashCompletionFunction annotation constant shell_completions",
+    "expected_files": [
+      "shell_completions.go"
+    ],
+    "category": "symbol",
+    "notes": "BashCompletionFunction annotation and completion annotation constants"
+  },
+  {
+    "query": "doc util.go printOptions linkHandler tree documentation",
+    "expected_files": [
+      "doc/util.go"
+    ],
+    "category": "symbol",
+    "notes": "doc/util.go: printOptions(), hasSeeAlso(), linkHandler type for doc generators"
+  },
+  {
+    "query": "ValidArgsFunction custom completions command usage example",
+    "expected_files": [
+      "completions.go",
+      "command.go"
+    ],
+    "category": "example",
+    "notes": "Shows Command.ValidArgsFunction assignment and how completions.go invokes it"
+  },
+  {
+    "query": "persistent flag child inheritance usage example command",
+    "expected_files": [
+      "command.go",
+      "flag_groups.go"
+    ],
+    "category": "example",
+    "notes": "PersistentFlags() inheritance across parent/child commands; group annotation pattern"
   }
 ]
