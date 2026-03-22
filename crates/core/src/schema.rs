@@ -29,6 +29,10 @@ pub struct ChunkRecord {
     pub content: String,
     /// Whitespace-normalised version of `content` used for FTS.
     pub normalized: String,
+    /// LLM-generated natural-language summary. Empty when no summary provider was
+    /// attached at index time. The embedding is computed from this field when non-empty,
+    /// from `content` otherwise.
+    pub description: String,
     pub chunk_type: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -267,16 +271,24 @@ impl CozoBackend {
     }
 
     fn row_to_chunk(row: &[DataValue]) -> anyhow::Result<ChunkRecord> {
-        // Column order: file_path, chunk_idx, content, normalized, chunk_type,
-        //               start_line, end_line, embedding
+        // Column order (new schema, PER-130+): file_path, chunk_idx, content, normalized,
+        //   description, chunk_type, start_line, end_line, embedding
+        // Column order (old schema, pre-PER-130): file_path, chunk_idx, content,
+        //   normalized, chunk_type, start_line, end_line, embedding
+        // Old indexes return 8 columns; new return 9.  Detect by length for graceful compat.
         let file_path = Self::str_col(&row[0])?;
         let chunk_idx = Self::int_col(&row[1])? as usize;
         let content = Self::str_col(&row[2])?;
         let normalized = Self::str_col(&row[3])?;
-        let chunk_type = Self::str_col(&row[4])?;
-        let start_line = Self::int_col(&row[5])? as usize;
-        let end_line = Self::int_col(&row[6])? as usize;
-        let embedding = match &row[7] {
+        let (description, chunk_type_idx) = if row.len() >= 9 {
+            (Self::str_col(&row[4]).unwrap_or_default(), 5)
+        } else {
+            (String::new(), 4)
+        };
+        let chunk_type = Self::str_col(&row[chunk_type_idx])?;
+        let start_line = Self::int_col(&row[chunk_type_idx + 1])? as usize;
+        let end_line = Self::int_col(&row[chunk_type_idx + 2])? as usize;
+        let embedding = match &row[chunk_type_idx + 3] {
             DataValue::List(items) if items.is_empty() => None,
             DataValue::List(items) => Some(
                 items
@@ -290,7 +302,7 @@ impl CozoBackend {
             ),
             _ => None,
         };
-        Ok(ChunkRecord { file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding })
+        Ok(ChunkRecord { file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding })
     }
 
     fn str_col(dv: &DataValue) -> anyhow::Result<String> {
@@ -319,7 +331,7 @@ impl CozoBackend {
         let script = format!(
             r#"?[file_path, chunk_idx, bm25, content, chunk_type, start_line, end_line] :=
     ~chunks:text{{ file_path, chunk_idx | query: $qs, k: {limit}, score_kind: 'tf_idf', bind_score: bm25 }},
-    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _]
+    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _]
 :order -bm25
 :limit {limit}"#
         );
@@ -371,7 +383,7 @@ impl CozoBackend {
         let script = format!(
             r#"?[file_path, chunk_idx, dist, content, chunk_type, start_line, end_line] :=
     ~chunks:semantic{{ file_path, chunk_idx | query: $qv, k: {limit}, ef: 64, bind_distance: dist }},
-    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _]
+    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _]
 :order dist
 :limit {limit}"#
         );
@@ -446,7 +458,7 @@ impl StorageBackend for CozoBackend {
         // The embedding field uses CozoDB's fixed-dimension vector type <F32; dim>.
         // The relation is created with the specific dim supplied at initialization time.
         let chunks_schema = format!(
-            ":create chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
+            ":create chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
         );
         self.run_mut_ignore(&chunks_schema)?;
 
@@ -547,6 +559,7 @@ impl StorageBackend for CozoBackend {
                         Self::dv_int(c.chunk_idx as i64),
                         Self::dv_str(&c.content),
                         Self::dv_str(&c.normalized),
+                        Self::dv_str(&c.description),
                         Self::dv_str(&c.chunk_type),
                         Self::dv_int(c.start_line as i64),
                         Self::dv_int(c.end_line as i64),
@@ -565,8 +578,8 @@ impl StorageBackend for CozoBackend {
             p.insert("rows".into(), data);
 
             self.run_mut(
-                "?[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding] <- $rows \
-                 :put chunks { file_path, chunk_idx => content, normalized, chunk_type, start_line, end_line, embedding }",
+                "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] <- $rows \
+                 :put chunks { file_path, chunk_idx => content, normalized, description, chunk_type, start_line, end_line, embedding }",
                 p,
             )?;
         }
@@ -577,7 +590,7 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("fp".into(), Self::dv_str(file_path));
         self.run_mut(
-            "?[file_path, chunk_idx] := *chunks[file_path, chunk_idx, _, _, _, _, _, _], file_path = $fp \
+            "?[file_path, chunk_idx] := *chunks[file_path, chunk_idx, _, _, _, _, _, _, _], file_path = $fp \
              :rm chunks { file_path, chunk_idx }",
             p,
         )?;
@@ -588,8 +601,8 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("fp".into(), Self::dv_str(file_path));
         let rows = self.run_imm(
-            "?[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding] \
-             := *chunks[$fp, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding], \
+            "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] \
+             := *chunks[$fp, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding], \
                 file_path = $fp",
             p,
         )?;
@@ -604,8 +617,8 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("fps".into(), fps);
         let rows = self.run_imm(
-            "?[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding] \
-             := *chunks[file_path, chunk_idx, content, normalized, chunk_type, start_line, end_line, embedding], \
+            "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] \
+             := *chunks[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding], \
              is_in(file_path, $fps)",
             p,
         )?;
@@ -771,8 +784,8 @@ impl StorageBackend for CozoBackend {
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Single round-trip: count total chunks and chunks-with-embeddings together.
         let guard_rows = self.run_imm(
-            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]\n\
-             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)\n\
+            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _]\n\
+             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, emb], !is_null(emb)\n\
              ?[t, e] := total[t], with_emb[e]",
             BTreeMap::new(),
         )?;
@@ -902,9 +915,9 @@ impl StorageBackend for CozoBackend {
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Guard: empty index - nothing to search.
         let guard_rows = self.run_imm(
-            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]
+            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _]
 \
-             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)
+             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, emb], !is_null(emb)
 \
              ?[t, e] := total[t], with_emb[e]",
             BTreeMap::new(),
@@ -984,7 +997,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    *code_edges[file_path, _, target_fp, _, _],
 ",
-                    "    *chunks[file_path, chunk_idx, _, _, _, _, _, emb], !is_null(emb),
+                    "    *chunks[file_path, chunk_idx, _, _, _, _, _, _, emb], !is_null(emb),
 ",
                     "    s = parent_score * {gsf}
 ",
@@ -1006,7 +1019,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    boosted[file_path, chunk_idx, score],
 ",
-                    "    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _],
+                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _],
 ",
                     "    why = 'hybrid'
 ",
@@ -1014,7 +1027,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    graph[file_path, chunk_idx, score],
 ",
-                    "    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _],
+                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _],
 ",
                     "    why = 'graph'
 ",
@@ -1075,7 +1088,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    boosted[file_path, chunk_idx, score],
 ",
-                    "    *chunks[file_path, chunk_idx, content, _, chunk_type, start_line, end_line, _]
+                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _]
 ",
                     ":order -score
 ",
@@ -1162,7 +1175,7 @@ impl StorageBackend for CozoBackend {
         // unwrap_or covers that case.
         let rows = self.run_imm(
             "fc[count(fp)] := *files[fp, _, _, _, _]\n\
-             cc[count(fp)] := *chunks[fp, _, _, _, _, _, _, _]\n\
+             cc[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _]\n\
              ml[max(li)] := *files[_, _, _, li, _]\n\
              ?[f, c, m] := fc[f], cc[c], ml[m]",
             BTreeMap::new(),
@@ -1300,7 +1313,7 @@ impl StorageBackend for CozoBackend {
         p.insert("fps".into(), DataValue::List(unique_fps));
 
         let rows = self.run_imm(
-            "?[fp, ci, emb] := *chunks[fp, ci, _, _, _, _, _, emb], is_in(fp, $fps)",
+            "?[fp, ci, emb] := *chunks[fp, ci, _, _, _, _, _, _, emb], is_in(fp, $fps)",
             p,
         )?;
 

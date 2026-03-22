@@ -63,6 +63,10 @@ pub struct Indexer<B, P> {
     /// Extension allowlist. `None` → use `default_include_extensions()`.
     /// `Some(set)` → only index files whose lowercased extension is in the set.
     include_extensions: Option<HashSet<String>>,
+    /// Optional provider that generates natural-language descriptions of code chunks.
+    /// When set, descriptions are embedded instead of raw code, bridging the
+    /// vocabulary gap between natural-language queries and source code.
+    summary_provider: Option<Box<dyn crate::summary::SummaryProvider>>,
 }
 
 impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
@@ -75,6 +79,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             exclude: vec![],
             symbol_enrichment: true,
             include_extensions: None,
+            summary_provider: None,
         }
     }
 
@@ -110,6 +115,14 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         });
         self
     }
+    /// Attach an LLM summary provider.  When set, each chunk's description is
+    /// generated before embedding; the HNSW index stores description-based
+    /// vectors instead of raw-code vectors.
+    pub fn with_summary_provider(mut self, provider: Box<dyn crate::summary::SummaryProvider>) -> Self {
+        self.summary_provider = Some(provider);
+        self
+    }
+
     /// Walk `root`, detect changed files via the manifest, chunk and embed
     /// them, upsert to the backend, then reconcile deletions/renames.
     ///
@@ -360,26 +373,48 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 vec![Vec::new(); batch_files.len()];
 
             for sub in pending.chunks(self.batch_size) {
-                // --- embedding cache lookup ---
+                // --- 1. Generate descriptions (if summary provider is attached) ---
+                //     Descriptions replace raw code as the embedding target, bridging
+                //     the vocabulary gap between natural-language queries and source code.
+                let descriptions: Vec<String> = if let Some(ref sp) = self.summary_provider {
+                    let code_texts: Vec<String> = sub.iter()
+                        .map(|(_, c)| c.content.clone())
+                        .collect();
+                    sp.summarize_batch(code_texts).await?
+                } else {
+                    vec![String::new(); sub.len()]
+                };
+
+                // --- 2. Build the text to embed for each chunk ---
+                //     When a description is available, embed it (natural language → HNSW).
+                //     When not, use the Anthropic Contextual Retrieval format:
+                //     prepend path + type so the model sees where the chunk lives.
+                let embed_texts: Vec<String> = sub.iter()
+                    .zip(descriptions.iter())
+                    .map(|((fi, chunk), desc)| {
+                        if !desc.is_empty() {
+                            desc.clone()
+                        } else {
+                            let rel_path = &batch_files[*fi].candidate.rel_path;
+                            format!("{} {}\n{}", rel_path, chunk.chunk_type, chunk.content)
+                        }
+                    })
+                    .collect();
+
+                // --- 3. Embedding cache lookup keyed on the actual embed text ---
+                //     Keying on embed_text (not raw content) means description-based
+                //     and raw-code embeddings never collide in the cache.
                 let hashes: Vec<String> =
-                    sub.iter().map(|(_, c)| content_hash(&c.content)).collect();
+                    embed_texts.iter().map(|t| content_hash(t)).collect();
                 let cached = self.manifest.get_cached_embeddings(&hashes, dim)?;
 
-                // Partition into hits and misses; track original sub-indices.
-                // For cache-miss texts, prepend file path context so the embedding
-                // model sees where this chunk lives in the codebase.  This is the
-                // Anthropic Contextual Retrieval pattern: -49% retrieval failure.
+                // Partition into hits and misses.
                 let mut miss_indices: Vec<usize> = Vec::new();
                 let mut miss_texts: Vec<String> = Vec::new();
                 for (i, hit) in cached.iter().enumerate() {
                     if hit.is_none() {
                         miss_indices.push(i);
-                        let (fi, chunk) = &sub[i];
-                        let rel_path = &batch_files[*fi].candidate.rel_path;
-                        miss_texts.push(format!(
-                            "{} {}\n{}",
-                            rel_path, chunk.chunk_type, chunk.content
-                        ));
+                        miss_texts.push(embed_texts[i].clone());
                     }
                 }
 
@@ -412,7 +447,6 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 self.manifest.cache_embeddings(&to_cache)?;
 
                 // Merge cached + fresh into per-original-index embeddings.
-                // cached[i] is Some(hit) or None (miss); fill misses from fresh_embs in order.
                 let mut fresh_iter = fresh_embs.into_iter();
                 let embs: Vec<Vec<f32>> = cached
                     .into_iter()
@@ -422,13 +456,14 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                     })
                     .collect();
 
-                for ((fi, chunk), emb) in sub.iter().zip(embs) {
+                for (idx, ((fi, chunk), emb)) in sub.iter().zip(embs).enumerate() {
                     let fc = batch_files[*fi].candidate;
                     chunk_records_per_file[*fi].push(ChunkRecord {
                         file_path: fc.rel_path.clone(),
                         chunk_idx: chunk.chunk_idx,
                         content: chunk.content.clone(),
                         normalized: chunk.normalized.clone(),
+                        description: descriptions[idx].clone(),
                         chunk_type: chunk.chunk_type.clone(),
                         start_line: chunk.start_line,
                         end_line: chunk.end_line,

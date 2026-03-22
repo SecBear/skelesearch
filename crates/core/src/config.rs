@@ -22,6 +22,11 @@ pub struct IndexConfig {
     /// whose extension appears in this list are indexed.  When absent, the
     /// built-in allowlist in `indexer.rs` is used.
     pub include_extensions: Option<Vec<String>>,
+    /// Generate LLM summaries for each chunk at index time.
+    /// When enabled, the description is embedded instead of raw code, bridging the
+    /// vocabulary gap between natural-language queries and source code.
+    /// Requires `OPENAI_API_KEY` to be set. Default: `false`.
+    pub summarize: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +140,7 @@ impl Default for IndexConfig {
             index_dir: None,
             symbol_enrichment: true,
             include_extensions: None,
+            summarize: false,
         }
     }
 }

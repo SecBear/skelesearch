@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod eval;
+mod summary;
 
 use clap::Parser;
 

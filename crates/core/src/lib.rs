@@ -1,3 +1,6 @@
+pub mod summary;
+pub use summary::{NoopSummaryProvider, OpenAISummaryProvider, SummaryProvider};
+
 pub mod git;
 
 pub mod chunker;
@@ -34,6 +37,3 @@ pub use expander::{LLMExpander, NoopExpander, QueryExpander};
 
 pub mod resolve;
 pub use resolve::{extract_import_path, resolver_for_extension, ImportResolver};
-
-pub mod summary;
-pub use summary::{NoopSummaryProvider, OpenAISummaryProvider, SummaryProvider};

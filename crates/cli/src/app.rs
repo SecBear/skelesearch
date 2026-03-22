@@ -276,6 +276,16 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
         .with_excludes(config.index.exclude.clone())
         .with_include_extensions(config.index.include_extensions.clone())
         .with_symbol_enrichment(config.index.symbol_enrichment);
+    let indexer = if config.index.summarize {
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
+        } else {
+            tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
+            indexer
+        }
+    } else {
+        indexer
+    };
     let start = std::time::Instant::now();
     let result = indexer.index_path(&root).await?;
     let elapsed = start.elapsed();
@@ -559,6 +569,16 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                     .with_excludes(config.index.exclude.clone())
                     .with_include_extensions(config.index.include_extensions.clone())
                     .with_symbol_enrichment(config.index.symbol_enrichment);
+                let indexer = if config.index.summarize {
+                    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                        indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
+                    } else {
+                        tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
+                        indexer
+                    }
+                } else {
+                    indexer
+                };
                 match indexer.index_path(&root).await {
                     Ok(r) => eprintln!(
                         "skelesearch watch: indexed {} file(s) in {}",
@@ -634,6 +654,16 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                                     let indexer = Indexer::new(backend, manifest, provider)
                                         .with_excludes(config.index.exclude.clone())
                                         .with_include_extensions(config.index.include_extensions.clone());
+                                    let indexer = if config.index.summarize {
+                                        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                                            indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
+                                        } else {
+                                            tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
+                                            indexer
+                                        }
+                                    } else {
+                                        indexer
+                                    };
                                     match indexer.index_path(&root).await {
                                         Ok(r) => eprintln!(
                                             "skelesearch watch: re-indexed {} file(s), {} chunk(s)",
