@@ -15,6 +15,10 @@ adding a new retrieval strategy, check whether an ADR already covers that decisi
 Notably:
 - CozoDB is used intentionally despite stalled development (see ADR-002). The mitigation
   is the `StorageBackend` trait in `crates/core/src/schema.rs`.
+- **Before modifying schema.rs, searcher.rs, or indexer.rs:** read `docs/cozodb-patterns.md`.
+  It documents CozoDB's Datalog patterns, index features, anti-patterns, and performance
+  guidelines. Every past bug in this area (wrong column names, O(N) query loops, missed
+  parallelism) would have been prevented by reading this document.
 - SPLADE is intentionally absent from v1 (see ADR-003). Research is in `docs/future-improvements.md`.
 - Embedding dimensions are runtime-configurable — do not hardcode them anywhere.
 
@@ -24,8 +28,13 @@ Notably:
 crates/
   core/               Library — schema, indexer, searcher, chunker, manifest, provider trait
   embed-fastembed/    Optional library — fastembed-rs provider (jina-v2-base-code default)
+  embed-openai/       Optional library — OpenAI embedding provider
+  embed-voyage/       Optional library — Voyage AI embedding provider
   mcp/                Binary — rmcp 0.16 MCP server (stdio transport)
   cli/                Binary — clap CLI
+  rerank-api/         Library — cloud cross-encoder reranker (API-based)
+  rerank-local/       Library — local ONNX cross-encoder reranker (ort)
+  telemetry/          Library — shared tracing setup (fmt + optional OTLP)
 ```
 
 ## Design spec
