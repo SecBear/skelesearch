@@ -50,30 +50,38 @@ def extract_gold_files(instance: dict) -> list[str]:
     return sorted(files)
 
 
-def clone_at_commit(repo: str, commit: str, target_dir: Path, timeout: int = 300) -> bool:
-    """Shallow clone a repo at a specific commit."""
+def clone_repo(repo: str, target_dir: Path, timeout: int = 600) -> bool:
+    """Clone a repo (full clone — SWE-bench needs arbitrary commits)."""
     try:
-        # Clone with depth 1, then fetch the specific commit
         repo_url = f"https://github.com/{repo}.git"
         subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(target_dir)],
+            ["git", "clone", "--quiet", repo_url, str(target_dir)],
             capture_output=True, text=True, timeout=timeout, check=True,
-        )
-        subprocess.run(
-            ["git", "fetch", "--depth", "1", "origin", commit],
-            capture_output=True, text=True, timeout=timeout, check=True,
-            cwd=str(target_dir),
-        )
-        subprocess.run(
-            ["git", "checkout", commit],
-            capture_output=True, text=True, timeout=60, check=True,
-            cwd=str(target_dir),
         )
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"  Clone failed: {e}", file=sys.stderr)
         return False
 
+
+def checkout_commit(repo_dir: Path, commit: str, timeout: int = 60) -> bool:
+    """Checkout a specific commit and clean the working tree (keep .skelesearch cache)."""
+    try:
+        subprocess.run(
+            ["git", "checkout", "--force", "--quiet", commit],
+            capture_output=True, text=True, timeout=timeout, check=True,
+            cwd=str(repo_dir),
+        )
+        # Clean untracked files but keep .skelesearch index for incremental re-index
+        subprocess.run(
+            ["git", "clean", "-fdxq", "--exclude=.skelesearch"],
+            capture_output=True, text=True, timeout=timeout, check=True,
+            cwd=str(repo_dir),
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"  Checkout failed: {e}", file=sys.stderr)
+        return False
 
 def run_skelesearch(binary: str, project_dir: Path, query: str,
                     provider: str = "fastembed", top_k: int = 10,
@@ -85,22 +93,21 @@ def run_skelesearch(binary: str, project_dir: Path, query: str,
     for key in ["VOYAGE_API_KEY", "JINA_API_KEY", "COHERE_API_KEY"]:
         env.pop(key, None)
 
-    skel_dir = project_dir / ".skelesearch"
-    if not skel_dir.exists():
-        # Count files
-        file_count = sum(1 for _ in project_dir.rglob("*.py"))
-        if file_count > max_files:
-            print(f"  SKIP: {file_count} Python files exceeds limit of {max_files}", file=sys.stderr)
-            return []
-
-        try:
-            subprocess.run(
-                [binary, "index", str(project_dir), "--provider", provider],
-                capture_output=True, text=True, env=env, timeout=index_timeout,
-            )
-        except subprocess.TimeoutExpired:
-            print(f"  TIMEOUT: indexing exceeded {index_timeout}s", file=sys.stderr)
-            return []
+    # Always run index — skelesearch's incremental indexer hash-checks files
+    # and only re-embeds changed ones. After git checkout, most files are unchanged
+    # so re-indexing is fast (~seconds for the diff).
+    file_count = sum(1 for _ in project_dir.rglob("*.py"))
+    if file_count > max_files:
+        print(f"  SKIP: {file_count} Python files exceeds limit of {max_files}", file=sys.stderr)
+        return []
+    try:
+        subprocess.run(
+            [binary, "index", str(project_dir), "--provider", provider],
+            capture_output=True, text=True, env=env, timeout=index_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  TIMEOUT: indexing exceeded {index_timeout}s", file=sys.stderr)
+        return []
 
     # Search
     try:
@@ -192,7 +199,7 @@ def main():
             pass  # never crash on save
 
     results = []
-    # Group by repo for index reuse
+    # Group by repo — clone once, checkout per instance.
     repo_groups = defaultdict(list)
     for inst in instances:
         repo_groups[inst["repo"]].append(inst)
@@ -202,6 +209,17 @@ def main():
 
     for repo, repo_instances in repo_groups.items():
         print(f"\n=== {repo} ({len(repo_instances)} instances) ===")
+
+        # Single full clone per repo (reused across all commits)
+        repo_dir = cache_dir / repo.replace('/', '_')
+        if not repo_dir.exists():
+            if not clone_repo(repo, repo_dir):
+                for inst in repo_instances:
+                    results.append({"instance_id": inst["instance_id"], "status": "clone_failed",
+                                    "acc1": 0, "acc3": 0, "acc5": 0, "recall5": 0, "mrr": 0})
+                    skipped += 1
+                save_partial()
+                continue
 
         for inst in repo_instances:
             instance_id = inst["instance_id"]
@@ -216,14 +234,12 @@ def main():
 
             print(f"  [{instance_id}] {len(gold)} gold files")
 
-            # Clone at the base commit
-            repo_dir = cache_dir / f"{repo.replace('/', '_')}_{commit[:8]}"
-            if not repo_dir.exists():
-                if not clone_at_commit(repo, commit, repo_dir):
-                    results.append({"instance_id": instance_id, "status": "clone_failed",
-                                    "acc1": 0, "acc3": 0, "acc5": 0, "recall5": 0, "mrr": 0})
-                    skipped += 1
-                    continue
+            # Checkout the specific commit (clean working tree, keep .skelesearch)
+            if not checkout_commit(repo_dir, commit):
+                results.append({"instance_id": instance_id, "status": "checkout_failed",
+                                "acc1": 0, "acc3": 0, "acc5": 0, "recall5": 0, "mrr": 0})
+                skipped += 1
+                continue
 
             # Run skelesearch
             t0 = time.time()
