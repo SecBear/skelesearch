@@ -21,6 +21,7 @@ cuda = []
 [dependencies]
 skelesearch-core = { path = "../core" }
 fastembed = { workspace = true }
+hf-hub = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }

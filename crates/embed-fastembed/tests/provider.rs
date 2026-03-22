@@ -48,3 +48,42 @@ async fn fastembed_provider_empty_batch_returns_empty() -> anyhow::Result<()> {
     assert!(result.is_empty(), "empty input must yield empty output");
     Ok(())
 }
+
+
+/// `provider_from_name` must reject unknown names with a clear error message
+/// that lists supported providers including `coderankembed`.
+#[test]
+fn provider_from_name_unknown_includes_coderankembed_in_error() {
+    use skelesearch_embed_fastembed::provider_from_name;
+    let result = provider_from_name("notamodel");
+    assert!(result.is_err(), "unknown name must be rejected");
+    let err = result.err().unwrap();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("coderankembed"),
+        "error message should list 'coderankembed' as supported; got: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CodeRankEmbed ONNX download (~548 MB) / network or cache"]
+async fn coderankembed_provider_returns_768_dim_vectors() -> anyhow::Result<()> {
+    let provider = skelesearch_embed_fastembed::FastEmbedProvider::coderankembed()?;
+    assert_eq!(provider.dim(), 768, "CodeRankEmbed is 768-dim");
+    assert_eq!(provider.name(), "coderankembed");
+
+    use skelesearch_core::EmbedProvider;
+    // Query prefix recommended by model authors:
+    // "Represent this query for searching relevant code: <query>"
+    let embeddings = provider
+        .embed_batch(vec![
+            "Represent this query for searching relevant code: compute factorial".into(),
+            "def factorial(n): return 1 if n <= 1 else n * factorial(n-1)".into(),
+        ])
+        .await?;
+
+    assert_eq!(embeddings.len(), 2);
+    assert_eq!(embeddings[0].len(), 768);
+    assert_eq!(embeddings[1].len(), 768);
+    Ok(())
+}
