@@ -111,8 +111,14 @@ with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)
 
 ### Deletion
 
+Output column names **must** match the relation's key column names:
+
 ```datalog
-?[fp, ci] <- $keys :rm chunks { file_path: fp, chunk_idx: ci }
+-- CORRECT: column names match relation keys (file_path, chunk_idx)
+?[file_path, chunk_idx] <- $keys :rm chunks
+
+-- WRONG: aliased names cause parse error at runtime
+-- ?[fp, ci] <- $keys :rm chunks { file_path: fp, chunk_idx: ci }
 ```
 
 ## Anti-Patterns (DO NOT)
@@ -127,6 +133,7 @@ with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, emb], !is_null(emb)
 | Omitting `score_kind: 'tf_idf'` on FTS queries | Always specify — default is raw TF, not TF-IDF |
 | Using `!ignore_link` as negation-as-failure | Bind `ignore_link: false` in the relation pattern |
 | Using `fr_k` / `fr__field` for HNSW graph columns | Use `fr_{column_name}` (e.g., `fr_file_path`, `fr_chunk_idx`) |
+| Using aliased columns in `:rm` (`?[fp, ci] <- $keys :rm rel { col: fp }`) | Output names must match relation key names: `?[col] <- $keys :rm rel` |
 | Multiple count/stat queries in sequence | Combine into multi-rule single query |
 | `::algo` fixed rules (PageRank, etc.) | Broken in v0.7.6. Compute in Rust, store back. |
 
