@@ -221,6 +221,10 @@ pub struct SmartSearchInput {
     /// Example: "src/auth" limits results to files under that path.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Project path to search. When set, searches that project's index instead
+    /// of the default (server cwd). The project must have been indexed.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// A single grep result row returned by `smart_search` on the grep path.
@@ -257,6 +261,9 @@ pub struct FindSymbolInput {
     pub name: String,
     /// Optional kind filter (e.g., "function", "struct", "class").
     pub kind: Option<String>,
+    /// Project path to search.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// A single symbol definition.
@@ -276,6 +283,9 @@ pub struct FindImpactSetInput {
     pub file_path: String,
     /// Maximum traversal depth (default: 3, capped at 5).
     pub max_depth: Option<usize>,
+    /// Project path to search.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// A single entry in the transitive importer list.
@@ -303,6 +313,9 @@ pub struct ImpactSetOutput {
 pub struct FindTestContextInput {
     /// File path to find tests for.
     pub file_path: String,
+    /// Project path to search.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Output of the `find_test_context` tool.
@@ -330,6 +343,9 @@ pub struct GetSymbolContextInput {
     /// Include test files that reference this symbol (default: true).
     #[serde(default = "default_true")]
     pub include_tests: bool,
+    /// Project path to search.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Output of the `get_symbol_context` tool.
@@ -374,6 +390,9 @@ pub struct GetRepoMapInput {
     /// If true, include file-level import edges (default: true).
     #[serde(default = "default_true")]
     pub include_edges: bool,
+    /// Project path to query.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 fn default_map_tokens() -> usize { 8192 }

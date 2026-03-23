@@ -156,6 +156,10 @@ pub struct SkeleSearchServer {
     /// Shared state for background indexing.  Written by the spawned task,
     /// read by `index_status` and `index_codebase` (duplicate-check).
     index_state: Arc<tokio::sync::RwLock<IndexProgress>>,
+    /// Cache of opened backends for non-cwd projects. Keyed by project root.
+    /// The default backend (self.backend) handles the cwd project; this cache
+    /// serves tools that specify an explicit `path` to a different project.
+    backend_cache: Arc<tokio::sync::RwLock<HashMap<PathBuf, (Arc<CozoBackend>, PathBuf)>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +216,7 @@ impl SkeleSearchServer {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
             index_state: Arc::new(tokio::sync::RwLock::new(IndexProgress::default())),
+            backend_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -219,6 +224,54 @@ impl SkeleSearchServer {
     async fn friendly_err(&self, err: anyhow::Error) -> String {
         let active = self.index_state.read().await.status == IndexingStatus::Running;
         friendly_index_error_inner(&err, active)
+    }
+
+    /// Resolve a backend for the given path. If `path` is None, returns the
+    /// default (cwd) backend. Otherwise, finds the project root for the path,
+    /// opens a CozoBackend on first use, and caches it for the session.
+    async fn resolve_backend(&self, path: Option<&str>) -> anyhow::Result<(Arc<CozoBackend>, PathBuf)> {
+        let target = match path {
+            None => return Ok((Arc::clone(&self.backend), self.manifest_path.as_ref().clone())),
+            Some(p) => PathBuf::from(p),
+        };
+
+        // Walk up to find .git (same logic as main.rs find_project_root)
+        let project_root = {
+            let abs = if target.is_absolute() { target.clone() } else {
+                std::env::current_dir().unwrap_or_default().join(&target)
+            };
+            let mut dir = if abs.is_dir() { abs.clone() } else { abs.parent().unwrap_or(&abs).to_path_buf() };
+            loop {
+                if dir.join(".git").exists() { break dir; }
+                match dir.parent() {
+                    Some(p) => dir = p.to_path_buf(),
+                    None => break abs,
+                }
+            }
+        };
+
+        // Check cache first
+        {
+            let cache = self.backend_cache.read().await;
+            if let Some((backend, manifest)) = cache.get(&project_root) {
+                return Ok((Arc::clone(backend), manifest.clone()));
+            }
+        }
+
+        // Open new backend
+        let skele_dir = project_root.join(".skelesearch");
+        std::fs::create_dir_all(&skele_dir)
+            .with_context(|| format!("create .skelesearch at {}", skele_dir.display()))?;
+        let backend = Arc::new(CozoBackend::open(skele_dir.join("index.db"))?);
+        let manifest_path = skele_dir.join("manifest.db");
+
+        tracing::info!(project = %project_root.display(), "opened backend for new project");
+
+        // Cache it
+        let mut cache = self.backend_cache.write().await;
+        cache.insert(project_root, (Arc::clone(&backend), manifest_path.clone()));
+
+        Ok((backend, manifest_path))
     }
 
     // -----------------------------------------------------------------------
@@ -1126,7 +1179,8 @@ impl SkeleSearchServer {
                 let impact = self
                     .find_impact_set(FindImpactSetInput {
                         file_path,
-                        max_depth: None, // use find_impact_set default (3, capped at 5)
+                        max_depth: None,
+                        project: input.project.clone(),
                     })
                     .await?;
                 Ok(SmartSearchOutput {
@@ -1152,7 +1206,8 @@ impl SkeleSearchServer {
         &self,
         input: FindSymbolInput,
     ) -> anyhow::Result<Vec<SymbolRow>> {
-        let results = match self.backend.find_symbols(&input.name, input.kind.as_deref()).await {
+        let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
+        let results = match backend.find_symbols(&input.name, input.kind.as_deref()).await {
             Ok(r) => r,
             Err(ref e) if is_uninitialized_index_error(e) => return Ok(vec![]),
             Err(e) => return Err(e),
@@ -1178,8 +1233,10 @@ impl SkeleSearchServer {
         &self,
         input: GetSymbolContextInput,
     ) -> anyhow::Result<SymbolContextOutput> {
+        // Resolve backend for the target project.
+        let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
         // Step 1: resolve the symbol.
-        let symbols = match self.backend.find_symbols(&input.name, input.kind.as_deref()).await {
+        let symbols = match backend.find_symbols(&input.name, input.kind.as_deref()).await {
             Ok(r) => r,
             Err(ref e) if is_uninitialized_index_error(e) => {
                 return Ok(SymbolContextOutput {
@@ -1226,7 +1283,7 @@ impl SkeleSearchServer {
         };
 
         // Step 2: find the chunk containing the symbol's start line.
-        let source = self.backend
+        let source = backend
             .get_chunks_for_file(&sym.file_path)
             .await
             .ok() // source is best-effort — don't fail the whole call on a missing chunk
@@ -1237,11 +1294,11 @@ impl SkeleSearchServer {
             });
 
         // Step 3: import graph edges for the symbol's file.
-        let imports = self.backend
+        let imports = backend
             .get_imports(&sym.file_path)
             .await
             .unwrap_or_default();
-        let all_importers = self.backend
+        let all_importers = backend
             .get_importers(&sym.file_path)
             .await
             .unwrap_or_default();
@@ -1266,7 +1323,7 @@ impl SkeleSearchServer {
         // Step 5: role lookup — use persisted role when available; otherwise infer
         // an approximate file-level role from import graph degrees so ordinary
         // indexed repos do not surface a null role to MCP callers.
-        let role: Option<String> = match self.backend
+        let role: Option<String> = match backend
             .get_symbol_roles(&[sym.file_path.as_str()])
             .await
             .ok()
@@ -1294,8 +1351,9 @@ impl SkeleSearchServer {
         &self,
         input: FindImpactSetInput,
     ) -> anyhow::Result<ImpactSetOutput> {
+        let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
         let max_depth = input.max_depth.unwrap_or(3).min(5);
-        let all_importers = match self.backend.traverse_importers(&input.file_path, max_depth, None).await {
+        let all_importers = match backend.traverse_importers(&input.file_path, max_depth, None).await {
             Ok(v) => v,
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
@@ -1328,7 +1386,8 @@ impl SkeleSearchServer {
         &self,
         input: FindTestContextInput,
     ) -> anyhow::Result<TestContextOutput> {
-        let importers = match self.backend.get_importers(&input.file_path).await {
+        let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
+        let importers = match backend.get_importers(&input.file_path).await {
             Ok(v) => v,
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
@@ -1346,7 +1405,7 @@ impl SkeleSearchServer {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let all_files = match self.backend.list_indexed_paths().await {
+        let all_files = match backend.list_indexed_paths().await {
             Ok(v) => v,
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
@@ -1416,13 +1475,14 @@ impl SkeleSearchServer {
     /// Build a compact repo map from indexed data. Renders a tree with file
     /// roles, symbols, and import edges, respecting the token budget.
     pub async fn get_repo_map(&self, input: GetRepoMapInput) -> anyhow::Result<String> {
-        let data = self.backend.get_repo_map_data().await?;
-        let stats = self.backend.stats().await.ok();
+        let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
+        let data = backend.get_repo_map_data().await?;
+        let stats = backend.stats().await.ok();
         let stale = stats.as_ref().map(|s| s.estimated_stale).unwrap_or(0);
         let mut out = render_repo_map(&data, &input);
         if stale > 0 {
             out.insert_str(0, &format!(
-                "⚠ {} file(s) changed since last index. Run index_codebase to update.\n\n",
+                "⚠ {} file(s) changed since last index. Run index to update.\n\n",
                 stale
             ));
         }

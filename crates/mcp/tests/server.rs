@@ -330,6 +330,7 @@ async fn smart_search_exact_symbol_prefers_grep() -> anyhow::Result<()> {
             intent: None,
             symbols: vec![],
             scope: None,
+            project: None,
         })
         .await?;
     assert_eq!(out.strategy, "grep");
@@ -351,6 +352,7 @@ async fn get_symbol_context_returns_role_and_context() -> anyhow::Result<()> {
             name: "helper".into(),
             kind: Some("function".into()),
             include_tests: true,
+            project: None,
         })
         .await?;
     assert!(ctx.symbol.is_some(), "expected symbol match");
