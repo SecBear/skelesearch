@@ -1511,8 +1511,9 @@ impl SkeleSearchServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SkeleSearchServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("skelesearch", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
                 "skelesearch -- semantic code search for agents.\n\n\
                  Tools:\n\
                  - smart_search: Find code by concept, keyword, or symbol. Auto-routes between grep and semantic search.\n\
@@ -1528,16 +1529,8 @@ impl ServerHandler for SkeleSearchServer {
                  - Use `intent: \"impact\"` with `symbols: [\"SymbolName\"]` to find all dependents before refactoring\n\
                  - Set `scope: \"src/auth\"` to narrow results to a directory\n\
                  - Set `max_tokens` to control output size (default: 8192)\n\
-                 - Set `session_id` to deduplicate across multi-turn searches".into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "skelesearch".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+                 - Set `session_id` to deduplicate across multi-turn searches"
+            )
     }
 
     /// Called by rmcp after the MCP `initialized` notification (handshake complete).
