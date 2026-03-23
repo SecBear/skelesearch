@@ -21,6 +21,7 @@ use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
+    service::{NotificationContext, RoleServer},
     tool, tool_handler, tool_router,
 };
 use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, IndexResult, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, StorageBackend};
@@ -205,6 +206,103 @@ impl SkeleSearchServer {
             .collect())
     }
 
+    /// Return the right error message for an empty index.
+    ///
+    /// When auto-indexing is already running, the caller gets a 'indexing in
+    /// progress' message instead of the generic 'run index_codebase first'.
+    async fn empty_index_error(&self) -> anyhow::Error {
+        let state = self.index_state.read().await;
+        if state.status == IndexingStatus::Running {
+            anyhow::anyhow!(
+                "indexing in progress for '{}' — use index_status to check progress",
+                state.path
+            )
+        } else {
+            anyhow::anyhow!("index is empty; run index_codebase first")
+        }
+    }
+
+    /// Check if the index is empty; if so, start background indexing from cwd.
+    ///
+    /// Called from `on_initialized` (after MCP handshake). Logs but never propagates
+    /// errors — startup must not fail just because auto-index could not start.
+    ///
+    /// Guards:
+    /// - `SKELESEARCH_NO_AUTO_INDEX` env var disables auto-indexing entirely.
+    /// - Skips if indexing is already running (prevents double-start on reconnect).
+    /// - Skips if cwd does not look like a code project (no project markers found).
+    /// - Provider is auto-detected: Voyage → OpenAI → FastEmbed (zero-config fallback).
+    async fn auto_index_if_needed(&self) {
+        // Opt-out escape hatch for managed environments.
+        if std::env::var("SKELESEARCH_NO_AUTO_INDEX").is_ok() {
+            return;
+        }
+
+        // Don't start a second run if one is already in flight.
+        {
+            let state = self.index_state.read().await;
+            if state.status == IndexingStatus::Running {
+                tracing::debug!("auto-index: indexing already in progress, skipping");
+                return;
+            }
+        }
+
+        // Check if the index already has data.
+        let needs_index = match self.backend.stats().await {
+            Ok(s) => s.total_chunks == 0,
+            Err(ref e) if is_uninitialized_index_error(e) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "auto-index: backend stats failed, skipping");
+                return;
+            }
+        };
+        if !needs_index {
+            tracing::debug!("auto-index: index already populated, skipping");
+            return;
+        }
+
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "auto-index: failed to determine cwd, skipping");
+                return;
+            }
+        };
+
+        if !looks_like_project(&cwd) {
+            tracing::info!(
+                path = %cwd.display(),
+                "auto-index: no project markers found in cwd, skipping \
+                 (set SKELESEARCH_NO_AUTO_INDEX to suppress, or run index_codebase explicitly)"
+            );
+            return;
+        }
+
+        // Prefer cloud providers when API keys are present; FastEmbed is the
+        // zero-config default that works offline.
+        let provider_name = if std::env::var("VOYAGE_API_KEY").map_or(false, |k| !k.is_empty()) {
+            "voyage"
+        } else if std::env::var("OPENAI_API_KEY").map_or(false, |k| !k.is_empty()) {
+            "openai"
+        } else {
+            "fastembed"
+        };
+
+        tracing::info!(
+            path = %cwd.display(),
+            provider = provider_name,
+            "no index found; auto-starting background indexing"
+        );
+
+        // Errors here are logged inside index_codebase; we discard the Result
+        // since a failed auto-index must not crash the server — the user can
+        // always call index_codebase explicitly.
+        let _ = self.index_codebase(IndexCodebaseInput {
+            path: cwd.to_string_lossy().to_string(),
+            provider: Some(provider_name.to_string()),
+        }).await;
+    }
+
     /// Ensure a usable embedding provider is ready before a search.
     ///
     /// Returns an error when the index is empty so callers get a clear
@@ -216,12 +314,12 @@ impl SkeleSearchServer {
         let stats = match self.backend.stats().await {
             Ok(s) => s,
             Err(ref e) if is_uninitialized_index_error(e) => {
-                return Err(anyhow::anyhow!("index is empty; run index_codebase first"));
+                return Err(self.empty_index_error().await);
             }
             Err(e) => return Err(e),
         };
         if stats.total_chunks == 0 {
-            return Err(anyhow::anyhow!("index is empty; run index_codebase first"));
+            return Err(self.empty_index_error().await);
         }
 
         // Fast path: already a real provider.
@@ -343,6 +441,7 @@ impl SkeleSearchServer {
 
         (expander, reranker)
     }
+
 
     /// Return a cached Searcher or build one on the first call.
     /// The searcher is invalidated (cache cleared) after indexing so
@@ -1190,11 +1289,59 @@ impl ServerHandler for SkeleSearchServer {
             ..Default::default()
         }
     }
+
+    /// Called by rmcp after the MCP `initialized` notification (handshake complete).
+    /// Triggers background auto-indexing if no index exists for the current project.
+    fn on_initialized(
+        &self,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        async move {
+            self.auto_index_if_needed().await;
+        }
+    }
+
 }
 
 // ---------------------------------------------------------------------------
 // Path utilities
 // ---------------------------------------------------------------------------
+
+/// Returns true when `dir` looks like a code project root.
+///
+/// Used by `auto_index_if_needed` to guard against auto-indexing from system
+/// directories (`/`, `/tmp`, etc.) where an MCP server might be accidentally
+/// launched without a meaningful working directory.
+///
+/// Checks for common project marker files/directories.  Any one marker suffices.
+/// Covers Rust, JS/TS, Go, Python, Java, C/C++, and skelesearch's own config.
+fn looks_like_project(dir: &std::path::Path) -> bool {
+    // Reject well-known non-project roots.
+    {
+        let s = dir.to_string_lossy();
+        if s == "/" || s.starts_with("/tmp") || s.starts_with("/var/tmp") {
+            return false;
+        }
+    }
+
+    const MARKERS: &[&str] = &[
+        ".git",
+        ".skelesearch.toml",
+        "Cargo.toml",
+        "package.json",
+        "go.mod",
+        "pyproject.toml",
+        "setup.py",
+        "pom.xml",
+        "build.gradle",
+        "CMakeLists.txt",
+        "Makefile",
+        "requirements.txt",
+        ".hg",
+        ".svn",
+    ];
+    MARKERS.iter().any(|m| dir.join(m).exists())
+}
 
 /// Returns true when `path` looks like a test file based on common naming conventions.
 /// This is a heuristic — it covers Go, Rust, JS/TS, Ruby, and directory-based conventions.
