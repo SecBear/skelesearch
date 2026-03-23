@@ -471,30 +471,67 @@ impl StorageBackend for CozoBackend {
             Err(e) => {
                 let msg = e.to_string().to_lowercase();
                 if msg.contains("already exists") || msg.contains("conflicts with an existing one") {
-                    // Relation exists. Inspect column count to detect schema drift.
-                    match self.run_mut("::columns chunks", BTreeMap::new()) {
-                        Ok(cols) if cols.rows.len() != CHUNKS_EXPECTED_COLS => {
-                            tracing::warn!(
-                                current_cols = cols.rows.len(),
-                                expected_cols = CHUNKS_EXPECTED_COLS,
-                                "chunks schema migrated: dropped old relation and indexes, re-index required"
-                            );
-                            // Indexes must be removed before the relation that they reference.
-                            // Ignore errors — an index may not exist if a prior migration was partial.
-                            let _ = self.run_mut("::remove chunks:semantic", BTreeMap::new());
-                            let _ = self.run_mut("::remove chunks:text", BTreeMap::new());
-                            let _ = self.run_mut("::remove chunks:dedup", BTreeMap::new());
-                            // :replace drops the existing relation and recreates it with the new schema.
-                            // An empty output rule is required — :replace cannot omit the query unlike :create.
-                            let chunks_replace = format!(
-                                "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] <- [] \
-                                 :replace chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
-                            );
-                            self.run_mut(&chunks_replace, BTreeMap::new())
-                                .map_err(|e| anyhow::anyhow!("chunks schema migration failed: {}", e))?;
-                        }
-                        Ok(_) => {
-                            // Column count matches expected — schema is compatible, nothing to do.
+                    // Relation exists. Inspect column count and embedding dimension.
+                    match self.run_imm("::columns chunks", BTreeMap::new()) {
+                        Ok(cols) => {
+                            // CozoDB type format for vectors: "<F32;{len}>" (no space; see ColType Display impl).
+                            let dim_tag = format!("F32;{dim}");
+                            let wrong_col_count = cols.rows.len() != CHUNKS_EXPECTED_COLS;
+                            // Find the 'embedding' row and verify its type encodes the expected dimension.
+                            let wrong_dimension = !cols.rows.iter().any(|row| {
+                                if let (DataValue::Str(name), DataValue::Str(type_str)) = (&row[0], &row[3]) {
+                                    &name[..] == "embedding" && type_str.contains(dim_tag.as_str())
+                                } else {
+                                    false
+                                }
+                            });
+                            if wrong_col_count || wrong_dimension {
+                                tracing::warn!(
+                                    current_cols = cols.rows.len(),
+                                    expected_cols = CHUNKS_EXPECTED_COLS,
+                                    expected_dim = dim,
+                                    wrong_col_count,
+                                    wrong_dimension,
+                                    "chunks schema migration: dropping old relation and indexes, full re-index required"
+                                );
+                                // Indexes must be dropped before the relation that they reference.
+                                // Ignore errors — an index may not exist if a prior migration was partial.
+                                let _ = self.run_mut("::hnsw drop chunks:semantic", BTreeMap::new());
+                                let _ = self.run_mut("::fts drop chunks:text", BTreeMap::new());
+                                let _ = self.run_mut("::lsh drop chunks:dedup", BTreeMap::new());
+                                // :replace drops the existing relation and recreates it with the new schema.
+                                // An empty output rule is required — :replace cannot omit the query unlike :create.
+                                let chunks_replace = format!(
+                                    "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] <- [] \
+                                     :replace chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
+                                );
+                                self.run_mut(&chunks_replace, BTreeMap::new())
+                                    .map_err(|e| anyhow::anyhow!("chunks schema migration failed: {}", e))?;
+                                // Purge all dependent relations: their data references old chunks.
+                                // With files empty, the indexer's mtime check treats every file as
+                                // new and re-processes the entire corpus. Errors are intentionally
+                                // ignored — a partial purge still forces a re-index for those files.
+                                let _ = self.run_mut(
+                                    "?[file_path, language, last_modified, last_indexed, chunk_count] <- [] \
+                                     :replace files { file_path: String => language: String, last_modified: Int, last_indexed: Int, chunk_count: Int }",
+                                    BTreeMap::new(),
+                                );
+                                let _ = self.run_mut(
+                                    "?[file_path, name, start_line, kind, end_line] <- [] \
+                                     :replace symbols { file_path: String, name: String, start_line: Int => kind: String, end_line: Int }",
+                                    BTreeMap::new(),
+                                );
+                                let _ = self.run_mut(
+                                    "?[file_path, pagerank] <- [] :replace file_ranks { file_path: String => pagerank: Float }",
+                                    BTreeMap::new(),
+                                );
+                                let _ = self.run_mut(
+                                    "?[from_file, from_chunk, to_file, edge_type, created_at] <- [] \
+                                     :replace code_edges { from_file: String, from_chunk: Int, to_file: String => edge_type: String, created_at: Int }",
+                                    BTreeMap::new(),
+                                );
+                            }
+                            // else: schema and dimension match — nothing to do.
                         }
                         Err(inspect_err) => {
                             // Cannot inspect schema; assume compatible and proceed.
