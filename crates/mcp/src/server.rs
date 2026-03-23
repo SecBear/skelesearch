@@ -248,8 +248,11 @@ impl SkeleSearchServer {
     /// - Skips if cwd does not look like a code project (no project markers found).
     /// - Provider is auto-detected: Voyage → OpenAI → FastEmbed (zero-config fallback).
     async fn auto_index_if_needed(&self) {
+        tracing::info!("auto_index_if_needed: entry");
+
         // Opt-out escape hatch for managed environments.
         if std::env::var("SKELESEARCH_NO_AUTO_INDEX").is_ok() {
+            tracing::info!("auto_index_if_needed: SKELESEARCH_NO_AUTO_INDEX is set, skipping");
             return;
         }
 
@@ -257,38 +260,68 @@ impl SkeleSearchServer {
         {
             let state = self.index_state.read().await;
             if state.status == IndexingStatus::Running {
-                tracing::debug!("auto-index: indexing already in progress, skipping");
+                tracing::info!("auto_index_if_needed: indexing already in progress, skipping");
                 return;
             }
         }
 
         // Check if the index already has data.
+        // Treat any error as "needs index": a fresh or corrupt DB should trigger
+        // re-indexing rather than silently leaving the user with no search.
         let needs_index = match self.backend.stats().await {
-            Ok(s) => s.total_chunks == 0,
-            Err(ref e) if is_uninitialized_index_error(e) => true,
-            Err(e) => {
-                tracing::warn!(error = %e, "auto-index: backend stats failed, skipping");
-                return;
+            Ok(s) => {
+                tracing::info!(
+                    indexed_files = s.indexed_files,
+                    total_chunks = s.total_chunks,
+                    "auto_index_if_needed: backend stats OK"
+                );
+                s.total_chunks == 0
+            }
+            Err(ref e) if is_uninitialized_index_error(e) => {
+                tracing::info!("auto_index_if_needed: index not yet initialized (expected on first run)");
+                true
+            }
+            Err(ref e) => {
+                // Unexpected error — CozoDB may return something outside our known
+                // "stored relation not found" pattern (locked file, partial schema,
+                // new CozoDB version).  Treat it as needs-index: the worst outcome
+                // is a redundant re-index; the alternative is permanent silence.
+                tracing::warn!(
+                    error = %e,
+                    "auto_index_if_needed: unexpected stats error — treating as needs-index"
+                );
+                true
             }
         };
         if !needs_index {
-            tracing::debug!("auto-index: index already populated, skipping");
+            tracing::info!("auto_index_if_needed: index already populated, skipping");
             return;
         }
 
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error = %e, "auto-index: failed to determine cwd, skipping");
+                tracing::warn!(error = %e, "auto_index_if_needed: failed to determine cwd, skipping");
                 return;
             }
         };
 
-        if !looks_like_project(&cwd) {
+        tracing::info!(cwd = %cwd.display(), "auto_index_if_needed: checking cwd");
+
+        let is_project = looks_like_project(&cwd);
+        tracing::info!(
+            is_project,
+            path = %cwd.display(),
+            "auto_index_if_needed: project detection result"
+        );
+
+        if !is_project {
             tracing::info!(
                 path = %cwd.display(),
-                "auto-index: no project markers found in cwd, skipping \
-                 (set SKELESEARCH_NO_AUTO_INDEX to suppress, or run index_codebase explicitly)"
+                "auto_index_if_needed: no project markers found — skipping (run index_codebase explicitly, ",
+            );
+            tracing::info!(
+                "auto_index_if_needed: or set SKELESEARCH_NO_AUTO_INDEX to silence this message)"
             );
             return;
         }
@@ -306,7 +339,7 @@ impl SkeleSearchServer {
         tracing::info!(
             path = %cwd.display(),
             provider = provider_name,
-            "no index found; auto-starting background indexing"
+            "auto_index_if_needed: triggering index_codebase"
         );
 
         // Surface auto-index failures so the user can act on them.
@@ -316,10 +349,15 @@ impl SkeleSearchServer {
             path: cwd.to_string_lossy().to_string(),
             provider: Some(provider_name.to_string()),
         }).await {
-            Ok(_) => {}
+            Ok(_) => {
+                tracing::info!("auto_index_if_needed: index_codebase started successfully");
+            }
             Err(e) => {
                 let friendly = friendly_index_error(&e);
-                tracing::error!(error = %friendly, "auto-index failed to start; search tools may not be available");
+                tracing::error!(
+                    error = %friendly,
+                    "auto_index_if_needed: index_codebase failed to start; search tools may not be available"
+                );
                 let mut state = self.index_state.write().await;
                 state.status = IndexingStatus::Failed;
                 state.error = Some(friendly);
@@ -1480,6 +1518,7 @@ impl ServerHandler for SkeleSearchServer {
         _context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
+            tracing::info!("on_initialized: called — triggering auto-index check");
             self.auto_index_if_needed().await;
             // Quick health check: verify the index backend is queryable.
             // Does not block startup — logs clearly so the user sees problems in server logs.
