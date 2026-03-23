@@ -1417,7 +1417,16 @@ impl SkeleSearchServer {
     /// roles, symbols, and import edges, respecting the token budget.
     pub async fn get_repo_map(&self, input: GetRepoMapInput) -> anyhow::Result<String> {
         let data = self.backend.get_repo_map_data().await?;
-        Ok(render_repo_map(&data, &input))
+        let stats = self.backend.stats().await.ok();
+        let stale = stats.as_ref().map(|s| s.estimated_stale).unwrap_or(0);
+        let mut out = render_repo_map(&data, &input);
+        if stale > 0 {
+            out.insert_str(0, &format!(
+                "⚠ {} file(s) changed since last index. Run index_codebase to update.\n\n",
+                stale
+            ));
+        }
+        Ok(out)
     }
 }
 
