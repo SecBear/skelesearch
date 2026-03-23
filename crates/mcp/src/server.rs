@@ -1008,8 +1008,15 @@ impl SkeleSearchServer {
         // If a non-default project is specified and search_code doesn't support
         // cross-project yet, resolve the backend and build a temporary searcher.
         if let Some(ref project) = input.project {
-            let (backend, _) = self.resolve_backend(Some(project.as_str())).await?;
-            let provider = self.prepare_search_provider().await?;
+            let (backend, manifest_path) = self.resolve_backend(Some(project.as_str())).await?;
+            // Read provider from target project's manifest — dimensions must match its index.
+            let provider_name = ManifestStore::open(&manifest_path)
+                .ok()
+                .and_then(|m| m.get_meta("provider").ok().flatten())
+                .unwrap_or_else(|| "fastembed".to_string());
+            let real = provider_from_name(&provider_name)
+                .with_context(|| format!("init provider '{}' for project {}", provider_name, project))?;
+            let provider = ArcProvider::new(real);
             let searcher = Searcher::new(backend, provider);
             // Delegate to a simplified search path for cross-project queries.
             let (mut results, _timings) = searcher
