@@ -672,9 +672,13 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let mut hits = hits;
         for hit in &mut hits {
             if is_test_file(&hit.file_path) {
-                hit.score *= 0.15;
+                if query_asks_about_testing(query) {
+                    hit.score *= 0.85; // Test files ARE the answer
+                } else {
+                    hit.score *= 0.15;
+                }
             } else if is_readme_or_meta(&hit.file_path) {
-                hit.score *= 0.05; // Almost never the right answer for code search
+                hit.score *= 0.15; // README-like meta files — heavily penalized but recoverable
             } else if is_doc_file(&hit.file_path) {
                 if is_docs_directory(&hit.file_path) {
                     hit.score *= 0.1; // Docs-directory files are almost never the right answer
@@ -1103,14 +1107,18 @@ fn is_doc_file(path: &str) -> bool {
         return true;
     }
 
-    // Well-known prose filenames (with or without extension).
+    // Well-known prose filenames with NO extension (e.g. bare `LICENSE`,
+    // `README`, `CHANGELOG`).  Files that carry a non-doc extension even
+    // when the stem matches a known prose name are source code, not docs.
+    // Example: `internal/license.go` or `changelog.py` must not be penalised.
     let file_name = norm.rsplit('/').next().unwrap_or(&norm);
-    let stem = match file_name.rfind('.') {
-        Some(dot) => &file_name[..dot],
-        None => file_name,
-    };
+    if file_name.contains('.') {
+        // Non-doc extension: the extension check above would have caught any
+        // real doc extension, so anything reaching here is a source file.
+        return false;
+    }
     matches!(
-        stem,
+        file_name,
         "readme" | "changelog" | "changes" | "history" | "news"
             | "authors" | "contributors" | "license" | "licence"
     )
@@ -1185,9 +1193,23 @@ fn query_asks_about_entry_point(query: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+/// Returns true when the query signals the user is asking about tests,
+/// test infrastructure, or testing-related code.
+/// Used to soften the test-file penalty when those files ARE the answer.
+fn query_asks_about_testing(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    [
+        "test", "testing", "spec", "mock", "stub", "fixture",
+        "assert", "expect", "should", "coverage",
+        "integration test", "unit test", "e2e",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query};
+    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, query_asks_about_testing};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -1458,6 +1480,11 @@ mod tests {
         assert!(!is_doc_file("tests/test_auth.py"));
         // File with 'doc' in the name but not in a docs/ directory.
         assert!(!is_doc_file("src/docstring.rs"));
+        // Source files whose stem matches a well-known prose name must not be flagged.
+        // The extension guard prevents these false-positives.
+        assert!(!is_doc_file("internal/license.go"));
+        assert!(!is_doc_file("src/changelog.py"));
+        assert!(!is_doc_file("pkg/readme.rs"));
     }
 
     // --- is_barrel_file tests ---
@@ -1511,6 +1538,43 @@ mod tests {
         // Source dirs with 'doc' component must not match.
         assert!(!is_docs_directory("src/validator/doc/schema.ts"));
     }
+
+    // --- query_asks_about_testing tests ---
+
+    #[test]
+    fn query_asks_about_testing_positive() {
+        // Explicit test vocabulary triggers the gate.
+        assert!(query_asks_about_testing("how do I write unit tests for the parser"));
+        assert!(query_asks_about_testing("testing the authentication flow"));
+        assert!(query_asks_about_testing("what mock should I use here"));
+        assert!(query_asks_about_testing("stub the HTTP client"));
+        assert!(query_asks_about_testing("fixture setup for integration test"));
+        assert!(query_asks_about_testing("assert error is returned"));
+        assert!(query_asks_about_testing("expect the function to throw"));
+        assert!(query_asks_about_testing("code coverage report"));
+        assert!(query_asks_about_testing("e2e browser spec"));
+        // Case-insensitive.
+        assert!(query_asks_about_testing("Write a Test for the Retry logic"));
+    }
+
+    #[test]
+    fn query_asks_about_testing_negative() {
+        // Normal code queries must not trigger the gate.
+        assert!(!query_asks_about_testing("parse JSON response"));
+        assert!(!query_asks_about_testing("error handling middleware"));
+        assert!(!query_asks_about_testing("database connection pool"));
+        assert!(!query_asks_about_testing("authentication token refresh"));
+    }
+
+    #[test]
+    fn query_asks_about_testing_partial_word_boundary() {
+        // 'test' is a substring match — words containing it also trigger.
+        // This is intentional: 'latest' contains 'test' but callers should
+        // know the gate is substring-based, not word-boundary-based.
+        // The important cases are the positive ones above.
+        assert!(query_asks_about_testing("latest test runner"));
+    }
+
 
     #[test]
     fn preprocess_strips_boilerplate() {
