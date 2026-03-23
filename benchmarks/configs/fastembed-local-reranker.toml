@@ -1,0 +1,17 @@
+# Benchmark profile: fastembed embeddings + local gte-modernbert-base reranker.
+# Requires: gte-modernbert-base model files downloaded to ~/.cache/skelesearch/reranker/
+# Build with: cargo build --release -p skelesearch-cli --features coreml
+
+[index]
+symbol_enrichment = true
+
+[search.reranker]
+provider = "local"
+model_dir = "~/.cache/skelesearch/reranker/gte-modernbert-base"
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = true
+max_depth = 1

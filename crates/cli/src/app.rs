@@ -19,24 +19,21 @@ use crate::eval;
 // ---------------------------------------------------------------------------
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    // Initialise tracing before dispatching so every command gets structured
-    // logging.  Write to stderr so stdout remains clean for MCP JSON-RPC.
-    let level = match cli.verbose {
+    // Initialise tracing. Verbose flag sets the default level; RUST_LOG
+    // overrides it. When OTEL_EXPORTER_OTLP_ENDPOINT is set and the `otlp`
+    // feature is enabled on skelesearch-telemetry, spans are also exported.
+    let default_level = match cli.verbose {
         0 => "warn",
         1 => "info",
         2 => "debug",
         _ => "trace",
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(level))
-        .with_writer(std::io::stderr)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .init();
+    let _telemetry = skelesearch_telemetry::init_tracing("skelesearch", default_level);
 
     match cli.command {
         Commands::Index { path, provider } => run_index(path, provider).await,
-        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens, branch } => {
-            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens, branch).await
+        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens, branch, timings } => {
+            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens, branch, timings).await
         }
         Commands::Context { file } => run_context(file).await,
         Commands::Status { path, json } => run_status(path, json).await,
@@ -164,6 +161,19 @@ where
 {
     let config = Config::load(root).unwrap_or_default();
 
+    // PageRank boost: disabled when config explicitly sets pagerank_boost = false.
+    let searcher = match config.search.pagerank_boost {
+        Some(false) => searcher.with_pagerank_boost(false),
+        _ => searcher,
+    };
+
+    // Unified Datalog retrieval: single round-trip FTS + HNSW + graph + PageRank.
+    // Also applies any tuning parameters from the config.
+    let searcher = match config.search.unified_search {
+        Some(true) => searcher.with_unified_search(true).with_search_tuning(&config),
+        _ => searcher.with_search_tuning(&config),
+    };
+
     // Query expansion: skip if explicitly disabled; otherwise attach LLMExpander
     // when OPENAI_API_KEY is available.
     let searcher = match config.search.expansion.enabled {
@@ -176,22 +186,48 @@ where
 
     // Reranker: explicit config wins; fall back to env-var auto-detect.
     if let Some(ref provider_name) = config.search.reranker.provider {
-        let key_env = config.search.reranker.api_key_env.as_deref().unwrap_or(
-            match provider_name.as_str() {
-                "jina"   => "JINA_API_KEY",
-                "cohere" => "COHERE_API_KEY",
-                "voyage" => "VOYAGE_API_KEY",
-                _        => "RERANKER_API_KEY",
-            },
-        );
-        match std::env::var(key_env).ok().filter(|k| !k.is_empty()) {
-            Some(key) => match skelesearch_rerank_api::reranker_from_name(provider_name, key) {
-                Ok(r)  => searcher.with_reranker(Box::new(r)),
-                Err(e) => { tracing::warn!("reranker init failed: {e}"); searcher }
-            },
-            None => {
-                tracing::warn!("reranker configured as '{provider_name}' but {key_env} not set");
-                searcher
+        if provider_name == "local" {
+            // Explicit local reranker via config.
+            let result = if let Some(ref dir) = config.search.reranker.model_dir {
+                // Expand ~ to home directory
+                let expanded = if dir.starts_with("~/") {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    std::path::PathBuf::from(home).join(&dir[2..])
+                } else {
+                    std::path::PathBuf::from(dir)
+                };
+                skelesearch_rerank_local::LocalReranker::new(&expanded)
+            } else {
+                skelesearch_rerank_local::LocalReranker::default_model()
+            };
+            match result {
+                Ok(r) => {
+                    tracing::info!("local reranker enabled");
+                    searcher.with_reranker(Box::new(r))
+                }
+                Err(e) => {
+                    tracing::warn!("local reranker failed to load: {e}");
+                    searcher
+                }
+            }
+        } else {
+            let key_env = config.search.reranker.api_key_env.as_deref().unwrap_or(
+                match provider_name.as_str() {
+                    "jina"   => "JINA_API_KEY",
+                    "cohere" => "COHERE_API_KEY",
+                    "voyage" => "VOYAGE_API_KEY",
+                    _        => "RERANKER_API_KEY",
+                },
+            );
+            match std::env::var(key_env).ok().filter(|k| !k.is_empty()) {
+                Some(key) => match skelesearch_rerank_api::reranker_from_name(provider_name, key) {
+                    Ok(r)  => searcher.with_reranker(Box::new(r)),
+                    Err(e) => { tracing::warn!("reranker init failed: {e}"); searcher }
+                },
+                None => {
+                    tracing::warn!("reranker configured as '{provider_name}' but {key_env} not set");
+                    searcher
+                }
             }
         }
     } else {
@@ -201,10 +237,19 @@ where
             .or_else(|| std::env::var("VOYAGE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("voyage", k)));
         match auto {
             Some((name, key)) => match skelesearch_rerank_api::reranker_from_name(name, key) {
-                Ok(r)  => searcher.with_reranker(Box::new(r)),
+                Ok(r)  => {
+                    tracing::info!(provider = name, "cloud reranker enabled");
+                    searcher.with_reranker(Box::new(r))
+                }
                 Err(_) => searcher,
             },
-            None => searcher,
+            None => {
+                // No cloud API keys and no explicit config — skip reranking.
+                // Local CPU cross-encoders (MiniLM, gte-modernbert) are either
+                // too slow or not code-aware enough to improve results.
+                // Users can opt in via .skelesearch.toml [search.reranker].
+                searcher
+            }
         }
     }
 }
@@ -231,6 +276,16 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
         .with_excludes(config.index.exclude.clone())
         .with_include_extensions(config.index.include_extensions.clone())
         .with_symbol_enrichment(config.index.symbol_enrichment);
+    let indexer = if config.index.summarize {
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
+        } else {
+            tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
+            indexer
+        }
+    } else {
+        indexer
+    };
     let start = std::time::Instant::now();
     let result = indexer.index_path(&root).await?;
     let elapsed = start.elapsed();
@@ -252,6 +307,7 @@ async fn run_search(
     provider_name: String,
     max_tokens: Option<usize>,
     branch_scope: bool,
+    show_timings: bool,
 ) -> anyhow::Result<()> {
     let root = std::env::current_dir().context("failed to get current directory")?;
     let dir = index_dir(&root);
@@ -284,9 +340,30 @@ async fn run_search(
     } else {
         0
     };
-    let mut results = searcher.search(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await?;
+    let (mut results, timings) = searcher.search_with_timings(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await?;
     let elapsed = start.elapsed();
-    tracing::info!(elapsed_ms = elapsed.as_millis() as u64, results = results.len(), "search complete");
+    tracing::info!(
+        embed_ms = timings.embed_ms,
+        retrieve_ms = timings.retrieve_ms,
+        expand_ms = timings.expand_ms,
+        rerank_ms = timings.rerank_ms,
+        graph_ms = timings.graph_ms,
+        total_ms = timings.total_ms,
+        results = results.len(),
+        "search complete",
+    );
+
+    if show_timings {
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr();
+        writeln!(stderr, "Pipeline timings:").ok();
+        writeln!(stderr, "  embed:    {}ms", timings.embed_ms).ok();
+        writeln!(stderr, "  retrieve: {}ms", timings.retrieve_ms).ok();
+        writeln!(stderr, "  expand:   {}ms", timings.expand_ms).ok();
+        writeln!(stderr, "  rerank:   {}ms", timings.rerank_ms).ok();
+        writeln!(stderr, "  graph:    {}ms", timings.graph_ms).ok();
+        writeln!(stderr, "  total:    {}ms", timings.total_ms).ok();
+    }
 
     // Filter to branch-changed files if requested.
     if branch_scope {
@@ -492,6 +569,16 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                     .with_excludes(config.index.exclude.clone())
                     .with_include_extensions(config.index.include_extensions.clone())
                     .with_symbol_enrichment(config.index.symbol_enrichment);
+                let indexer = if config.index.summarize {
+                    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                        indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
+                    } else {
+                        tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
+                        indexer
+                    }
+                } else {
+                    indexer
+                };
                 match indexer.index_path(&root).await {
                     Ok(r) => eprintln!(
                         "skelesearch watch: indexed {} file(s) in {}",
@@ -567,6 +654,16 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                                     let indexer = Indexer::new(backend, manifest, provider)
                                         .with_excludes(config.index.exclude.clone())
                                         .with_include_extensions(config.index.include_extensions.clone());
+                                    let indexer = if config.index.summarize {
+                                        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                                            indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
+                                        } else {
+                                            tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
+                                            indexer
+                                        }
+                                    } else {
+                                        indexer
+                                    };
                                     match indexer.index_path(&root).await {
                                         Ok(r) => eprintln!(
                                             "skelesearch watch: re-indexed {} file(s), {} chunk(s)",

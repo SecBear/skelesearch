@@ -205,6 +205,27 @@ impl ManifestStore {
         )?;
         Ok(())
     }
+
+    /// Clear all file-hash entries, forcing a full re-index on next run.
+    ///
+    /// Called when the embedding provider or dimension changes so that every
+    /// file is treated as a candidate regardless of its stored mtime/size.
+    pub fn clear_file_hashes(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        conn.execute("DELETE FROM file_hashes", [])?;
+        Ok(())
+    }
+
+    /// Clear all cached embeddings, forcing a full re-embed on next run.
+    ///
+    /// Called alongside `clear_file_hashes` whenever the embedding provider
+    /// changes (even at the same dimension), so stale vectors from the old
+    /// provider are never served to the new one.
+    pub fn clear_embedding_cache(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("manifest lock: {e}"))?;
+        conn.execute("DELETE FROM embedding_cache", [])?;
+        Ok(())
+    }
 }
 impl ManifestStore {
     /// Count files where stored mtime differs from current filesystem mtime.

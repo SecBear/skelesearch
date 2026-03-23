@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 
@@ -51,6 +51,21 @@ def extract_gold_files(row) -> list[str]:
     return list(set(e["file"] for e in gc))
 
 
+def extract_gold_spans(row) -> list[dict]:
+    """Extract gold spans (file + line ranges) from gold_context."""
+    gc = row["gold_context"]
+    if isinstance(gc, str):
+        gc = json.loads(gc)
+    return [
+        {
+            "file": e["file"],
+            "start_line": e["start_line"],
+            "end_line": e["end_line"],
+        }
+        for e in gc
+    ]
+
+
 def clone_at_commit(repo_url: str, commit: str, dest: Path) -> bool:
     """Shallow clone a repo and checkout a specific commit."""
     try:
@@ -69,24 +84,79 @@ def clone_at_commit(repo_url: str, commit: str, dest: Path) -> bool:
         return False
 
 
-def run_skelesearch(binary: str, project_dir: Path, query: str, provider: str = "fastembed", top_k: int = 10) -> list[str]:
-    """Index and search with skelesearch, return retrieved file paths."""
-    env = os.environ.copy()
+def count_source_files(project_dir: Path) -> int:
+    """Quick count of source files in a repo (no hidden dirs, no vendor)."""
+    count = 0
+    skip_dirs = {'.git', 'node_modules', 'vendor', '.venv', '__pycache__', 'build', 'dist'}
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+        count += len(files)
+    return count
 
-    # Index
-    idx_result = subprocess.run(
-        [binary, "index", str(project_dir), "--provider", provider],
-        capture_output=True, timeout=900, env=env,
-    )
-    if idx_result.returncode != 0:
-        print(f"  WARN: index failed: {idx_result.stderr[:200]}", file=sys.stderr)
-        return []
+
+def run_skelesearch(
+    binary: str,
+    project_dir: Path,
+    query: str,
+    provider: str = "fastembed",
+    top_k: int = 10,
+    use_cache: bool = True,
+    index_timeout: int = 3600,
+    max_files: int = 20000,
+) -> list[dict]:
+    """Index (if needed) and search with skelesearch.
+
+    Returns list of dicts with file, start_line, end_line per retrieved chunk.
+    Caching: if .skelesearch/ already exists and use_cache is True, skip indexing.
+    Repos with more than max_files source files are skipped (too large for CPU indexing).
+    """
+    env = os.environ.copy()
+    # Enable tracing output from skelesearch
+    env.setdefault("RUST_LOG", "skelesearch=info")
+    skel_dir = project_dir / ".skelesearch"
+
+    if not use_cache or not skel_dir.exists():
+        # Check repo size before indexing
+        file_count = count_source_files(project_dir)
+        if file_count > max_files:
+            print(f"  SKIP: {file_count} files exceeds limit of {max_files}", file=sys.stderr)
+            return []
+        print(f"  Indexing {file_count} files...")
+
+        # Need to index — wipe any stale state first
+        if skel_dir.exists():
+            shutil.rmtree(skel_dir)
+
+        # Stream output so we can see progress and diagnose hangs
+        idx_proc = subprocess.Popen(
+            [binary, "index", str(project_dir), "--provider", provider],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, text=True,
+        )
+        try:
+            stdout, _ = idx_proc.communicate(timeout=index_timeout)
+            if idx_proc.returncode != 0:
+                print(f"  WARN: index failed (exit {idx_proc.returncode}): {stdout[:300]}", file=sys.stderr)
+                return []
+            # Print last line of output (summary)
+            last_line = stdout.strip().split('\n')[-1] if stdout.strip() else ''
+            if last_line:
+                print(f"  Index: {last_line}")
+        except subprocess.TimeoutExpired:
+            idx_proc.kill()
+            idx_proc.wait()
+            print(f"  WARN: index timed out after {index_timeout}s", file=sys.stderr)
+            return []
 
     # Search
-    search_result = subprocess.run(
-        [binary, "search", query, "--top-k", str(top_k), "--json"],
-        capture_output=True, timeout=60, env=env, cwd=str(project_dir),
-    )
+    try:
+        search_result = subprocess.run(
+            [binary, "search", query, "--top-k", str(top_k), "--json"],
+            capture_output=True, timeout=120, env=env, cwd=str(project_dir),
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  TIMEOUT: search exceeded 120s, skipping", file=sys.stderr)
+        return []
     if search_result.returncode != 0:
         print(f"  WARN: search failed: {search_result.stderr[:200]}", file=sys.stderr)
         return []
@@ -94,34 +164,111 @@ def run_skelesearch(binary: str, project_dir: Path, query: str, provider: str = 
     try:
         results = json.loads(search_result.stdout)
         if isinstance(results, list):
-            return [r.get("file_path", r.get("file", "")) for r in results]
+            return [
+                {
+                    "file": r.get("file_path", r.get("file", "")),
+                    "start_line": r.get("start_line", 0),
+                    "end_line": r.get("end_line", 0),
+                }
+                for r in results
+            ]
         return []
     except json.JSONDecodeError:
         return []
 
 
-def recall_at_k(retrieved: list[str], expected: list[str], k: int) -> float:
-    if not expected:
+# ---------------------------------------------------------------------------
+# Metric helpers
+# ---------------------------------------------------------------------------
+
+def _file_match(retrieved: str, gold: str) -> bool:
+    """Fuzzy path match: one path is a suffix of the other."""
+    return retrieved.endswith(gold) or gold.endswith(retrieved)
+
+
+def recall_at_k(retrieved_files: list[str], gold_files: list[str], k: int) -> float:
+    if not gold_files:
         return 1.0
-    top_k = retrieved[:k]
-    hits = sum(1 for e in expected if any(r.endswith(e) or e.endswith(r) for r in top_k))
-    return hits / len(expected)
+    top_k = retrieved_files[:k]
+    hits = sum(1 for g in gold_files if any(_file_match(r, g) for r in top_k))
+    return hits / len(gold_files)
 
 
-def precision_at_k(retrieved: list[str], expected: list[str], k: int) -> float:
-    top_k = retrieved[:k]
+def precision_at_k(retrieved_files: list[str], gold_files: list[str], k: int) -> float:
+    top_k = retrieved_files[:k]
     if not top_k:
         return 0.0
-    hits = sum(1 for r in top_k if any(r.endswith(e) or e.endswith(r) for e in expected))
+    hits = sum(1 for r in top_k if any(_file_match(r, g) for g in gold_files))
     return hits / len(top_k)
 
 
-def mrr(retrieved: list[str], expected: list[str]) -> float:
-    for i, r in enumerate(retrieved):
-        if any(r.endswith(e) or e.endswith(r) for e in expected):
+def mrr(retrieved_files: list[str], gold_files: list[str]) -> float:
+    for i, r in enumerate(retrieved_files):
+        if any(_file_match(r, g) for g in gold_files):
             return 1.0 / (i + 1)
     return 0.0
 
+
+def file_f1(retrieved_files: list[str], gold_files: list[str]) -> tuple[float, float, float]:
+    """Return (precision, recall, f1) at the file level."""
+    if not retrieved_files and not gold_files:
+        return 1.0, 1.0, 1.0
+    if not retrieved_files:
+        return 0.0, 0.0, 0.0
+    if not gold_files:
+        return 0.0, 1.0, 0.0  # retrieved something but nothing expected
+
+    tp_r = sum(1 for r in retrieved_files if any(_file_match(r, g) for g in gold_files))
+    tp_g = sum(1 for g in gold_files if any(_file_match(r, g) for r in retrieved_files))
+
+    precision = tp_r / len(retrieved_files)
+    recall = tp_g / len(gold_files)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    return precision, recall, f1
+
+
+def line_overlap(
+    retrieved_spans: list[dict],
+    gold_spans: list[dict],
+) -> tuple[float, float, float]:
+    """Compute line-level precision, recall, F1 across all files.
+
+    Each span is {file, start_line, end_line}.  We build sets of (file, line_num)
+    pairs and compute standard P/R/F1 over those sets.
+    """
+    retrieved_lines: set[tuple[str, int]] = set()
+    for s in retrieved_spans:
+        f = s["file"]
+        for ln in range(s["start_line"], s["end_line"] + 1):
+            retrieved_lines.add((f, ln))
+
+    gold_lines: set[tuple[str, int]] = set()
+    for s in gold_spans:
+        f = s["file"]
+        for ln in range(s["start_line"], s["end_line"] + 1):
+            gold_lines.add((f, ln))
+
+    if not retrieved_lines and not gold_lines:
+        return 1.0, 1.0, 1.0
+    if not retrieved_lines:
+        return 0.0, 0.0, 0.0
+    if not gold_lines:
+        return 0.0, 1.0, 0.0
+
+    tp = len(retrieved_lines & gold_lines)
+    precision = tp / len(retrieved_lines)
+    recall = tp / len(gold_lines)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    return precision, recall, f1
+
+
+def safe_mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Run skelesearch against ContextBench")
@@ -131,6 +278,24 @@ def main():
     parser.add_argument("--output", required=True, help="Output JSON path")
     parser.add_argument("--cache-dir", default=None, help="Dir to cache repo clones")
     parser.add_argument("--provider", default="fastembed", help="Embedding provider")
+    parser.add_argument("--top-k", type=int, default=10, help="Number of results to retrieve (default: 10)")
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Force re-index even if .skelesearch/ already exists",
+    )
+    parser.add_argument(
+        "--index-timeout",
+        type=int,
+        default=3600,
+        help="Timeout in seconds for indexing a repo (default: 3600)",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=20000,
+        help="Skip repos with more source files than this (default: 20000)",
+    )
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
 
@@ -152,6 +317,7 @@ def main():
         lang = row["language"]
         query = row["problem_statement"]
         gold_files = extract_gold_files(row)
+        gold_spans = extract_gold_spans(row)
 
         print(f"[{i+1}/{len(instances)}] {instance_id} ({lang}, {len(gold_files)} gold files)")
 
@@ -161,61 +327,137 @@ def main():
             if not clone_at_commit(row["repo_url"], commit, repo_dir):
                 results.append({
                     "instance_id": instance_id, "language": lang,
-                    "status": "clone_failed", "r5": 0, "r10": 0, "p5": 0, "mrr": 0,
+                    "status": "clone_failed",
+                    "r5": 0, "r10": 0, "p5": 0, "mrr": 0,
+                    "file_precision": 0, "file_recall": 0, "file_f1": 0,
+                    "line_precision": 0, "line_recall": 0, "line_f1": 0,
                 })
                 continue
 
-        # Clear any previous index
+        # Determine whether we have a warm index cache
         skel_dir = repo_dir / ".skelesearch"
-        if skel_dir.exists():
-            shutil.rmtree(skel_dir)
+        cache_hit = skel_dir.exists() and not args.no_cache
+        if cache_hit:
+            print(f"  Using cached index for {repo}@{commit[:8]}")
 
-        # Run skelesearch
+        # Run skelesearch (index + search, or search-only on cache hit)
         t0 = time.time()
-        retrieved = run_skelesearch(args.binary, repo_dir, query[:2000], provider=args.provider)  # cap query length
+        chunks = run_skelesearch(
+            args.binary,
+            repo_dir,
+            query[:2000],  # cap query length
+            provider=args.provider,
+            top_k=args.top_k,
+            use_cache=not args.no_cache,
+            index_timeout=args.index_timeout,
+            max_files=args.max_files,
+        )
         elapsed = time.time() - t0
 
-        r5 = recall_at_k(retrieved, gold_files, 5)
-        r10 = recall_at_k(retrieved, gold_files, 10)
-        p5 = precision_at_k(retrieved, gold_files, 5)
-        m = mrr(retrieved, gold_files)
+        # Record skipped instances (too large or timed out) without zeroing metrics
+        if not chunks and gold_files:
+            print(f"  SKIPPED: no results returned, recording as skipped", file=sys.stderr)
+            results.append({
+                "instance_id": instance_id, "language": lang,
+                "repo": repo,
+                "status": "skipped",
+                "r5": None, "r10": None, "p5": None, "mrr": None,
+                "file_precision": None, "file_recall": None, "file_f1": None,
+                "line_precision": None, "line_recall": None, "line_f1": None,
+                "gold_files": gold_files,
+                "retrieved_files": [],
+                "elapsed_s": round(elapsed, 1),
+            })
+            lang_metrics[lang].append(results[-1])
+            continue
+
+        retrieved_files = [c["file"] for c in chunks]
+
+        # Legacy metrics (preserved)
+        r5 = recall_at_k(retrieved_files, gold_files, 5)
+        r10 = recall_at_k(retrieved_files, gold_files, 10)
+        p5 = precision_at_k(retrieved_files, gold_files, 5)
+        m = mrr(retrieved_files, gold_files)
+
+        # New metrics
+        fp, fr, ff1 = file_f1(retrieved_files, gold_files)
+        lp, lr, lf1 = line_overlap(chunks, gold_spans)
+
+        print(
+            f"  File: P={fp:.2f} R={fr:.2f} F1={ff1:.2f} | "
+            f"Line: P={lp:.2f} R={lr:.2f} F1={lf1:.2f} | ({elapsed:.1f}s)"
+        )
 
         result = {
             "instance_id": instance_id,
             "language": lang,
             "repo": repo,
             "status": "ok",
+            # Legacy metrics
             "r5": round(r5, 4),
             "r10": round(r10, 4),
             "p5": round(p5, 4),
             "mrr": round(m, 4),
+            # File-level F1
+            "file_precision": round(fp, 4),
+            "file_recall": round(fr, 4),
+            "file_f1": round(ff1, 4),
+            # Line-level F1
+            "line_precision": round(lp, 4),
+            "line_recall": round(lr, 4),
+            "line_f1": round(lf1, 4),
+            # Provenance
             "gold_files": gold_files,
-            "retrieved_files": retrieved[:10],
+            "retrieved_files": retrieved_files[:args.top_k],
             "elapsed_s": round(elapsed, 1),
         }
         results.append(result)
         lang_metrics[lang].append(result)
 
-        print(f"  R@5={r5:.2f} R@10={r10:.2f} P@5={p5:.2f} MRR={m:.2f} ({elapsed:.1f}s)")
-
     # Aggregate
     print("\n=== AGGREGATE ===")
     all_ok = [r for r in results if r["status"] == "ok"]
+    failed = sum(1 for r in results if r["status"] != "ok")
+
+    aggregate: dict = {}
     if all_ok:
-        mean_r5 = sum(r["r5"] for r in all_ok) / len(all_ok)
-        mean_r10 = sum(r["r10"] for r in all_ok) / len(all_ok)
-        mean_p5 = sum(r["p5"] for r in all_ok) / len(all_ok)
-        mean_mrr = sum(r["mrr"] for r in all_ok) / len(all_ok)
-        print(f"Overall: R@5={mean_r5:.3f} R@10={mean_r10:.3f} P@5={mean_p5:.3f} MRR={mean_mrr:.3f} ({len(all_ok)} instances)")
+        mean_r5 = safe_mean([r["r5"] for r in all_ok])
+        mean_r10 = safe_mean([r["r10"] for r in all_ok])
+        mean_p5 = safe_mean([r["p5"] for r in all_ok])
+        mean_mrr = safe_mean([r["mrr"] for r in all_ok])
+        mean_file_f1 = safe_mean([r["file_f1"] for r in all_ok])
+        mean_line_precision = safe_mean([r["line_precision"] for r in all_ok])
+        mean_line_recall = safe_mean([r["line_recall"] for r in all_ok])
+        mean_line_f1 = safe_mean([r["line_f1"] for r in all_ok])
+
+        print(
+            f"Overall: R@5={mean_r5:.3f} R@10={mean_r10:.3f} P@5={mean_p5:.3f} MRR={mean_mrr:.3f} "
+            f"FileF1={mean_file_f1:.3f} LineF1={mean_line_f1:.3f} ({len(all_ok)} instances)"
+        )
 
         for lang in sorted(lang_metrics.keys()):
             ok = [r for r in lang_metrics[lang] if r["status"] == "ok"]
             if ok:
-                lr5 = sum(r["r5"] for r in ok) / len(ok)
-                lmrr = sum(r["mrr"] for r in ok) / len(ok)
-                print(f"  {lang}: R@5={lr5:.3f} MRR={lmrr:.3f} ({len(ok)} instances)")
+                lr5 = safe_mean([r["r5"] for r in ok])
+                lmrr = safe_mean([r["mrr"] for r in ok])
+                lff1 = safe_mean([r["file_f1"] for r in ok])
+                llf1 = safe_mean([r["line_f1"] for r in ok])
+                print(
+                    f"  {lang}: R@5={lr5:.3f} MRR={lmrr:.3f} "
+                    f"FileF1={lff1:.3f} LineF1={llf1:.3f} ({len(ok)} instances)"
+                )
 
-    failed = sum(1 for r in results if r["status"] != "ok")
+        aggregate = {
+            "mean_r5": round(mean_r5, 4),
+            "mean_r10": round(mean_r10, 4),
+            "mean_p5": round(mean_p5, 4),
+            "mean_mrr": round(mean_mrr, 4),
+            "mean_file_f1": round(mean_file_f1, 4),
+            "mean_line_precision": round(mean_line_precision, 4),
+            "mean_line_recall": round(mean_line_recall, 4),
+            "mean_line_f1": round(mean_line_f1, 4),
+        }
+
     if failed:
         print(f"\n{failed} instances failed (clone/index/search)")
 
@@ -227,16 +469,13 @@ def main():
         "instances": len(results),
         "succeeded": len(all_ok),
         "failed": failed,
-        "aggregate": {
-            "mean_r5": round(mean_r5, 4) if all_ok else 0,
-            "mean_r10": round(mean_r10, 4) if all_ok else 0,
-            "mean_p5": round(mean_p5, 4) if all_ok else 0,
-            "mean_mrr": round(mean_mrr, 4) if all_ok else 0,
-        },
+        "aggregate": aggregate,
         "per_language": {
             lang: {
-                "mean_r5": round(sum(r["r5"] for r in ok) / len(ok), 4),
-                "mean_mrr": round(sum(r["mrr"] for r in ok) / len(ok), 4),
+                "mean_r5": round(safe_mean([r["r5"] for r in ok]), 4),
+                "mean_mrr": round(safe_mean([r["mrr"] for r in ok]), 4),
+                "mean_file_f1": round(safe_mean([r["file_f1"] for r in ok]), 4),
+                "mean_line_f1": round(safe_mean([r["line_f1"] for r in ok]), 4),
                 "count": len(ok),
             }
             for lang in sorted(lang_metrics.keys())

@@ -6,6 +6,23 @@ use crate::{expander::QueryExpander, reranker::{RerankCandidate, Reranker}, Chun
 // Public output types
 // ---------------------------------------------------------------------------
 
+/// Timing breakdown of search pipeline phases.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SearchTimings {
+    /// Query embedding generation (ms).
+    pub embed_ms: u64,
+    /// HNSW + BM25 + RRF fusion retrieval (ms).
+    pub retrieve_ms: u64,
+    /// LLM query expansion (ms, 0 if skipped).
+    pub expand_ms: u64,
+    /// Cross-encoder reranking (ms, 0 if skipped).
+    pub rerank_ms: u64,
+    /// Graph augmentation (ms, 0 if disabled).
+    pub graph_ms: u64,
+    /// End-to-end total (ms).
+    pub total_ms: u64,
+}
+
 /// Per-file context: all indexed chunks plus one-hop import graph for that file.
 #[derive(Debug, Clone, Default)]
 pub struct FileContext {
@@ -37,9 +54,136 @@ const STOP_WORDS: &[&str] = &[
     "them", "their", "about",
 ];
 
-/// Extract significant keywords from a natural language query.
-/// Returns the original query plus deduplicated keywords, giving BM25
-/// more signal for term matching.
+/// GitHub issue template boilerplate phrases that dilute embeddings.
+/// These add zero retrieval signal and inflate the query vector away from code.
+const BOILERPLATE_PREFIXES: &[&str] = &[
+    "i have searched",
+    "i have read",
+    "i have checked",
+    "i'm submitting",
+    "i am submitting",
+    "is there an existing issue",
+    "have you read the",
+    "current behavior",
+    "expected behavior",
+    "steps to reproduce",
+    "additional context",
+    "environment",
+    "operating system",
+    "python version",
+    "node version",
+    "browser version",
+    "package version",
+];
+
+/// Preprocess a verbose query (e.g. GitHub issue description) into a compact
+/// form that embeds well and produces good BM25 matches.
+///
+/// Applied before embedding AND BM25, so it affects both retrieval paths.
+///
+/// Strategy:
+/// 1. Strip markdown headers, HTML comments, checkbox lines, boilerplate.
+/// 2. Extract backtick-quoted symbols (high-confidence identifiers).
+/// 3. Compress to: first meaningful sentence + extracted symbols + code tokens.
+/// 4. Cap at ~200 words to prevent embedding dilution.
+pub fn preprocess_query(query: &str) -> String {
+    let mut symbols: Vec<String> = Vec::new();
+    let mut lines: Vec<&str> = Vec::new();
+
+    let mut in_fence = false;
+    for line in query.lines() {
+        let trimmed = line.trim();
+
+        // Track fenced code blocks — content inside ``` ... ``` is literal code
+        // (tracebacks, stack dumps, diffs) that should not be treated as prose.
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence { continue; }
+
+        // Skip empty lines.
+        if trimmed.is_empty() { continue; }
+
+        // Skip markdown headers (### Steps, ## Environment, etc.).
+        if trimmed.starts_with('#') { continue; }
+
+        // Skip HTML comments.
+        if trimmed.starts_with("<!--") || trimmed.starts_with("-->") { continue; }
+
+        // Skip checkbox lines (issue templates).
+        if trimmed.starts_with("- [x]") || trimmed.starts_with("- [ ]") { continue; }
+
+        // Skip boilerplate phrases.
+        let lower = trimmed.to_lowercase();
+        if BOILERPLATE_PREFIXES.iter().any(|p| lower.starts_with(p)) { continue; }
+
+        // Skip lines that are just URLs.
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") { continue; }
+
+        // Extract backtick-quoted symbols (high-confidence identifiers).
+        let mut rest = trimmed;
+        while let Some(start) = rest.find('`') {
+            rest = &rest[start + 1..];
+            if let Some(end) = rest.find('`') {
+                let sym = &rest[..end];
+                // Only keep short, identifier-like content (not code blocks).
+                if !sym.is_empty() && sym.len() <= 80 && !sym.contains('\n') {
+                    symbols.push(sym.to_string());
+                }
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+
+        lines.push(trimmed);
+    }
+    // If the query is already short (<40 words), return it with symbols appended.
+    let word_count: usize = lines.iter().map(|l| l.split_whitespace().count()).sum();
+    if word_count <= 40 {
+        if symbols.is_empty() {
+            return lines.join(" ");
+        }
+        let mut result = lines.join(" ");
+        for sym in &symbols {
+            if !result.contains(sym.as_str()) {
+                result.push(' ');
+                result.push_str(sym);
+            }
+        }
+        return result;
+    }
+
+    // For long queries: take first 3 meaningful lines + symbols.
+    let mut result: Vec<String> = Vec::new();
+    let mut total_words = 0usize;
+    for line in &lines {
+        let words = line.split_whitespace().count();
+        if total_words + words > 150 { break; }
+        result.push(line.to_string());
+        total_words += words;
+    }
+
+    // Append extracted symbols for BM25 boost.
+    for sym in &symbols {
+        let sym_str = sym.as_str();
+        if !result.iter().any(|r| r.contains(sym_str)) {
+            result.push(sym.clone());
+        }
+    }
+
+    let result = result.join(" ");
+    // If every line was filtered out (e.g. the query was pure boilerplate), avoid
+    // returning an empty string: that would produce a zero-vector embedding and
+    // zero BM25 matches. Fall back to the original query instead.
+    if result.trim().is_empty() {
+        return query.to_string();
+    }
+    result
+}
+
+
 /// Sanitize a query string for CozoDB's FTS mini-language.
 ///
 /// The FTS index uses `tokenizer: Simple, filters: [Lowercase, AlphaNumOnly]`,
@@ -138,11 +282,64 @@ pub struct Searcher<B, P> {
     /// Optional LLM-based query expander that enriches conceptual queries with
     /// code-vocabulary keywords before BM25 matching.  `None` skips expansion.
     expander: Option<Box<dyn QueryExpander>>,
+    /// Whether to apply the log-dampened PageRank score boost.  Enabled by
+    /// default; set to `false` via `with_pagerank_boost(false)` to ablate.
+    pagerank_boost: bool,
+    /// When true, delegate retrieval to `unified_search` which fuses FTS + HNSW +
+    /// graph + PageRank in a single Datalog round-trip.  MMR and cross-encoder
+    /// reranking still run in Rust after the unified query returns.
+    /// Disabled by default; enable via `with_unified_search(true)`.
+    use_unified_search: bool,
+    /// Tuning parameters for the unified search query.
+    fts_weight: f64,
+    graph_score_factor: f64,
+    graph_min_score: f64,
+    pagerank_factor: f64,
+    /// LRU cache for query embeddings.  Bounded at 256 entries.
+    query_embed_cache: std::sync::Mutex<lru::LruCache<String, Vec<f32>>>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     pub fn new(backend: Arc<B>, provider: P) -> Self {
-        Self { backend, provider, reranker: None, expander: None }
+        Self {
+            backend,
+            provider,
+            reranker: None,
+            expander: None,
+            pagerank_boost: true,
+            use_unified_search: false,
+            fts_weight: 0.55,
+            graph_score_factor: 0.3,
+            graph_min_score: 0.005,
+            pagerank_factor: 0.1,
+            query_embed_cache: std::sync::Mutex::new(
+                lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
+            ),
+        }
+    }
+
+    /// Set whether the log-dampened PageRank score boost is applied.
+    /// Pass `false` to disable for ablation benchmarks.
+    pub fn with_pagerank_boost(mut self, enabled: bool) -> Self {
+        self.pagerank_boost = enabled;
+        self
+    }
+
+    /// Enable single-query unified retrieval (FTS + HNSW + graph + PageRank in one
+    /// Datalog round-trip).  MMR and cross-encoder reranking still run in Rust.
+    /// Default: `false` (uses the multi-phase hybrid pipeline for compatibility).
+    pub fn with_unified_search(mut self, enabled: bool) -> Self {
+        self.use_unified_search = enabled;
+        self
+    }
+
+    /// Apply tuning parameters from a `SearchConfig`.
+    pub fn with_search_tuning(mut self, config: &crate::Config) -> Self {
+        self.fts_weight = config.search.fts_weight();
+        self.graph_score_factor = config.search.graph_score_factor();
+        self.graph_min_score = config.search.graph_min_score();
+        self.pagerank_factor = config.search.pagerank_factor();
+        self
     }
 
     /// Attach an LLM-based query expander.  Called once at construction time;
@@ -179,27 +376,95 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         diversity: f32,
         max_tokens: Option<usize>,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        // Produce the query vector.  A single-element batch keeps the
-        // provider interface uniform.
-        let embeddings = self.provider.embed_batch(vec![query.to_string()]).await?;
-        let query_vec = embeddings
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
+        let (results, _timings) = self
+            .search_with_timings(query, top_k, include_graph, max_depth, diversity, max_tokens)
+            .await?;
+        Ok(results)
+    }
 
-        // LLM-based query expansion for conceptual queries.
+    /// Like [`Self::search`] but also returns a [`SearchTimings`] breakdown.
+    ///
+    /// Use this from callers that need per-phase latency data (e.g. the MCP
+    /// server surface).  All other callers should prefer [`Self::search`] to
+    /// avoid destructuring the tuple.
+    #[tracing::instrument(skip_all, fields(%query, top_k, diversity))]
+    pub async fn search_with_timings(
+        &self,
+        query: &str,
+        top_k: usize,
+        include_graph: bool,
+        max_depth: usize,
+        diversity: f32,
+        max_tokens: Option<usize>,
+    ) -> anyhow::Result<(Vec<SearchResult>, SearchTimings)> {
+        let total_start = std::time::Instant::now();
+        let mut timings = SearchTimings::default();
+
+        // -- Query preprocessing ---------------------------------------------
+        // Strip issue template boilerplate and compress verbose queries before
+        // embedding.  This affects both the vector embedding and BM25 paths.
+        let preprocessed = preprocess_query(query);
+
+        // -- Embedding (cache-aware) -------------------------------------------
+        // Check the LRU cache first to avoid a redundant embed API call for
+        // repeated or near-identical queries.  Empty queries are not cached.
+        let embed_start = std::time::Instant::now();
+        let normalized_query = preprocessed.trim().to_string();
+        let query_vec: Vec<f32> = if normalized_query.is_empty() {
+            // Empty query: skip cache, return zero vector.
+            vec![0.0; self.provider.dim()]
+        } else {
+            // Probe cache with a scoped lock — guard must drop before any await.
+            let cached = {
+                self.query_embed_cache
+                    .lock()
+                    .expect("query_embed_cache mutex poisoned")
+                    .get(&normalized_query)
+                    .cloned()
+            };
+            if let Some(vec) = cached {
+                tracing::debug!("query embedding cache hit");
+                vec
+            } else {
+                // Apply model-specific query prefix (e.g. CodeRankEmbed instruction prefix).
+                let query_text = match self.provider.query_prefix() {
+                    Some(prefix) => format!("{prefix}{normalized_query}"),
+                    None => normalized_query.clone(),
+                };
+                let embeddings = self.provider.embed_queries(vec![query_text]).await?;
+                let vec = embeddings
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| vec![0.0; self.provider.dim()]);
+                // Re-acquire lock after await to store the result.
+                self.query_embed_cache
+                    .lock()
+                    .expect("query_embed_cache mutex poisoned")
+                    .put(normalized_query, vec.clone());
+                vec
+            }
+        };
+        timings.embed_ms = embed_start.elapsed().as_millis() as u64;
+
+        // -- LLM query expansion -----------------------------------------------
         // Only runs when an expander is configured and the query looks conceptual.
         // Failures degrade gracefully: expansion is skipped, search proceeds.
+        let expand_start = std::time::Instant::now();
         let expanded_keywords_raw = if let Some(ref expander) = self.expander {
             use crate::router::{classify_query, QueryStrategy};
-            if classify_query(query) == QueryStrategy::Semantic {
-                expander.expand(query).await.unwrap_or_default()
+            if classify_query(&preprocessed) == QueryStrategy::Semantic {
+                expander.expand(&preprocessed).await.unwrap_or_default()
             } else {
                 vec![]
             }
         } else {
             vec![]
         };
+        // Only charge expand_ms when the expander is configured (i.e. it ran
+        // or was at least considered); 0 when no expander is attached.
+        if self.expander.is_some() {
+            timings.expand_ms = expand_start.elapsed().as_millis() as u64;
+        }
 
         // Filter expansion keywords that have no lexical overlap with the
         // original query — prevents semantic drift from LLM hallucination.
@@ -233,7 +498,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Original query terms appear first and get natural BM25 term frequency.
         // Expansion keywords are appended once (lower weight than the original
         // query which may have terms repeated from expand_query()).
-        let mut bm25_query = expand_query(query);
+        // NOTE: CozoDB FTS deduplicates repeated query tokens at index time, so
+        // repeating a symbol in the query string does not increase its TF weight.
+        // Symbols are already included by preprocess_query; for true per-term
+        // boosting, run a separate symbol-index lookup and merge results.
+        let mut bm25_query = expand_query(&preprocessed);
         if !expanded_keywords.is_empty() {
             // Only append keywords not already present in the query
             let existing: std::collections::HashSet<String> = bm25_query
@@ -254,15 +523,32 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // other special characters that break the FTS query mini-language.
         let bm25_query = sanitize_fts_query(&bm25_query);
 
-        let mut hits = self
-            .backend
-            .hybrid_search(&query_vec, &bm25_query, top_k)
-            .await?;
+        // -- Hybrid retrieval --------------------------------------------------
+        // When `use_unified_search` is true, a single Datalog round-trip handles
+        // FTS + HNSW + PageRank boost + optional graph walk together.  The separate
+        // pagerank_boost and graph augmentation steps are skipped in that case.
+        let retrieve_start = std::time::Instant::now();
+        let mut hits = if self.use_unified_search {
+            let gd = if include_graph { max_depth } else { 0 };
+            self.backend
+                .unified_search(
+                    &query_vec, &bm25_query, top_k, gd,
+                    self.fts_weight, self.graph_score_factor,
+                    self.graph_min_score, self.pagerank_factor,
+                )
+                .await?
+        } else {
+            self.backend
+                .hybrid_search(&query_vec, &bm25_query, top_k)
+                .await?
+        };
+        timings.retrieve_ms = retrieve_start.elapsed().as_millis() as u64;
 
         // PageRank boost: structurally important files get a mild score uplift.
         // Log-dampened to prevent hub files from dominating all queries.
         // Applied before graph augmentation so expanded hits inherit consistent scaling.
-        {
+        // Gated on `self.pagerank_boost` so benchmarks can ablate this signal.
+        if !self.use_unified_search && self.pagerank_boost {
             let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
             let ranks = self.backend.get_file_ranks(&file_paths).await.unwrap_or_default();
             if !ranks.is_empty() {
@@ -284,15 +570,28 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         }
 
         if hits.is_empty() {
-            return Ok(vec![]);
+            timings.total_ms = total_start.elapsed().as_millis() as u64;
+            tracing::info!(
+                embed_ms = timings.embed_ms,
+                retrieve_ms = timings.retrieve_ms,
+                expand_ms = timings.expand_ms,
+                rerank_ms = timings.rerank_ms,
+                graph_ms = timings.graph_ms,
+                total_ms = timings.total_ms,
+                "search pipeline timings"
+            );
+            return Ok((vec![], timings));
         }
 
-        // Graph augmentation: pull in chunks from files reachable via resolved
-        // import edges.  Runs after hybrid search (so we have seed hits) but
-        // before MMR + reranker (so expanded results participate in filtering).
-        if include_graph && max_depth > 0 {
+        // -- Graph augmentation ------------------------------------------------
+        // Pull in chunks from files reachable via resolved import edges.
+        // Runs after hybrid search (so we have seed hits) but before MMR +
+        // reranker (so expanded results participate in filtering).
+        if !self.use_unified_search && include_graph && max_depth > 0 {
+            let graph_start = std::time::Instant::now();
             let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
-            hits = self.augment_with_graph(hits, max_depth, best_score).await?;
+            hits = self.augment_with_graph(hits, max_depth, best_score, &query_vec).await?;
+            timings.graph_ms = graph_start.elapsed().as_millis() as u64;
         }
 
         // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
@@ -321,6 +620,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             );
         }
 
+        // -- Reranking ---------------------------------------------------------
         // Optional cross-encoder reranking for precision improvement.
         // Reranker sees all post-MMR results; it reorders them before the
         // token-budget filter selects the top slice.
@@ -333,12 +633,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // we lean on fusion; the tail benefits more from reranker signal.
         let hits = if !strong_signal {
             if let Some(ref reranker) = self.reranker {
+                let rerank_start = std::time::Instant::now();
                 let candidates: Vec<RerankCandidate> = hits
                     .iter()
                     .enumerate()
                     .map(|(i, h)| RerankCandidate { index: i, text: h.content.clone() })
                     .collect();
                 let scores = reranker.rerank(query, candidates).await?;
+                timings.rerank_ms = rerank_start.elapsed().as_millis() as u64;
                 let mut scored: Vec<_> = hits.into_iter().zip(scores).collect();
                 // Sort by reranker score descending to establish position weights.
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -372,9 +674,18 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             if is_test_file(&hit.file_path) {
                 hit.score *= 0.3;
             } else if is_doc_file(&hit.file_path) {
-                hit.score *= 0.5;
+                if is_docs_directory(&hit.file_path) {
+                    hit.score *= 0.2; // Docs-directory files are almost never the right answer
+                } else {
+                    hit.score *= 0.35; // Inline docs (README.md in root) — still penalized but less
+                }
             } else if is_barrel_file(&hit.file_path) {
-                hit.score *= 0.4;
+                let barrel_penalty = if query_asks_about_entry_point(query) {
+                    0.85 // Mild penalty — barrel files are likely the answer
+                } else {
+                    0.4 // Strong penalty — barrel files are structural noise
+                };
+                hit.score *= barrel_penalty;
             }
         }
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -405,16 +716,31 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             hits
         };
 
-        Ok(hits)
+        timings.total_ms = total_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            embed_ms = timings.embed_ms,
+            retrieve_ms = timings.retrieve_ms,
+            expand_ms = timings.expand_ms,
+            rerank_ms = timings.rerank_ms,
+            graph_ms = timings.graph_ms,
+            total_ms = timings.total_ms,
+            "search pipeline timings"
+        );
+        Ok((hits, timings))
     }
 
     /// Return all indexed chunks, outbound imports, and inbound importers for
     /// `file_path`.  Returns empty arrays for files not in the index — never
     /// an error.
     pub async fn file_context(&self, file_path: &str) -> anyhow::Result<FileContext> {
-        let chunks = self.backend.get_chunks_for_file(file_path).await?;
-        let imports = self.backend.get_imports(file_path).await?;
-        let imported_by = self.backend.get_importers(file_path).await?;
+        let (chunks_res, imports_res, importers_res) = tokio::join!(
+            self.backend.get_chunks_for_file(file_path),
+            self.backend.get_imports(file_path),
+            self.backend.get_importers(file_path),
+        );
+        let chunks = chunks_res?;
+        let imports = imports_res?;
+        let imported_by = importers_res?;
         Ok(FileContext { chunks, imports, imported_by })
     }
 
@@ -449,16 +775,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
     /// Extend `hits` with chunks from files reachable via resolved import edges.
     ///
-    /// Graph-expanded results receive a flat score of `best_score * 0.5`.
-    /// This ensures they rank below direct hits but above noise, and participate
-    /// meaningfully in downstream MMR and reranker stages.
-    /// (Depth-decay `0.5^depth` is deferred until `traverse_imports` returns
-    /// per-hop depth information.)
+    /// Graph-expanded results are scored using `cosine_sim × 0.7^depth × best_score`.
+    /// Chunks with cosine similarity < 0.25 to the query are dropped to prevent result
+    /// flooding from tangentially related imported files.
     async fn augment_with_graph(
         &self,
         mut hits: Vec<SearchResult>,
         max_depth: usize,
         best_score: f64,
+        query_vec: &[f32],
     ) -> anyhow::Result<Vec<SearchResult>> {
         let present: std::collections::HashSet<String> =
             hits.iter().map(|h| h.file_path.clone()).collect();
@@ -466,37 +791,152 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let mut seen_chunks: std::collections::HashSet<(String, usize)> =
             hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
 
-        // BFS traversal depth is handled by traverse_imports.  All reachable
-        // files are scored identically at 0.5× the best direct-hit score.
-        // Depth-decay (0.5^depth) is deferred until traverse_imports returns
-        // per-hop depth info.
-        let graph_score = best_score * 0.5;
+        // Capture seed chunks from the original hits before any augmentation.
+        // Cap at 10 to limit HNSW graph traversal cost.
+        let seed_chunks: Vec<(String, usize)> = hits
+            .iter()
+            .take(10)
+            .map(|h| (h.file_path.clone(), h.chunk_idx))
+            .collect();
 
+        // Phase 1: Collect all graph-reachable files with their minimum depth.
+        // Multiple seed files may reach the same target; keep the shortest path.
+        let mut depth_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for file_path in &present {
-            let reachable = self.backend.traverse_imports(file_path, max_depth).await?;
-            for target in reachable {
-                let chunks = self.backend.get_chunks_for_file(&target).await?;
+            let reachable = self.backend.traverse_imports(file_path, max_depth, None).await?;
+            for (target, depth) in reachable {
+                depth_map.entry(target).and_modify(|d| { if depth < *d { *d = depth; } }).or_insert(depth);
+            }
+        }
+
+        // Phase 2: HNSW proximity expansion — collect specific (fp, ci) targets.
+        // Walks layer 0 of the HNSW graph using seed chunks from the original hits.
+        // Cosine distance threshold 0.3: captures semantically close neighbors
+        // while excluding weakly related chunks.
+        let mut hnsw_map: std::collections::HashMap<(String, usize), f64> = std::collections::HashMap::new();
+        if !seed_chunks.is_empty() {
+            let neighbors = self.backend.hnsw_neighbors(&seed_chunks, 0.3, 50).await?;
+            for (fp, ci, dist) in neighbors {
+                // Keep closest distance (smallest dist = most similar) for each chunk.
+                hnsw_map.entry((fp, ci)).and_modify(|d| { if dist < *d { *d = dist; } }).or_insert(dist);
+            }
+        }
+
+        // Phase 3: Batch fetch ALL chunks for all graph-reachable files in one query.
+        // HNSW files that are also graph-reachable get all chunks fetched here too.
+        // Pure HNSW files (not in depth_map) are omitted intentionally — we only
+        // need the specific (fp, ci) chunk, so we avoid pulling every chunk for those files.
+        let graph_file_list: Vec<&str> = depth_map.keys().map(|s| s.as_str()).collect();
+        let all_graph_chunks = self.backend.get_chunks_for_files(&graph_file_list).await?;
+
+        // Phase 4a: Distribute graph chunks filtered by query relevance.
+        // Chunks with cosine similarity < 0.25 are discarded to avoid flooding results
+        // with tangentially related code from imported files.
+        // Score = best_score × sim × GRAPH_HOP_DECAY^depth (closer import + more relevant = higher score).
+        // GRAPH_HOP_DECAY is 0.3 per hop: hop-1 chunks score at most 0.30×best_score,
+        // hop-2 at most 0.09×best_score.  This keeps graph results clearly subordinate
+        // to primary hits while still surfacing cross-file context.
+        let pre_graph_count = hits.len();
+        const GRAPH_SIM_THRESHOLD: f64 = 0.25;
+        // Per-hop score multiplier: 0.3^depth keeps graph results well below primary hits.
+        const GRAPH_HOP_DECAY: f64 = 0.3;
+        for chunk in all_graph_chunks {
+            let key = (chunk.file_path.clone(), chunk.chunk_idx);
+            if !seen_chunks.insert(key) {
+                continue;
+            }
+            // Skip chunks without embeddings — cannot assess relevance.
+            let emb = match &chunk.embedding {
+                Some(e) if !e.is_empty() => e,
+                _ => continue,
+            };
+            let sim = cosine_sim(query_vec, emb) as f64;
+            if sim < GRAPH_SIM_THRESHOLD {
+                continue;
+            }
+            let depth = *depth_map.get(&chunk.file_path).unwrap_or(&1);
+            let score = best_score * sim * GRAPH_HOP_DECAY.powi(depth as i32);
+            hits.push(SearchResult {
+                file_path: chunk.file_path,
+                chunk_idx: chunk.chunk_idx,
+                content: chunk.content,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                chunk_type: chunk.chunk_type,
+                score,
+                match_quality: "graph".to_string(),
+                why: "graph".to_string(),
+            });
+        }
+
+        // Phase 4b: Fetch and score HNSW-only chunks (specific (fp, ci) pairs not already seen).
+        // These are chunks in files that are NOT graph-reachable — pure proximity neighbors.
+        // We only need one specific chunk per HNSW hit, so fetch file-by-file here.
+        // In practice hnsw_map is small (≤50 entries) so this is cheap.
+        let hnsw_only: Vec<(&String, usize, f64)> = hnsw_map
+            .iter()
+            .filter(|((fp, ci), _)| {
+                // Skip if already added (either as a seed or via graph augmentation).
+                !seen_chunks.contains(&(fp.clone(), *ci))
+                    // Also skip if the file is graph-reachable — that fetch is already done.
+                    && !depth_map.contains_key(fp)
+            })
+            .map(|((fp, ci), dist)| (fp, *ci, *dist))
+            .collect();
+
+        // Group HNSW-only targets by file to minimise repeated backend calls.
+        let mut hnsw_by_file: std::collections::HashMap<&String, Vec<(usize, f64)>> = std::collections::HashMap::new();
+        for (fp, ci, dist) in hnsw_only {
+            hnsw_by_file.entry(fp).or_default().push((ci, dist));
+        }
+        for (fp, targets) in hnsw_by_file {
+            if let Ok(chunks) = self.backend.get_chunks_for_file(fp).await {
                 for chunk in chunks {
-                    let key = (chunk.file_path.clone(), chunk.chunk_idx);
-                    if seen_chunks.insert(key) {
-                        hits.push(SearchResult {
-                            file_path: chunk.file_path,
-                            chunk_idx: chunk.chunk_idx,
-                            content: chunk.content,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            chunk_type: chunk.chunk_type,
-                            score: graph_score,
-                            match_quality: "graph".to_string(),
-                            why: "graph".to_string(),
-                        });
+                    if let Some((_, dist)) = targets.iter().find(|(ci, _)| *ci == chunk.chunk_idx) {
+                        let key = (chunk.file_path.clone(), chunk.chunk_idx);
+                        if seen_chunks.insert(key) {
+                            // Apply same relevance gate as Phase 4a.
+                            if let Some(ref emb) = chunk.embedding {
+                                if !emb.is_empty() {
+                                    let sim = cosine_sim(query_vec, emb) as f64;
+                                    if sim < GRAPH_SIM_THRESHOLD {
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Score proportional to proximity: closer neighbor → higher score.
+                            // Capped at 0.4× best_score to rank below import-graph results.
+                            let prox_score = best_score * 0.4 * (1.0_f64 - dist).max(0.0);
+                            hits.push(SearchResult {
+                                file_path: chunk.file_path,
+                                chunk_idx: chunk.chunk_idx,
+                                content: chunk.content,
+                                start_line: chunk.start_line,
+                                end_line: chunk.end_line,
+                                chunk_type: chunk.chunk_type,
+                                score: prox_score,
+                                match_quality: "hnsw_proximity".to_string(),
+                                why: "hnsw_proximity".to_string(),
+                            });
+                        }
                     }
                 }
             }
         }
 
+        // Cap graph-added results to top 30 to prevent result flooding.
+        // Sort the graph portion by score descending before truncating so the
+        // highest-relevance graph chunks survive.
+        if hits.len() > pre_graph_count + 30 {
+            let graph_part = &mut hits[pre_graph_count..];
+            graph_part.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            hits.truncate(pre_graph_count + 30);
+        }
+
         tracing::debug!(
             seed_files = present.len(),
+            hnsw_seeds = seed_chunks.len(),
+            graph_files = depth_map.len(),
             total_hits = hits.len(),
             "graph augmentation complete"
         );
@@ -655,6 +1095,29 @@ fn is_doc_file(path: &str) -> bool {
     )
 }
 
+/// Returns `true` when `path` is inside a documentation directory.
+///
+/// Used together with [`is_doc_file`] to apply an aggressive tiered penalty:
+/// files that are *both* doc-typed *and* live under a dedicated docs tree
+/// are almost never the right answer for a code query.
+///
+/// Matches top-level docs roots and well-known nested doc tree patterns.
+/// Deliberately avoids `contains("/docs/")` and `contains("/doc/")` which
+/// are too broad — they flag source directories like `src/validator/doc/`.
+fn is_docs_directory(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let norm = lower.replace('\\', "/");
+    // Top-level docs roots
+    norm.starts_with("docs/") || norm.starts_with("doc/")
+        || norm.starts_with("documentation/")
+        // Common monorepo pattern: packages/docs/content/
+        || norm.contains("/docs/content/")
+        // Versioned docs directories: packages/docs-v3/
+        || norm.contains("/docs-v")
+        // Nested /documentation/ segment
+        || norm.contains("/documentation/")
+}
+
 /// Returns `true` when `path` looks like a barrel/re-export file.
 ///
 /// Barrel files primarily re-export symbols from other modules without
@@ -676,9 +1139,34 @@ fn is_barrel_file(path: &str) -> bool {
     )
 }
 
+/// Returns true when the query signals the user wants to know about
+/// entry points, exported API surface, or module initialization.
+/// Used to soften the barrel-file penalty when those files ARE the answer.
+fn query_asks_about_entry_point(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    [
+        "entry point",
+        "entrypoint",
+        "exports",
+        "exported",
+        "re-export",
+        "reexport",
+        "initializ", // matches initialize, initialization (US)
+        "initialis", // matches initialise, initialisation (UK)
+        "public api",
+        "api surface",
+        "imported from",
+        "barrel",
+        "module entry",
+        "package entry",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_doc_file, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case};
+    use super::{is_test_file, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -931,5 +1419,265 @@ mod tests {
         assert!(!is_barrel_file("src/main.rs"));
         assert!(!is_barrel_file("src/client.ts"));
         assert!(!is_barrel_file("src/models.py"));
+    }
+
+    // --- is_docs_directory tests ---
+
+    #[test]
+    fn docs_directory_positive() {
+        // Top-level roots.
+        assert!(is_docs_directory("docs/api.md"));
+        assert!(is_docs_directory("doc/guide.rst"));
+        assert!(is_docs_directory("documentation/overview.md"));
+        // Nested /documentation/ segment.
+        assert!(is_docs_directory("src/documentation/overview.md"));
+        // Common monorepo content pattern.
+        assert!(is_docs_directory("packages/docs/content/intro.md"));
+        // Versioned docs directories.
+        assert!(is_docs_directory("packages/docs-v3/guide.md"));
+    }
+
+    #[test]
+    fn docs_directory_negative() {
+        // Source file in a docs dir: ensure is_docs_directory alone
+        // doesn't flag unrelated paths.
+        assert!(!is_docs_directory("src/config.rs"));
+        assert!(!is_docs_directory("README.md"));
+        assert!(!is_docs_directory("src/parser.ts"));
+        // 'doc' appearing only in a filename stem must not match.
+        assert!(!is_docs_directory("src/docstring.rs"));
+        // Nested /docs/ that are NOT top-level and NOT content/ — no longer flagged.
+        assert!(!is_docs_directory("packages/docs/intro.md"));
+        assert!(!is_docs_directory("apps/web/docs/readme.md"));
+        // Source dirs with 'doc' component must not match.
+        assert!(!is_docs_directory("src/validator/doc/schema.ts"));
+    }
+
+    #[test]
+    fn preprocess_strips_boilerplate() {
+        let query = "### Steps to reproduce\n\n- [x] I have searched existing issues\n\n`IterativeImputer` has no parameter `fill_value`\n\n### Expected behavior\n\nShould support fill_value.";
+        let result = preprocess_query(query);
+        assert!(!result.contains("Steps to reproduce"));
+        assert!(!result.contains("I have searched"));
+        assert!(result.contains("IterativeImputer"));
+        assert!(result.contains("fill_value"));
+    }
+
+    #[test]
+    fn preprocess_short_query_unchanged() {
+        let query = "how does authentication work";
+        assert_eq!(preprocess_query(query), query);
+    }
+
+    #[test]
+    fn preprocess_extracts_backtick_symbols() {
+        let query = "The `SimpleImputer` class should handle `fill_value` parameter";
+        let result = preprocess_query(query);
+        assert!(result.contains("SimpleImputer"));
+        assert!(result.contains("fill_value"));
+    }
+
+
+    // -----------------------------------------------------------------------
+    // graph augmentation depth tests
+    // -----------------------------------------------------------------------
+
+    use std::sync::Arc;
+    use async_trait::async_trait;
+    use crate::schema::{ChunkRecord, SearchResult, StorageBackend, IndexStats};
+    use crate::symbols::SymbolDef;
+    use crate::EmbedProvider;
+    use super::Searcher;
+
+    // A minimal 4-dimensional embedding provider used only to satisfy the
+    // generic bound on `Searcher<B, P>`.  `augment_with_graph` never calls
+    // `embed_batch`, so the implementation is a no-op.
+    struct MockProvider;
+
+    #[async_trait]
+    impl EmbedProvider for MockProvider {
+        fn dim(&self) -> usize { 4 }
+        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+    }
+
+    // Simulates a 3-file import chain: a.rs → b.rs → c.rs.
+    // traverse_imports honours max_depth: depth=1 returns only b.rs;
+    // depth=2 also returns c.rs.
+    struct MockImportBackend;
+
+    fn make_chunk(file_path: &str, chunk_idx: usize) -> ChunkRecord {
+        ChunkRecord {
+            file_path: file_path.to_string(),
+            chunk_idx,
+            content: format!("content of {}:{}", file_path, chunk_idx),
+            normalized: String::new(),
+            description: String::new(),
+            chunk_type: "function".to_string(),
+            start_line: 1,
+            end_line: 10,
+            // embedding [1, 0, 0, 0] has cosine_sim=1.0 with query_vec [1, 0, 0, 0],
+            // well above the GRAPH_SIM_THRESHOLD=0.25 gate.
+            embedding: Some(vec![1.0_f32, 0.0, 0.0, 0.0]),
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for MockImportBackend {
+        async fn initialize(&self, _dim: usize) -> anyhow::Result<()> { Ok(()) }
+        async fn upsert_file(&self, _r: &crate::schema::FileRecord) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+
+        async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> {
+            match file_path {
+                "b.rs" => Ok(vec![make_chunk("b.rs", 0)]),
+                "c.rs" => Ok(vec![make_chunk("c.rs", 0)]),
+                _ => Ok(vec![]),
+            }
+        }
+
+        async fn get_chunks_for_files(&self, file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> {
+            let mut out = vec![];
+            for &fp in file_paths {
+                match fp {
+                    "b.rs" => out.push(make_chunk("b.rs", 0)),
+                    "c.rs" => out.push(make_chunk("c.rs", 0)),
+                    _ => {}
+                }
+            }
+            Ok(out)
+        }
+
+        async fn upsert_edges(&self, _e: &[crate::schema::EdgeRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+
+        /// Simulate the import chain a.rs → b.rs → c.rs.
+        /// Depth 1 from a.rs: only b.rs.  Depth 2: b.rs + c.rs.
+        async fn traverse_imports(
+            &self,
+            file_path: &str,
+            max_depth: usize,
+            _edge_types: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            if max_depth == 0 || file_path != "a.rs" {
+                return Ok(vec![]);
+            }
+            let mut out = vec![("b.rs".to_string(), 1)];
+            if max_depth >= 2 {
+                out.push(("c.rs".to_string(), 2));
+            }
+            Ok(out)
+        }
+
+        async fn traverse_importers(
+            &self,
+            _file_path: &str,
+            _max_depth: usize,
+            _edge_types: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            Ok(vec![])
+        }
+
+        async fn hybrid_search(
+            &self,
+            _query_vec: &[f32],
+            _query_str: &str,
+            _top_k: usize,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+
+        async fn stats(&self) -> anyhow::Result<IndexStats> {
+            Ok(IndexStats {
+                indexed_files: 0,
+                total_chunks: 0,
+                last_indexed: None,
+                watching: false,
+                estimated_stale: 0,
+            })
+        }
+
+        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn find_symbols(&self, _name: &str, _kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> { Ok(vec![]) }
+        async fn get_chunk_embeddings(&self, _keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
+        async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
+        async fn get_file_ranks(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
+
+        // Returns an empty neighbor set — this test targets import-graph depth,
+        // not HNSW proximity expansion.
+        async fn hnsw_neighbors(
+            &self,
+            _seeds: &[(String, usize)],
+            _max_dist: f64,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+            Ok(vec![])
+        }
+
+        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
+    }
+
+    fn seed_hit(file_path: &str) -> SearchResult {
+        SearchResult {
+            file_path: file_path.to_string(),
+            chunk_idx: 0,
+            content: "seed".to_string(),
+            start_line: 1,
+            end_line: 5,
+            chunk_type: "function".to_string(),
+            score: 1.0,
+            match_quality: "high".to_string(),
+            why: "vector".to_string(),
+        }
+    }
+
+    /// Verify that depth=2 graph augmentation returns one more file (c.rs) than
+    /// depth=1 because the recursive import traversal reaches the second hop.
+    #[tokio::test]
+    async fn graph_augment_depth2_returns_more_than_depth1() {
+        let backend = Arc::new(MockImportBackend);
+        let searcher = Searcher::new(backend, MockProvider);
+        let query_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let best_score = 1.0_f64;
+
+        let hits_d1 = searcher
+            .augment_with_graph(vec![seed_hit("a.rs")], 1, best_score, &query_vec)
+            .await
+            .expect("depth=1 augmentation failed");
+
+        let hits_d2 = searcher
+            .augment_with_graph(vec![seed_hit("a.rs")], 2, best_score, &query_vec)
+            .await
+            .expect("depth=2 augmentation failed");
+
+        // depth=1: seed a.rs + graph b.rs  = 2 total
+        // depth=2: seed a.rs + graph b.rs + graph c.rs = 3 total
+        assert!(
+            hits_d2.len() > hits_d1.len(),
+            "depth=2 should return more hits than depth=1: got d1={}, d2={}",
+            hits_d1.len(), hits_d2.len()
+        );
+
+        // Verify c.rs appears only in the depth=2 result.
+        let d1_files: Vec<&str> = hits_d1.iter().map(|h| h.file_path.as_str()).collect();
+        let d2_files: Vec<&str> = hits_d2.iter().map(|h| h.file_path.as_str()).collect();
+        assert!(!d1_files.contains(&"c.rs"), "c.rs must not appear in depth=1: {:?}", d1_files);
+        assert!(d2_files.contains(&"c.rs"), "c.rs must appear in depth=2: {:?}", d2_files);
+
+        // Verify hop-2 (c.rs) scores less than hop-1 (b.rs).
+        let score_b_d2 = hits_d2.iter().find(|h| h.file_path == "b.rs").map(|h| h.score).unwrap_or(0.0);
+        let score_c_d2 = hits_d2.iter().find(|h| h.file_path == "c.rs").map(|h| h.score).unwrap_or(0.0);
+        assert!(
+            score_b_d2 > score_c_d2,
+            "hop-1 (b.rs, score={}) should score higher than hop-2 (c.rs, score={})",
+            score_b_d2, score_c_d2
+        );
     }
 }

@@ -1,0 +1,16 @@
+# Benchmark profile: unified Datalog retrieval (experimental).
+# Single CozoDB round-trip for FTS + HNSW + graph + PageRank.
+# Reranker and expansion run on top in Rust.
+
+[index]
+symbol_enrichment = true
+
+[search]
+unified_search = true
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = true
+max_depth = 1

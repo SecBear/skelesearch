@@ -3,6 +3,63 @@ use tree_sitter::Language;
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
 // ---------------------------------------------------------------------------
+// Custom tags queries
+// ---------------------------------------------------------------------------
+
+/// TypeScript's built-in TAGS_QUERY only captures `@reference.type` and
+/// `@reference.class` — it has no `@reference.call` patterns, so call-graph
+/// edges are entirely absent for `.ts`/`.tsx` files.
+///
+/// This custom query keeps every definition pattern from the upstream
+/// `tree_sitter_typescript::TAGS_QUERY` verbatim, then appends
+/// `@reference.call` captures modelled after the JavaScript tags query.
+/// TypeScript inherits `call_expression` from the JavaScript grammar, so
+/// the same node shapes apply.
+///
+/// Convention: `@name` sub-capture = identifier text; `@reference.call`
+/// on the enclosing call / arguments node = the tag site.
+const TS_CUSTOM_TAGS_QUERY: &str = r#"
+; Original TypeScript definitions (verbatim from built-in TAGS_QUERY).
+(function_signature
+  name: (identifier) @name) @definition.function
+
+(method_signature
+  name: (property_identifier) @name) @definition.method
+
+(abstract_method_signature
+  name: (property_identifier) @name) @definition.method
+
+(abstract_class_declaration
+  name: (type_identifier) @name) @definition.class
+
+(module
+  name: (identifier) @name) @definition.module
+
+(interface_declaration
+  name: (type_identifier) @name) @definition.interface
+
+(type_annotation
+  (type_identifier) @name) @reference.type
+
+(new_expression
+  constructor: (identifier) @name) @reference.class
+
+; Added: call-site references.
+; Direct call: foo() -- excludes require() (module boundary, not a semantic edge).
+(
+  (call_expression
+    function: (identifier) @name) @reference.call
+  (#not-match? @name "^(require)$")
+)
+
+; Member call: obj.method() -- @name = property identifier; @reference.call = arguments node.
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)
+  arguments: (_) @reference.call)
+"#;
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -14,6 +71,14 @@ pub struct SymbolDef {
     /// "enum", "type", "impl", "interface", or the raw tree-sitter node kind
     /// for anything not explicitly mapped.
     pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+/// A `@reference.call` capture: a function or method call site within a file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReferenceCapture {
+    pub name: String,
     pub start_line: usize,
     pub end_line: usize,
 }
@@ -82,6 +147,88 @@ pub fn extract_symbols(filename: &str, source: &str) -> anyhow::Result<Vec<Symbo
     Ok(symbols)
 }
 
+/// Extract `@reference.call` captures from `source` using the tree-sitter-tags
+/// pipeline for the language inferred from `filename`'s extension.
+///
+/// Returns an empty `Vec` when the language has no tags query, when the query
+/// fails to compile, or when `source` yields no call references — not an error.
+pub fn extract_references(filename: &str, source: &str) -> anyhow::Result<Vec<ReferenceCapture>> {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let (tags_query, lang) = match tags_info_for_extension(ext) {
+        Some(info) => info,
+        None => return Ok(vec![]),
+    };
+
+    match TagsConfiguration::new(lang, tags_query, "") {
+        Ok(tags_cfg) => extract_references_via_tags(&tags_cfg, source),
+        Err(e) => {
+            // Same graceful degradation as extract_symbols.
+            tracing::debug!(
+                ext,
+                error = %e,
+                "tree-sitter-tags config failed; skipping reference extraction"
+            );
+            Ok(vec![])
+        }
+    }
+}
+
+fn extract_references_via_tags(
+    config: &TagsConfiguration,
+    source: &str,
+) -> anyhow::Result<Vec<ReferenceCapture>> {
+    let mut ctx = TagsContext::new();
+    let source_bytes = source.as_bytes();
+
+    let (iter, _cancelled) = ctx
+        .generate_tags(config, source_bytes, None)
+        .map_err(|e| anyhow::anyhow!("generate_tags: {e}"))?;
+
+    let mut refs = Vec::new();
+    for result in iter {
+        let tag = match result {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping tag error in reference extraction");
+                continue;
+            }
+        };
+
+        // Only emit references (not definitions).
+        if tag.is_definition {
+            continue;
+        }
+
+        // Filter to call references specifically (@reference.call).
+        let syntax_type = config.syntax_type_name(tag.syntax_type_id);
+        if syntax_type != "call" {
+            continue;
+        }
+
+        // Skip tags with empty name ranges (anonymous constructs).
+        if tag.name_range.is_empty() {
+            continue;
+        }
+
+        let name = match std::str::from_utf8(&source_bytes[tag.name_range.clone()]) {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+
+        refs.push(ReferenceCapture {
+            name,
+            start_line: tag.span.start.row + 1, // 0-indexed → 1-indexed
+            end_line: tag.span.end.row + 1,
+        });
+    }
+
+    Ok(refs)
+}
+
 // ---------------------------------------------------------------------------
 // tree-sitter-tags extraction
 // ---------------------------------------------------------------------------
@@ -103,13 +250,14 @@ fn tags_info_for_extension(ext: &str) -> Option<(&'static str, Language)> {
             tree_sitter_python::TAGS_QUERY,
             tree_sitter_python::LANGUAGE.into(),
         )),
-        // ts and tsx share the same tags.scm but use different grammars.
+        // ts and tsx share the same grammar shape but the built-in TAGS_QUERY
+        // has no @reference.call patterns; use TS_CUSTOM_TAGS_QUERY instead.
         "ts" => Some((
-            tree_sitter_typescript::TAGS_QUERY,
+            TS_CUSTOM_TAGS_QUERY,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         )),
         "tsx" => Some((
-            tree_sitter_typescript::TAGS_QUERY,
+            TS_CUSTOM_TAGS_QUERY,
             tree_sitter_typescript::LANGUAGE_TSX.into(),
         )),
         "js" | "jsx" | "mjs" | "cjs" => Some((

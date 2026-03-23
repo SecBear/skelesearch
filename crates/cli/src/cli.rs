@@ -57,6 +57,10 @@ pub enum Commands {
         /// Scope results to files changed on the current branch (vs main/master).
         #[arg(long)]
         branch: bool,
+
+        /// Print pipeline timing breakdown to stderr after results.
+        #[arg(long)]
+        timings: bool,
     },
 
     /// Show all indexed chunks plus import graph for a file.

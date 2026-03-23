@@ -1,38 +1,31 @@
 [
   {
-    "query": "How does the httpx Client send a request and handle redirects",
+    "query": "Client send request redirect history follow max_redirects",
     "expected_files": [
       "httpx/_client.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "Where is the transport layer that manages connection pooling in httpx",
-    "expected_files": [
-      "httpx/_transports/default.py"
-    ],
-    "category": "architecture"
-  },
-  {
-    "query": "How does httpx implement digest authentication",
+    "query": "DigestAuth qop nonce opaque cnonce header computation",
     "expected_files": [
       "httpx/_auth.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "What is the relationship between sync Client and AsyncClient in httpx",
+    "query": "Client AsyncClient sync async send transport shared",
     "expected_files": [
       "httpx/_client.py"
     ],
-    "category": "cross_file"
+    "category": "keyword_code"
   },
   {
     "query": "Where are the Cookies and Request and Response model classes defined in httpx",
     "expected_files": [
       "httpx/_models.py"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "How does httpx configure connection limits and TLS verification",
@@ -43,19 +36,19 @@
     "category": "cross_file"
   },
   {
-    "query": "How does httpx parse and validate URLs with percent-encoding and IDNA hostname normalization",
+    "query": "URL parse percent-encoding IDNA hostname normalize _urlparse",
     "expected_files": [
       "httpx/_urlparse.py",
       "httpx/_urls.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does httpx encode multipart form data and guess MIME types for file uploads",
+    "query": "multipart DataField FileField boundary MIME guess_content_type",
     "expected_files": [
       "httpx/_multipart.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "What is the exception hierarchy in httpx and how are httpcore transport errors mapped",
@@ -63,31 +56,31 @@
       "httpx/_exceptions.py",
       "httpx/_transports/default.py"
     ],
-    "category": "error_handling"
+    "category": "cross_file"
   },
   {
-    "query": "How does httpx decompress response bodies with gzip brotli deflate and zstandard content-encoding",
+    "query": "Response decompress gzip brotli deflate zstandard decoder",
     "expected_files": [
       "httpx/_decoders.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does httpx support streaming responses with iter_bytes iter_text and iter_lines",
+    "query": "Response iter_bytes iter_text iter_lines streaming async",
     "expected_files": [
       "httpx/_models.py",
       "httpx/_decoders.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does httpx configure and route requests through HTTP and SOCKS proxies",
+    "query": "Client proxy HTTP SOCKS route URL pattern mounts",
     "expected_files": [
       "httpx/_config.py",
       "httpx/_utils.py",
       "httpx/_client.py"
     ],
-    "category": "config_init"
+    "category": "keyword_code"
   },
   {
     "query": "How does httpx implement the transport layer abstraction with BaseTransport and WSGI/ASGI transports",
@@ -97,84 +90,79 @@
       "httpx/_transports/wsgi.py",
       "httpx/_transports/asgi.py"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
-    "query": "How does httpx handle request body content encoding for JSON form data and raw bytes",
+    "query": "content encode JSON form bytes chunked RequestContent",
     "expected_files": [
       "httpx/_content.py",
       "httpx/_multipart.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "What type aliases does httpx define for headers cookies auth timeout and file parameters",
     "expected_files": [
       "httpx/_types.py"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
-    "query": "How do the top-level httpx.get httpx.post convenience functions create and manage client instances",
+    "query": "httpx.get httpx.post top-level api convenience client create",
     "expected_files": [
       "httpx/_api.py"
     ],
-    "category": "utility_helper"
+    "category": "keyword_code"
   },
   {
     "query": "Where are HTTP status codes and their descriptive phrases defined in httpx",
     "expected_files": [
       "httpx/_status_codes.py"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "What classes and symbols does httpx expose in its public package namespace",
     "expected_files": [
       "httpx/__init__.py"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol",
+    "notes": "BARREL PENALTY: __init__.py is detected as a barrel file and scored at 0.4x. However, this query specifically asks about the public namespace, so __init__.py IS the correct answer. The semantic embedding for 'public package namespace expose symbols' should be strong enough to survive the 0.4x penalty over other files. __init__.py has 80 entries in __all__ and 12 wildcard re-export lines."
   },
   {
     "query": "Where is the Timeout configuration class defined and what per-phase timeout fields does it expose",
     "expected_files": [
       "httpx/_config.py"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
-    "query": "How does httpx implement BasicAuth and construct the Authorization header value",
+    "query": "BasicAuth encode username password Authorization header base64",
     "expected_files": [
       "httpx/_auth.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the httpx Response class read and buffer the response body on first access",
+    "query": "Response read buffer body aread content bytes lazy",
     "expected_files": [
       "httpx/_models.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does httpx implement the mock transport for intercepting requests in tests",
+    "query": "MockTransport intercept request test handler response",
     "expected_files": [
       "httpx/_transports/mock.py"
     ],
-    "category": "implementation"
+    "category": "keyword_code",
+    "notes": "TEST FILE RISK: the word 'tests' in the query may boost files inside the tests/ directory. Test files receive a 0.3x penalty in scoring. _transports/mock.py is a production module (not in tests/) that implements MockTransport; it should rank well."
   },
   {
     "query": "How do cookies flow from the client cookie jar into requests and back from responses",
     "expected_files": [
       "httpx/_client.py",
       "httpx/_models.py"
-    ],
-    "category": "cross_file"
-  },
-  {
-    "query": "How does the httpx event hook system invoke request and response hooks during the send cycle",
-    "expected_files": [
-      "httpx/_client.py"
     ],
     "category": "cross_file"
   },
@@ -192,7 +180,7 @@
       "httpx/_transports/base.py",
       "httpx/_transports/default.py"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
     "query": "How does httpx separate low-level URL parsing from the high-level URL user interface",
@@ -200,14 +188,7 @@
       "httpx/_urlparse.py",
       "httpx/_urls.py"
     ],
-    "category": "architecture"
-  },
-  {
-    "query": "What exception does httpx raise on a connection timeout versus a read timeout",
-    "expected_files": [
-      "httpx/_exceptions.py"
-    ],
-    "category": "error_handling"
+    "category": "conceptual"
   },
   {
     "query": "How does httpx handle SSL certificate verification failures and what exception is raised",
@@ -215,7 +196,7 @@
       "httpx/_exceptions.py",
       "httpx/_transports/default.py"
     ],
-    "category": "error_handling"
+    "category": "cross_file"
   },
   {
     "query": "How does httpx surface non-2xx HTTP status codes as exceptions through raise_for_status",
@@ -223,15 +204,7 @@
       "httpx/_models.py",
       "httpx/_exceptions.py"
     ],
-    "category": "error_handling"
-  },
-  {
-    "query": "How does httpx merge default client-level headers with per-request headers on each send",
-    "expected_files": [
-      "httpx/_client.py",
-      "httpx/_models.py"
-    ],
-    "category": "config_init"
+    "category": "cross_file"
   },
   {
     "query": "How does httpx configure HTTP/2 support and what transport settings enable it",
@@ -239,49 +212,28 @@
       "httpx/_config.py",
       "httpx/_transports/default.py"
     ],
-    "category": "config_init"
+    "category": "cross_file"
   },
   {
     "query": "What does IDNA encoding mean in the context of httpx URL handling and where is it applied",
     "expected_files": [
       "httpx/_urlparse.py"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
     "query": "What is a transport in httpx and how does it differ from a session or connection pool",
     "expected_files": [
       "httpx/_transports/base.py"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
-    "query": "Where are internal utility helpers like primitive_value_to_str and guess_content_type defined",
-    "expected_files": [
-      "httpx/_utils.py"
-    ],
-    "category": "utility_helper"
-  },
-  {
-    "query": "How does httpx provide a command-line HTTP client interface through its _main module",
-    "expected_files": [
-      "httpx/_main.py"
-    ],
-    "category": "utility_helper"
-  },
-  {
-    "query": "How does httpx handle chunked transfer encoding when streaming request bodies",
+    "query": "content chunked transfer encoding AsyncByteStream iterator",
     "expected_files": [
       "httpx/_content.py"
     ],
-    "category": "implementation"
-  },
-  {
-    "query": "How does httpx normalize and validate header name-value pairs in the Headers model",
-    "expected_files": [
-      "httpx/_models.py"
-    ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How does httpx map query parameters from URL strings and from dict arguments to QueryParams",
@@ -296,6 +248,63 @@
     "expected_files": [
       "httpx/_transports/wsgi.py"
     ],
-    "category": "implementation"
+    "category": "conceptual"
+  },
+  {
+    "query": "Client AsyncClient __init__ params headers auth timeout fields",
+    "expected_files": [
+      "httpx/_client.py"
+    ],
+    "category": "symbol",
+    "notes": "Client and AsyncClient constructors: params, headers, auth, timeout, transport args"
+  },
+  {
+    "query": "Request method url headers content stream fields",
+    "expected_files": [
+      "httpx/_models.py"
+    ],
+    "category": "symbol",
+    "notes": "Request dataclass: method, url, headers, stream, extensions"
+  },
+  {
+    "query": "Headers normalize case-insensitive name value mapping",
+    "expected_files": [
+      "httpx/_models.py"
+    ],
+    "category": "symbol",
+    "notes": "Headers normalizes names to lowercase bytes; implements MutableMapping"
+  },
+  {
+    "query": "URL host scheme path query raw_path properties",
+    "expected_files": [
+      "httpx/_urls.py"
+    ],
+    "category": "symbol",
+    "notes": "URL wraps ParseResult; exposes host/scheme/path/query/raw_url properties"
+  },
+  {
+    "query": "Auth flow response challenge generator protocol",
+    "expected_files": [
+      "httpx/_auth.py"
+    ],
+    "category": "symbol",
+    "notes": "Auth base class: auth_flow() generator yields Request, receives Response"
+  },
+  {
+    "query": "async with AsyncClient request response usage example",
+    "expected_files": [
+      "httpx/_client.py"
+    ],
+    "category": "example",
+    "notes": "AsyncClient as async context manager; common async request pattern"
+  },
+  {
+    "query": "MockTransport custom transport test intercept example",
+    "expected_files": [
+      "httpx/_transports/mock.py",
+      "httpx/_transports/base.py"
+    ],
+    "category": "example",
+    "notes": "MockTransport implements BaseTransport; shows how to wire custom transports"
   }
 ]

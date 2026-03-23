@@ -87,3 +87,75 @@ Version 1 is intentionally narrow:
 - starter corpus first, larger eval corpus later
 
 See `docs/superpowers/plans/2026-03-19-benchmarks-and-eval-infrastructure.md` for the implementation plan.
+
+
+## Quick eval (development feedback loop)
+
+For rapid iteration, use the quick-eval script instead of running the full suite:
+
+```bash
+# First time: clone benchmark repos
+bun benchmarks/scripts/clone-repos.ts
+
+# Quick eval: 3 diagnostic repos (~3-5 min, no API keys)
+./benchmarks/scripts/quick-eval.sh
+
+# Quick eval with voyage embeddings (~5-10 min, needs API keys)
+./benchmarks/scripts/quick-eval.sh --provider voyage
+
+# Tag a run for comparison
+./benchmarks/scripts/quick-eval.sh --tag post-depth-decay
+
+# Single repo deep dive
+./benchmarks/scripts/quick-eval.sh --repo zod
+
+# Full 6-repo suite (~10-15 min)
+./benchmarks/scripts/quick-eval.sh --full
+
+# Full suite with voyage
+./benchmarks/scripts/quick-eval.sh --full --provider voyage
+```
+
+**Diagnostic subset:** zod (63.6% MRR, weakest), httpx (65.2% MRR, second
+weakest), cobra (96.3% MRR, regression canary). If zod/httpx improve without
+cobra regressing, the change is good.
+
+**Machine requirements:**
+- macOS M4 Pro 24GB: fastembed runs well, ~3-5 min for quick eval
+- NixOS bearbrick (7800X3D): same or faster, run `nix develop` first
+- No GPU required — fastembed uses ONNX on CPU
+
+## External benchmarks
+
+### CoIR (Code Information Retrieval)
+Standard code retrieval benchmark, on MTEB leaderboard. 10 sub-tasks.
+
+```bash
+# Single task smoke test (~20 min)
+uv run --with coir-eval --with fastembed --with numpy \
+  python3 benchmarks/scripts/coir-eval.py \
+  --mode embed-only --provider fastembed --tasks cosqa \
+  --output benchmarks/runs/coir-fastembed-cosqa.json
+
+# Full 10-task suite (~2-3 hours)
+uv run --with coir-eval --with fastembed --with numpy \
+  python3 benchmarks/scripts/coir-eval.py \
+  --mode embed-only --provider fastembed --tasks all \
+  --output benchmarks/runs/coir-fastembed-full.json
+```
+
+### ContextBench
+Real GitHub issue retrieval. File/Block/Line F1. No retrieval-only baselines published.
+
+```bash
+# Pilot (~25 min, 9 instances)
+uv run --with datasets --with huggingface_hub \
+  python3 benchmarks/scripts/contextbench-eval.py \
+  --binary ./target/release/skelesearch \
+  --languages python,go,rust --limit-per-lang 3 \
+  --cache-dir benchmarks/contextbench-repos \
+  --output benchmarks/runs/contextbench-pilot.json --provider fastembed
+
+# Full verified (500 instances, ~2-4 hours with caching)
+# Same command without --limit-per-lang
+```

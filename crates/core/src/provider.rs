@@ -12,12 +12,24 @@ pub trait EmbedProvider: Send + Sync {
     /// Human-readable provider name for manifest storage.
     fn name(&self) -> &str { "unknown" }
 
+    /// Optional prefix to prepend to query text before embedding.
+    /// Models like CodeRankEmbed require instruction prefixes for
+    /// query-document alignment. Default implementation returns `None`.
+    fn query_prefix(&self) -> Option<&str> { None }
+
     /// Embed a batch of texts, returning one vector per input in order.
     ///
     /// # Errors
     /// Returns an error if the underlying model call fails or the returned
     /// vector count does not match `texts.len()`.
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>>;
+
+    /// Embed queries specifically (as opposed to documents).
+    /// Providers that distinguish query vs document embeddings (e.g. Voyage AI
+    /// with `input_type`) should override this. Default delegates to `embed_batch`.
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_batch(texts).await
+    }
 }
 
 
@@ -33,7 +45,15 @@ impl<T: EmbedProvider + ?Sized> EmbedProvider for Box<T> {
         (**self).name()
     }
 
+    fn query_prefix(&self) -> Option<&str> {
+        (**self).query_prefix()
+    }
+
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         (**self).embed_batch(texts).await
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        (**self).embed_queries(texts).await
     }
 }

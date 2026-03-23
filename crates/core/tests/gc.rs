@@ -26,6 +26,7 @@ async fn gc_removes_orphaned_chunks() -> anyhow::Result<()> {
             chunk_idx: 0,
             content: "fn gone() {}".into(),
             normalized: "fn gone".into(),
+            description: String::new(),
             chunk_type: "code".into(),
             start_line: 1,
             end_line: 1,

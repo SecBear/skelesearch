@@ -9,7 +9,7 @@ use crate::{
     content_hash, ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore,
     StorageBackend,
 };
-use crate::symbols::extract_symbols;
+use crate::symbols::{extract_references, extract_symbols};
 
 // ---------------------------------------------------------------------------
 // Public output type
@@ -63,9 +63,13 @@ pub struct Indexer<B, P> {
     /// Extension allowlist. `None` → use `default_include_extensions()`.
     /// `Some(set)` → only index files whose lowercased extension is in the set.
     include_extensions: Option<HashSet<String>>,
+    /// Optional provider that generates natural-language descriptions of code chunks.
+    /// When set, descriptions are embedded instead of raw code, bridging the
+    /// vocabulary gap between natural-language queries and source code.
+    summary_provider: Option<Box<dyn crate::summary::SummaryProvider>>,
 }
 
-impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
+impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
     pub fn new(backend: Arc<B>, manifest: Arc<ManifestStore>, provider: P) -> Self {
         Self {
             backend,
@@ -75,6 +79,7 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             exclude: vec![],
             symbol_enrichment: true,
             include_extensions: None,
+            summary_provider: None,
         }
     }
 
@@ -110,6 +115,14 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         });
         self
     }
+    /// Attach an LLM summary provider.  When set, each chunk's description is
+    /// generated before embedding; the HNSW index stores description-based
+    /// vectors instead of raw-code vectors.
+    pub fn with_summary_provider(mut self, provider: Box<dyn crate::summary::SummaryProvider>) -> Self {
+        self.summary_provider = Some(provider);
+        self
+    }
+
     /// Walk `root`, detect changed files via the manifest, chunk and embed
     /// them, upsert to the backend, then reconcile deletions/renames.
     ///
@@ -120,8 +133,50 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
     /// only — no file content is loaded until Phase 2.
     #[tracing::instrument(skip_all, fields(root = %root.display()))]
     pub async fn index_path(&self, root: &Path) -> anyhow::Result<IndexResult> {
+        let index_start = std::time::Instant::now();
         let dim = self.provider.dim();
         self.backend.initialize(dim).await?;
+
+        // -- Detect provider/dimension changes ----------------------------------
+        //    If the manifest records a different embedding provider or dimension,
+        //    stored vectors are incompatible with the current provider's output.
+        //    * Dim changed  → hard error: CozoDB's typed vector column cannot
+        //      store vectors of a different length without schema recreation.
+        //      The user must delete .skelesearch/ to switch dimensions.
+        //    * Provider changed, same dim → clear file_hashes so every file
+        //      becomes a candidate and gets re-embedded with the new provider.
+        //      Phase 2b deletes stale backend data before upserting fresh vectors.
+        let stored_provider = self.manifest.get_meta("provider")?;
+        let stored_dim = self.manifest.get_meta("dim")?
+            .and_then(|s| s.parse::<usize>().ok());
+        if let (Some(prev_provider), Some(prev_dim)) = (&stored_provider, stored_dim) {
+            let cur_provider = self.provider.name();
+            if prev_dim != dim {
+                anyhow::bail!(
+                    "embedding dimension mismatch: stored index uses provider '{}' (dim={}) \
+                     but this run requests provider '{}' (dim={}). \
+                     Delete the .skelesearch/ directory to re-index with the new provider.",
+                    prev_provider, prev_dim, cur_provider, dim
+                );
+            } else if prev_provider.as_str() != cur_provider {
+                tracing::info!(
+                    prev_provider = %prev_provider,
+                    cur_provider  = %cur_provider,
+                    "embedding provider changed — forcing full re-index"
+                );
+                self.manifest.clear_file_hashes()?;
+                // Also clear the embedding cache: vectors are provider-specific.
+                // Same-dim providers produce incompatible vectors; keeping stale
+                // entries would silently serve the old provider's embeddings.
+                self.manifest.clear_embedding_cache()?;
+            }
+        }
+        // Write provider/dim metadata now (before any indexing work) so that
+        // a crash mid-index still leaves the metadata in a consistent state.
+        // On the next run the mismatch check above can make correct decisions
+        // rather than operating on stale values written only at the very end.
+        self.manifest.set_meta("provider", self.provider.name())?;
+        self.manifest.set_meta("dim", &self.provider.dim().to_string())?;
 
         let chunker = Chunker::default();
         let mut visited: HashSet<String> = HashSet::new();
@@ -279,6 +334,9 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 chunks: Vec<crate::ParsedChunk>,
                 edges: Vec<crate::ImportEdge>,
                 symbols: Vec<crate::symbols::SymbolDef>,
+                /// Call-site references extracted from source during Phase 2a.
+                /// Used in Phase 2c to emit "calls" edges.
+                references: Vec<crate::symbols::ReferenceCapture>,
             }
 
             let mut batch_files: Vec<BatchFile<'_>> = Vec::with_capacity(batch.len());
@@ -312,8 +370,10 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 };
                 let edges = chunker.extract_edges(&fc.rel_path, &source).unwrap_or_default();
                 let symbols = extract_symbols(&fc.rel_path, &source).unwrap_or_default();
+                let references = extract_references(&fc.rel_path, &source).unwrap_or_default();
+                // `source` is dropped here — only structured data retained for the batch.
 
-                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols });
+                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols, references });
             }
 
             if batch_files.is_empty() {
@@ -354,26 +414,48 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 vec![Vec::new(); batch_files.len()];
 
             for sub in pending.chunks(self.batch_size) {
-                // --- embedding cache lookup ---
+                // --- 1. Generate descriptions (if summary provider is attached) ---
+                //     Descriptions replace raw code as the embedding target, bridging
+                //     the vocabulary gap between natural-language queries and source code.
+                let descriptions: Vec<String> = if let Some(ref sp) = self.summary_provider {
+                    let code_texts: Vec<String> = sub.iter()
+                        .map(|(_, c)| c.content.clone())
+                        .collect();
+                    sp.summarize_batch(code_texts).await?
+                } else {
+                    vec![String::new(); sub.len()]
+                };
+
+                // --- 2. Build the text to embed for each chunk ---
+                //     When a description is available, embed it (natural language → HNSW).
+                //     When not, use the Anthropic Contextual Retrieval format:
+                //     prepend path + type so the model sees where the chunk lives.
+                let embed_texts: Vec<String> = sub.iter()
+                    .zip(descriptions.iter())
+                    .map(|((fi, chunk), desc)| {
+                        if !desc.is_empty() {
+                            desc.clone()
+                        } else {
+                            let rel_path = &batch_files[*fi].candidate.rel_path;
+                            format!("{} {}\n{}", rel_path, chunk.chunk_type, chunk.content)
+                        }
+                    })
+                    .collect();
+
+                // --- 3. Embedding cache lookup keyed on the actual embed text ---
+                //     Keying on embed_text (not raw content) means description-based
+                //     and raw-code embeddings never collide in the cache.
                 let hashes: Vec<String> =
-                    sub.iter().map(|(_, c)| content_hash(&c.content)).collect();
+                    embed_texts.iter().map(|t| content_hash(t)).collect();
                 let cached = self.manifest.get_cached_embeddings(&hashes, dim)?;
 
-                // Partition into hits and misses; track original sub-indices.
-                // For cache-miss texts, prepend file path context so the embedding
-                // model sees where this chunk lives in the codebase.  This is the
-                // Anthropic Contextual Retrieval pattern: -49% retrieval failure.
+                // Partition into hits and misses.
                 let mut miss_indices: Vec<usize> = Vec::new();
                 let mut miss_texts: Vec<String> = Vec::new();
                 for (i, hit) in cached.iter().enumerate() {
                     if hit.is_none() {
                         miss_indices.push(i);
-                        let (fi, chunk) = &sub[i];
-                        let rel_path = &batch_files[*fi].candidate.rel_path;
-                        miss_texts.push(format!(
-                            "{} {}\n{}",
-                            rel_path, chunk.chunk_type, chunk.content
-                        ));
+                        miss_texts.push(embed_texts[i].clone());
                     }
                 }
 
@@ -406,7 +488,6 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 self.manifest.cache_embeddings(&to_cache)?;
 
                 // Merge cached + fresh into per-original-index embeddings.
-                // cached[i] is Some(hit) or None (miss); fill misses from fresh_embs in order.
                 let mut fresh_iter = fresh_embs.into_iter();
                 let embs: Vec<Vec<f32>> = cached
                     .into_iter()
@@ -416,13 +497,14 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                     })
                     .collect();
 
-                for ((fi, chunk), emb) in sub.iter().zip(embs) {
+                for (idx, ((fi, chunk), emb)) in sub.iter().zip(embs).enumerate() {
                     let fc = batch_files[*fi].candidate;
                     chunk_records_per_file[*fi].push(ChunkRecord {
                         file_path: fc.rel_path.clone(),
                         chunk_idx: chunk.chunk_idx,
                         content: chunk.content.clone(),
                         normalized: chunk.normalized.clone(),
+                        description: descriptions[idx].clone(),
                         chunk_type: chunk.chunk_type.clone(),
                         start_line: chunk.start_line,
                         end_line: chunk.end_line,
@@ -508,6 +590,51 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
                 if !edge_records.is_empty() {
                     self.backend.upsert_edges(&edge_records).await?;
                 }
+
+                // Extract call-site references and join with resolved import edges
+                // to emit "calls" edges. The heuristic: if a @reference.call name
+                // matches the file stem of a resolved import target, emit a calls
+                // edge. This is a v1 approximation — it catches namespace-style
+                // imports (e.g. `import utils; utils.foo()`) and misses named
+                // imports (e.g. `from utils import foo; foo()`), but is cheap
+                // and produces directionally correct signal.
+                if !edge_records.is_empty() {
+                    let references = &bf.references;
+                    if !references.is_empty() {
+                        let ref_names: std::collections::HashSet<&str> =
+                            references.iter().map(|r| r.name.as_str()).collect();
+                        // One calls edge per unique target file; dedup by to_file.
+                        let mut seen_targets = std::collections::HashSet::new();
+                        let call_edges: Vec<EdgeRecord> = edge_records.iter()
+                            .filter_map(|e| {
+                                // Match by file stem: "utils" from "src/utils.rs".
+                                let stem = Path::new(&e.to_file)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())?;
+                                if ref_names.contains(stem)
+                                    && seen_targets.insert(e.to_file.clone())
+                                {
+                                    Some(EdgeRecord {
+                                        from_file: e.from_file.clone(),
+                                        from_chunk: 0,
+                                        to_file: e.to_file.clone(),
+                                        edge_type: "calls".into(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if !call_edges.is_empty() {
+                            tracing::info!(
+                                file = %fc.rel_path,
+                                count = call_edges.len(),
+                                "call edges"
+                            );
+                            self.backend.upsert_edges(&call_edges).await?;
+                        }
+                    }
+                }
                 tracing::info!(
                     file = %fc.rel_path,
                     total = bf.edges.len(),
@@ -538,9 +665,6 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
         // Clean up completed batch records for this run.
         self.manifest.clear_completed_batches(&run_id)?;
 
-        // Record which provider and dimension were used for this index.
-        self.manifest.set_meta("provider", self.provider.name())?;
-        self.manifest.set_meta("dim", &self.provider.dim().to_string())?;
 
         // -- Phase 3: Reconcile deletions and renames ------------------------
         //    Any manifest path not visited this run is stale (file gone or
@@ -557,11 +681,46 @@ impl<B: StorageBackend, P: EmbedProvider> Indexer<B, P> {
             self.manifest.remove(path)?;
         }
 
-        // Compute PageRank over the import graph now that all edges are settled.
-        // Failure is non-fatal: a missing or empty graph should not abort indexing.
-        if let Err(e) = self.backend.compute_pagerank().await {
-            tracing::warn!(error = %e, "failed to compute PageRank");
-        }
+        // Spawn PageRank computation as a background task now that all edges are
+        // settled.  PageRank is a score boost, not a filter — stale ranks degrade
+        // gracefully (new files simply get no boost until recomputation completes).
+        //
+        // NOTE: compute_pagerank(None) includes ALL edge types (imports + calls).
+        // Per-edge-type PageRank (separate import vs call centrality) is deferred
+        // until file_ranks supports a rank_type column — two concurrent spawns
+        // writing to the same :replace relation would race and the loser's ranks
+        // get silently wiped.
+        let backend = Arc::clone(&self.backend);
+        tokio::spawn(async move {
+            if let Err(e) = backend.compute_pagerank(None).await {
+                tracing::warn!(error = %e, "background PageRank computation failed");
+            } else {
+                tracing::info!("PageRank computation completed");
+            }
+        });
+
+        // Spawn LSH deduplication as a background task.  Near-duplicate chunks
+        // across different files waste HNSW graph capacity; removing them improves
+        // retrieval diversity.  Like PageRank, this is a quality boost — stale
+        // duplicates degrade gracefully (slightly lower recall) until the next
+        // full re-index.
+        let backend2 = Arc::clone(&self.backend);
+        tokio::spawn(async move {
+            match backend2.deduplicate_chunks().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(removed = n, "background LSH deduplication completed"),
+                Err(e) => tracing::warn!(error = %e, "background LSH deduplication failed"),
+            }
+        });
+
+        tracing::info!(
+            files_indexed = result.indexed_files,
+            files_deleted = result.deleted_files,
+            chunks_embedded = result.total_chunks,
+            parse_errors = result.parse_errors,
+            elapsed_ms = index_start.elapsed().as_millis() as u64,
+            "index complete"
+        );
 
         Ok(result)
     }

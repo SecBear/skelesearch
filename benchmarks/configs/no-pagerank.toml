@@ -1,0 +1,13 @@
+# Benchmark profile: disable PageRank boost to measure its contribution.
+
+[index]
+symbol_enrichment = true
+
+[search]
+pagerank_boost = false
+
+[search.expansion]
+enabled = false
+
+[search.graph]
+enabled = false

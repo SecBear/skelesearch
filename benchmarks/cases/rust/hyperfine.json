@@ -1,10 +1,10 @@
 [
   {
-    "query": "Where is the main benchmark execution loop that runs warmup iterations and collects timing samples",
+    "query": "Benchmark run warmup samples timing statistics orchestrate",
     "expected_files": [
       "src/benchmark/mod.rs"
     ],
-    "category": "implementation",
+    "category": "keyword_code",
     "notes": "Benchmark::run orchestrates warmup, sample collection, stats, and cleanup."
   },
   {
@@ -26,11 +26,11 @@
     "notes": "Modified Z score outlier detection feeds warning emission."
   },
   {
-    "query": "Where is shell spawning overhead calibrated and subtracted from measurements",
+    "query": "ShellExecutor calibrate shell overhead subtract measurement",
     "expected_files": [
       "src/benchmark/executor.rs"
     ],
-    "category": "implementation",
+    "category": "keyword_code",
     "notes": "ShellExecutor.calibrate measures empty shell cost and subtracts it from command timings."
   },
   {
@@ -43,12 +43,12 @@
     "notes": "RangeStep validates and iterates values; command expansion builds the cross product into final commands."
   },
   {
-    "query": "How are benchmark results exported to JSON format",
+    "query": "JsonExporter ExportManager pretty JSON serialize results",
     "expected_files": [
       "src/export/json.rs",
       "src/export/mod.rs"
     ],
-    "category": "implementation",
+    "category": "keyword_code",
     "notes": "ExportManager registers exporters and JsonExporter serializes pretty JSON."
   },
   {
@@ -57,51 +57,44 @@
       "src/cli.rs",
       "src/options.rs"
     ],
-    "category": "config_init"
+    "category": "conceptual"
   },
   {
-    "query": "What error types does hyperfine define for parameter scanning and option validation",
-    "expected_files": [
-      "src/error.rs"
-    ],
-    "category": "error_handling"
-  },
-  {
-    "query": "How does hyperfine compute relative speed ratios and uncertainty propagation between benchmarks",
+    "query": "relative_speed ratio mean uncertainty propagation compute",
     "expected_files": [
       "src/benchmark/relative_speed.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does hyperfine automatically select time units and format durations as seconds milliseconds or microseconds",
+    "query": "time units seconds milliseconds microseconds format select",
     "expected_files": [
       "src/output/format.rs",
       "src/util/units.rs"
     ],
-    "category": "utility_helper"
+    "category": "keyword_code"
   },
   {
-    "query": "How does hyperfine measure CPU time on Windows using job objects and NtResumeProcess",
+    "query": "Windows CPU timer job objects NtResumeProcess rusage",
     "expected_files": [
       "src/timer/windows_timer.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does hyperfine handle non-zero exit codes during benchmark runs including ignore-failure mode",
+    "query": "executor non-zero exit code ignore_failure benchmark run",
     "expected_files": [
       "src/benchmark/executor.rs",
       "src/options.rs"
     ],
-    "category": "error_handling"
+    "category": "keyword_code"
   },
   {
     "query": "What executor types does hyperfine support and how do RawExecutor and ShellExecutor differ in calibration",
     "expected_files": [
       "src/benchmark/executor.rs"
     ],
-    "category": "implementation"
+    "category": "conceptual"
   },
   {
     "query": "How does the MarkupExporter trait provide shared table rendering for markdown asciidoc and orgmode",
@@ -114,11 +107,11 @@
     "category": "cross_file"
   },
   {
-    "query": "How does hyperfine tokenize comma-separated parameter values with backslash escape handling",
+    "query": "parameter tokenize comma separated backslash escape values",
     "expected_files": [
       "src/parameter/tokenize.rs"
     ],
-    "category": "utility_helper"
+    "category": "keyword_code"
   },
   {
     "query": "How does hyperfine use randomized environment variable padding to counteract memory layout effects on benchmarks",
@@ -133,70 +126,70 @@
     "expected_files": [
       "src/benchmark/benchmark_result.rs"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "Where is the TimingResult struct defined and what timing fields does it record",
     "expected_files": [
       "src/benchmark/timing_result.rs"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "Where is the Scheduler struct defined and what state does it hold",
     "expected_files": [
       "src/benchmark/scheduler.rs"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
     "query": "Where is the extract_exit_code function defined",
     "expected_files": [
       "src/util/exit_code.rs"
     ],
-    "category": "symbol_lookup"
+    "category": "symbol"
   },
   {
-    "query": "How does the Scheduler run benchmarks in sequence and export results incrementally after each individual run",
+    "query": "Scheduler run_benchmarks incremental export sequential results",
     "expected_files": [
       "src/benchmark/scheduler.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does hyperfine display a progress spinner or progress bar while a benchmark is running",
+    "query": "progress spinner ProgressBar indicatif benchmark running",
     "expected_files": [
       "src/output/progress_bar.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does hyperfine export benchmark results to CSV format",
+    "query": "CsvExporter benchmark results csv format serialize",
     "expected_files": [
       "src/export/csv.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does the wall clock timer record elapsed real time for a single benchmark run",
+    "query": "WallClockTimer elapsed real time single benchmark run",
     "expected_files": [
       "src/timer/wall_clock_timer.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does hyperfine validate option consistency such as minimum and maximum run count constraints after parsing",
+    "query": "Options validate min_runs max_runs consistency constraints",
     "expected_files": [
       "src/options.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
-    "query": "How does hyperfine select the fastest benchmark result as the default reference for speed comparison",
+    "query": "fastest benchmark select default reference baseline speed",
     "expected_files": [
       "src/benchmark/relative_speed.rs"
     ],
-    "category": "implementation"
+    "category": "keyword_code"
   },
   {
     "query": "How does main.rs wire together Scheduler, Options, Commands, and ExportManager to run benchmarks end to end",
@@ -223,19 +216,11 @@
     "category": "cross_file"
   },
   {
-    "query": "How does the reference command option pin a specific benchmark for relative speed comparison against others",
-    "expected_files": [
-      "src/benchmark/relative_speed.rs",
-      "src/benchmark/scheduler.rs"
-    ],
-    "category": "cross_file"
-  },
-  {
     "query": "How is the export system structured and what exporters does ExportManager register and manage",
     "expected_files": [
       "src/export/mod.rs"
     ],
-    "category": "architecture"
+    "category": "conceptual"
   },
   {
     "query": "How does hyperfine's entry point in main.rs orchestrate argument parsing, benchmark scheduling, and final export",
@@ -243,51 +228,14 @@
       "src/main.rs",
       "src/cli.rs"
     ],
-    "category": "architecture"
-  },
-  {
-    "query": "How does extract_exit_code encode Unix signal termination into a synthetic exit code value",
-    "expected_files": [
-      "src/util/exit_code.rs"
-    ],
-    "category": "error_handling"
-  },
-  {
-    "query": "What does the HyperfineError enum cover and when does each variant get raised during a run",
-    "expected_files": [
-      "src/error.rs"
-    ],
-    "category": "error_handling"
-  },
-  {
-    "query": "How does hyperfine emit warnings about high standard deviation or detected statistical outliers to the user",
-    "expected_files": [
-      "src/output/warnings.rs"
-    ],
-    "category": "error_handling"
-  },
-  {
-    "query": "How does ExportManager register output file paths for each supported export format at startup",
-    "expected_files": [
-      "src/export/mod.rs",
-      "src/cli.rs"
-    ],
-    "category": "config_init"
-  },
-  {
-    "query": "How does the CLI layer translate raw clap argument strings into a structured Options value",
-    "expected_files": [
-      "src/cli.rs",
-      "src/options.rs"
-    ],
-    "category": "config_init"
+    "category": "conceptual"
   },
   {
     "query": "How does hyperfine warm up a command before real timing starts to avoid cold-start cache effects",
     "expected_files": [
       "src/benchmark/mod.rs"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
     "query": "How does hyperfine determine which of two commands is faster and by how much",
@@ -295,14 +243,72 @@
       "src/benchmark/relative_speed.rs",
       "src/benchmark/scheduler.rs"
     ],
-    "category": "vocabulary_gap"
+    "category": "conceptual"
   },
   {
-    "query": "How does hyperfine avoid losing precision when measuring commands that complete in under a millisecond",
+    "query": "Command struct name prepare_command setup teardown fields",
     "expected_files": [
-      "src/util/units.rs",
-      "src/output/format.rs"
+      "src/command.rs"
     ],
-    "category": "vocabulary_gap"
+    "category": "symbol",
+    "notes": "Command holds name, setup/teardown commands, prepare command string"
+  },
+  {
+    "query": "Options struct shell warmup min_runs max_runs fields",
+    "expected_files": [
+      "src/options.rs"
+    ],
+    "category": "symbol",
+    "notes": "Options holds shell selection, warmup count, run count bounds, output options"
+  },
+  {
+    "query": "HyperfineError enum variants InvalidInput ParameterScan",
+    "expected_files": [
+      "src/error.rs"
+    ],
+    "category": "symbol",
+    "notes": "HyperfineError covers InvalidInput, ParameterScan, and IO error variants"
+  },
+  {
+    "query": "ExportManager struct exporters add export_with_output",
+    "expected_files": [
+      "src/export/mod.rs"
+    ],
+    "category": "symbol",
+    "notes": "ExportManager holds Vec of (Box<dyn Exporter>, path) pairs; export_with_output dispatches"
+  },
+  {
+    "query": "RelativeSpeed struct ratio uncertainty mean_time fields",
+    "expected_files": [
+      "src/benchmark/relative_speed.rs"
+    ],
+    "category": "symbol",
+    "notes": "RelativeSpeed holds ratio, uncertainty, mean_time; compute() builds from BenchmarkResult slice"
+  },
+  {
+    "query": "RangeStep begin end step validate iterate numeric",
+    "expected_files": [
+      "src/parameter/range_step.rs"
+    ],
+    "category": "symbol",
+    "notes": "RangeStep validates begin/end/step; implements Iterator<Item=Decimal>"
+  },
+  {
+    "query": "parameter range list expansion benchmark commands example",
+    "expected_files": [
+      "src/parameter/mod.rs",
+      "src/command.rs"
+    ],
+    "category": "example",
+    "notes": "Shows how parameter values expand into a cross-product of runnable Commands"
+  },
+  {
+    "query": "export json markdown csv ExportManager usage example",
+    "expected_files": [
+      "src/export/mod.rs",
+      "src/export/json.rs"
+    ],
+    "category": "example",
+    "notes": "ExportManager registration pattern and JsonExporter output format"
   }
 ]

@@ -17,6 +17,14 @@ use skelesearch_core::EmbedProvider;
 struct VoyageEmbeddingRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    /// Voyage AI distinguishes query vs document embeddings for retrieval.
+    /// `"query"` for search queries, `"document"` for indexed chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_type: Option<&'a str>,
+    /// Request truncated Matryoshka dimensions (e.g. 256, 512, 1024, 2048).
+    /// Only valid for MRL-enabled models (voyage-code-3, voyage-3.5, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimension: Option<usize>,
 }
 
 /// Top-level response envelope.
@@ -78,6 +86,11 @@ pub struct VoyageProvider {
     model: String,
     dim: usize,
     api_url: String,
+    /// When set, passed as `output_dimension` in API requests.
+    /// MRL (Matryoshka) property: first k dims of a larger vector are a valid k-dim embedding.
+    output_dimension: Option<usize>,
+    /// Cumulative token usage across all embed_batch calls.
+    total_tokens_used: std::sync::atomic::AtomicU64,
 }
 
 impl VoyageProvider {
@@ -111,12 +124,23 @@ impl VoyageProvider {
             model: model.to_string(),
             dim,
             api_url: "https://api.voyageai.com/v1/embeddings".to_string(),
+            output_dimension: None,
+            total_tokens_used: std::sync::atomic::AtomicU64::new(0),
         })
     }
-
     /// Override the API URL (useful for testing against a local proxy or mock).
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.api_url = url.into();
+        self
+    }
+
+    /// Request truncated MRL dimensions from the API.
+    /// Voyage's Matryoshka Representation Learning means the first k dims
+    /// of a larger vector are a valid k-dim embedding.
+    /// Supported values for voyage-code-3: 256, 512, 1024, 2048.
+    pub fn with_output_dimension(mut self, dim: usize) -> Self {
+        self.output_dimension = Some(dim);
+        self.dim = dim;
         self
     }
 
@@ -124,10 +148,12 @@ impl VoyageProvider {
     ///
     /// Retries up to 3 times on 429 with exponential back-off (1 s, 2 s, 4 s).
     /// Auth failures (401/403) and other HTTP errors are returned immediately.
-    async fn post_batch(&self, texts: &[String]) -> anyhow::Result<Vec<VoyageEmbeddingData>> {
+    async fn post_batch(&self, texts: &[String], input_type: Option<&str>) -> anyhow::Result<Vec<VoyageEmbeddingData>> {
         let body = VoyageEmbeddingRequest {
             model: &self.model,
             input: texts,
+            input_type,
+            output_dimension: self.output_dimension,
         };
 
         let mut delay_secs = 1u64;
@@ -188,8 +214,11 @@ impl VoyageProvider {
                 .await
                 .context("failed to deserialize Voyage AI embedding response")?;
 
-            tracing::trace!(
-                total_tokens = parsed.usage.total_tokens,
+            let tokens = parsed.usage.total_tokens;
+            let cumulative = self.total_tokens_used.fetch_add(tokens, std::sync::atomic::Ordering::Relaxed) + tokens;
+            tracing::info!(
+                batch_tokens = tokens,
+                cumulative_tokens = cumulative,
                 "Voyage AI embedding usage"
             );
 
@@ -228,7 +257,7 @@ impl EmbedProvider for VoyageProvider {
         let mut global_offset = 0usize;
 
         for chunk in texts.chunks(BATCH_LIMIT) {
-            let mut chunk_data = self.post_batch(chunk).await.with_context(|| {
+            let mut chunk_data = self.post_batch(chunk, Some("document")).await.with_context(|| {
                 format!(
                     "embedding sub-batch at offset {} (size {}) failed",
                     global_offset,
@@ -264,6 +293,53 @@ impl EmbedProvider for VoyageProvider {
         // Sort by global index — the API does not guarantee ordering.
         all_data.sort_unstable_by_key(|d| d.index);
 
+        Ok(all_data.into_iter().map(|d| d.embedding).collect())
+    }
+
+    /// Embed queries with `input_type: "query"` for better retrieval quality.
+    /// Voyage AI creates more tailored vectors when the input type is specified.
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let expected = texts.len();
+        let mut all_data: Vec<VoyageEmbeddingData> = Vec::with_capacity(expected);
+        let mut global_offset = 0usize;
+
+        for chunk in texts.chunks(BATCH_LIMIT) {
+            let mut chunk_data = self.post_batch(chunk, Some("query")).await.with_context(|| {
+                format!(
+                    "query embedding sub-batch at offset {} (size {}) failed",
+                    global_offset,
+                    chunk.len()
+                )
+            })?;
+
+            if chunk_data.len() != chunk.len() {
+                anyhow::bail!(
+                    "expected {} embeddings for query sub-batch at offset {}, got {}",
+                    chunk.len(),
+                    global_offset,
+                    chunk_data.len()
+                );
+            }
+
+            for item in &mut chunk_data {
+                item.index += global_offset;
+            }
+            all_data.extend(chunk_data);
+            global_offset += chunk.len();
+        }
+
+        anyhow::ensure!(
+            all_data.len() == expected,
+            "expected {} total query embeddings, got {}",
+            expected,
+            all_data.len()
+        );
+
+        all_data.sort_unstable_by_key(|d| d.index);
         Ok(all_data.into_iter().map(|d| d.embedding).collect())
     }
 }

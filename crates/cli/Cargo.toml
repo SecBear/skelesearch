@@ -11,12 +11,15 @@ path = "src/main.rs"
 
 [features]
 watch = ["skelesearch-core/watch"]
+coreml = ["skelesearch-rerank-local/coreml"]
+cuda = ["skelesearch-rerank-local/cuda"]
 
 [dependencies]
 skelesearch-core = { path = "../core" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 skelesearch-embed-openai = { path = "../embed-openai" }
 skelesearch-rerank-api = { path = "../rerank-api" }
+skelesearch-rerank-local = { path = "../rerank-local" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -26,6 +29,7 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+skelesearch-telemetry = { path = "../telemetry" }
 fs2 = { workspace = true }
 
 notify = { workspace = true }

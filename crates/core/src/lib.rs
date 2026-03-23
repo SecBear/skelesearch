@@ -1,3 +1,6 @@
+pub mod summary;
+pub use summary::{NoopSummaryProvider, OpenAISummaryProvider, SummaryProvider};
+
 pub mod git;
 
 pub mod chunker;
@@ -19,7 +22,7 @@ pub use provider::EmbedProvider;
 pub use schema::{
     ChunkRecord, CozoBackend, EdgeRecord, FileRecord, IndexStats, SearchResult, StorageBackend,
 };
-pub use searcher::{FileContext, Searcher};
+pub use searcher::{FileContext, Searcher, SearchTimings};
 pub use gc::collect_garbage;
 pub use grep::{grep_codebase, GrepMatch, GrepOptions};
 pub use config::{Config, ExpansionConfig, GraphConfig, IndexConfig, RerankerConfig, SearchConfig};
@@ -28,7 +31,7 @@ pub use reranker::{NoopReranker, RerankCandidate, Reranker};
 pub mod router;
 pub use router::{classify_query, QueryStrategy};
 pub mod symbols;
-pub use symbols::{extract_symbols, SymbolDef};
+pub use symbols::{extract_references, extract_symbols, ReferenceCapture, SymbolDef};
 pub mod expander;
 pub use expander::{LLMExpander, NoopExpander, QueryExpander};
 

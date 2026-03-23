@@ -1,5 +1,6 @@
 /target/
-Cargo.lock
+# Cargo.lock is committed — this is a binary project.
+# Reproducible builds require pinned dependencies across machines.
 crates/cli/.fastembed_cache/
 
 .brain/
@@ -10,3 +11,6 @@ crates/cli/.fastembed_cache/
 benchmarks/repos/
 benchmarks/runs/
 benchmarks/tmp/.worktrees
+__pycache__/
+.direnv/
+swebench-repos/

@@ -1,0 +1,12 @@
+# Benchmark profile: full pipeline with local fastembed embeddings.
+# No API keys needed — everything runs locally.
+
+[index]
+symbol_enrichment = true
+
+[search.expansion]
+enabled = false # LLM expansion needs OPENAI_API_KEY; skip for local runs
+
+[search.graph]
+enabled = true
+max_depth = 1

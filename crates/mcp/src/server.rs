@@ -29,7 +29,7 @@ use skelesearch_embed_fastembed::provider_from_name;
 use crate::tools::{
     ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
     GetFileContextInput, GrepSearchRow, ImpactEntry, ImpactSetOutput, IndexCodebaseInput,
-    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeRow,
+    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeResponse, SearchCodeRow,
     SmartSearchInput, SmartSearchOutput, SmartSearchResults, SymbolRow, TestContextOutput,
 };
 
@@ -60,6 +60,14 @@ impl EmbedProvider for ArcProvider {
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         self.0.embed_batch(texts).await
     }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.0.embed_queries(texts).await
+    }
+
+    fn query_prefix(&self) -> Option<&str> {
+        self.0.query_prefix()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,12 +81,14 @@ impl EmbedProvider for ArcProvider {
 /// The only tricky one is the manifest: `ManifestStore` wraps a raw SQLite pointer
 /// and is therefore `!Sync`.  We avoid this by storing the manifest's file path
 /// and opening a fresh connection per index operation rather than sharing one.
+/// Type alias for the concrete searcher used by the MCP server.
+type CachedSearcher = Searcher<CozoBackend, ArcProvider>;
+
 #[derive(Clone)]
 pub struct SkeleSearchServer {
     backend: Arc<CozoBackend>,
     /// Path to the manifest SQLite database; opened fresh per index_codebase call.
     manifest_path: Arc<PathBuf>,
-    /// Provider used for query embedding in `search_code`.
     /// Provider used for query embedding in `search_code`.  Wrapped in an
     /// RwLock so `run_index` can promote it to the real provider after a
     /// successful indexing run without requiring a full server restart.
@@ -87,6 +97,10 @@ pub struct SkeleSearchServer {
     /// Tracks content hashes seen per session for dedup.
     /// TODO: add periodic cleanup for long-running servers (sessions accumulate in memory).
     sessions: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    /// Cached searcher — built once on first search, invalidated after indexing.
+    /// Keeps the LRU query-embedding cache and TCP connection pool alive across
+    /// MCP calls, eliminating cold TLS handshakes and redundant embed API calls.
+    cached_searcher: Arc<tokio::sync::RwLock<Option<Arc<CachedSearcher>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +132,7 @@ impl SkeleSearchServer {
             provider: Arc::new(RwLock::new(ArcProvider::new(provider))),
             tool_router: Self::tool_router(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -237,16 +252,93 @@ impl SkeleSearchServer {
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("voyage", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
+            })
+            .or_else(|| {
+                // SKELESEARCH_RERANKER=local enables the local ONNX reranker.
+                // SKELESEARCH_RERANKER_MODEL_DIR overrides the default cache path.
+                // Best with CoreML (--features coreml) on Apple Silicon — model stays warm.
+                let local = std::env::var("SKELESEARCH_RERANKER").ok()
+                    .filter(|v| v == "local");
+                if local.is_none() { return None; }
+                let result = if let Ok(dir) = std::env::var("SKELESEARCH_RERANKER_MODEL_DIR") {
+                    let expanded = if dir.starts_with("~/") {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                        std::path::PathBuf::from(home).join(&dir[2..])
+                    } else {
+                        std::path::PathBuf::from(&dir)
+                    };
+                    skelesearch_rerank_local::LocalReranker::new(&expanded)
+                } else {
+                    skelesearch_rerank_local::LocalReranker::default_model()
+                };
+                result.ok().map(|r| -> Box<dyn Reranker> { Box::new(r) })
             });
 
         if expander.is_some() {
             tracing::info!("query expansion enabled (OPENAI_API_KEY detected)");
         }
         if reranker.is_some() {
-            tracing::info!("reranking enabled (API key detected)");
+            let source = if std::env::var("SKELESEARCH_RERANKER").ok().filter(|v| v == "local").is_some() {
+                "local ONNX model"
+            } else {
+                "cloud API key"
+            };
+            tracing::info!(source, "reranking enabled");
         }
 
         (expander, reranker)
+    }
+
+    /// Return a cached Searcher or build one on the first call.
+    /// The searcher is invalidated (cache cleared) after indexing so
+    /// provider changes and config changes are picked up.
+    async fn get_or_build_searcher(&self) -> anyhow::Result<Arc<CachedSearcher>> {
+        // Fast path: cached searcher exists.
+        {
+            let guard = self.cached_searcher.read().await;
+            if let Some(ref s) = *guard {
+                return Ok(Arc::clone(s));
+            }
+        }
+
+        // Slow path: build and cache.
+        let mut guard = self.cached_searcher.write().await;
+        // Double-check after acquiring write lock.
+        if let Some(ref s) = *guard {
+            return Ok(Arc::clone(s));
+        }
+
+        let provider = self.prepare_search_provider().await?;
+        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
+        let (expander, reranker) = self.auto_configure_pipeline();
+        let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
+        let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
+        // Apply pagerank_boost and tuning from project config.
+        let searcher = {
+            let root = self.backend.list_indexed_paths().await
+                .ok()
+                .and_then(|p| common_ancestor(&p))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let config = Config::load(&root).unwrap_or_default();
+            let searcher = searcher.with_search_tuning(&config);
+            if config.search.pagerank_boost == Some(false) {
+                searcher.with_pagerank_boost(false)
+            } else {
+                searcher
+            }
+        };
+
+        tracing::info!("searcher built and cached (LRU + connection pool will be reused)");
+        let arc = Arc::new(searcher);
+        *guard = Some(Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// Invalidate the cached searcher (call after indexing).
+    async fn invalidate_searcher_cache(&self) {
+        let mut guard = self.cached_searcher.write().await;
+        *guard = None;
+        tracing::info!("searcher cache invalidated");
     }
 
     /// Semantic + FTS hybrid search.
@@ -256,20 +348,24 @@ impl SkeleSearchServer {
     pub async fn search_code(
         &self,
         input: SearchCodeInput,
-    ) -> anyhow::Result<Vec<SearchCodeRow>> {
-        let provider = self.prepare_search_provider().await?;
-        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
-        let (expander, reranker) = self.auto_configure_pipeline();
-        let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
-        let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
+    ) -> anyhow::Result<SearchCodeResponse> {
+        let searcher = self.get_or_build_searcher().await?;
         let top_k = input.top_k.max(1);
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
-        let start = std::time::Instant::now();
-        let mut results = searcher
-            .search(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
+        let (mut results, timings) = searcher
+            .search_with_timings(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
             .await?;
-        tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, results = results.len(), "search_code complete");
+        tracing::info!(
+            embed_ms = timings.embed_ms,
+            retrieve_ms = timings.retrieve_ms,
+            expand_ms = timings.expand_ms,
+            rerank_ms = timings.rerank_ms,
+            graph_ms = timings.graph_ms,
+            total_ms = timings.total_ms,
+            results = results.len(),
+            "search_code pipeline timings"
+        );
 
         // Filter to branch-changed files if requested.
         if input.branch_scope {
@@ -312,7 +408,7 @@ impl SkeleSearchServer {
             rows = unseen;
         }
 
-        Ok(rows)
+        Ok(SearchCodeResponse { results: rows, _timings: timings })
     }
 
     /// Index the codebase at `input.path`.  Returns an error for unknown
@@ -378,6 +474,10 @@ impl SkeleSearchServer {
         // server never holds a provider for a failed/partial index.
         *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = provider;
 
+        // Invalidate cached searcher so the next search picks up the new provider
+        // and any config changes from the freshly indexed project.
+        self.invalidate_searcher_cache().await;
+
         Ok(IndexCodebaseOutput {
             status: "ok".to_string(),
             indexed: result.indexed_files,
@@ -420,8 +520,7 @@ impl SkeleSearchServer {
         &self,
         input: GetFileContextInput,
     ) -> anyhow::Result<FileContextOutput> {
-        let provider = self.provider.read().map_err(|_| anyhow::anyhow!("provider lock poisoned"))?.clone();
-        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
+        let searcher = self.get_or_build_searcher().await?;
         let ctx = match searcher.file_context(&input.file_path).await {
             Ok(c) => c,
             Err(ref e) if is_uninitialized_index_error(e) => {
@@ -459,7 +558,21 @@ impl SkeleSearchServer {
         input: SmartSearchInput,
     ) -> anyhow::Result<SmartSearchOutput> {
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
-        let strategy = classify_query(&input.query);
+
+        // Intent-based routing takes priority over auto-detection.
+        if let Some(ref intent) = input.intent.clone() {
+            return self.smart_search_by_intent(intent, input, max_tokens).await;
+        }
+
+        // No explicit intent — auto-detect from query content (backward compatible).
+        // Prepend any supplied symbols as BM25 boost terms.
+        let query = if input.symbols.is_empty() {
+            input.query.clone()
+        } else {
+            format!("{} {}", input.symbols.join(" "), input.query)
+        };
+
+        let strategy = classify_query(&query);
         let results = match &strategy {
             QueryStrategy::Grep => {
                 let paths = match self.backend.list_indexed_paths().await {
@@ -470,9 +583,14 @@ impl SkeleSearchServer {
                 if paths.is_empty() {
                     SmartSearchResults::Grep(vec![])
                 } else {
-                    let root = common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"));
+                    // If scope is set, use it as the grep root; otherwise use common ancestor.
+                    let root = if let Some(ref scope) = input.scope {
+                        PathBuf::from(scope)
+                    } else {
+                        common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"))
+                    };
                     let opts = GrepOptions { max_results: input.top_k.max(1), case_insensitive: false };
-                    let matches = grep_codebase(&root, &input.query, &opts)?;
+                    let matches = grep_codebase(&root, &query, &opts)?;
                     let mut rows: Vec<GrepSearchRow> = matches
                         .into_iter()
                         .map(|m| GrepSearchRow {
@@ -496,24 +614,102 @@ impl SkeleSearchServer {
                 }
             }
             QueryStrategy::Semantic => {
-                let rows = self
+                let response = self
                     .search_code(SearchCodeInput {
-                        query: input.query.clone(),
+                        query: query.clone(),
                         top_k: input.top_k,
                         include_graph: input.include_graph,
                         max_depth: None,
                         diversity: input.diversity,
                         max_tokens,
-                        // branch_scope and session_id are forwarded to search_code
                         branch_scope: input.branch_scope,
                         session_id: input.session_id.clone(),
                     })
                     .await?;
+                // Apply scope filter before returning.
+                let mut rows = response.results;
+                if let Some(ref scope) = input.scope {
+                    rows.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
+                }
                 SmartSearchResults::Semantic(rows)
             }
         };
         Ok(SmartSearchOutput { strategy: strategy.to_string(), results })
     }
+
+    /// Intent-based dispatch for explicit `intent` values.
+    async fn smart_search_by_intent(
+        &self,
+        intent: &str,
+        input: SmartSearchInput,
+        max_tokens: Option<usize>,
+    ) -> anyhow::Result<SmartSearchOutput> {
+        match intent {
+            "find" | "understand" => {
+                let include_graph = intent == "understand" || input.include_graph;
+                // "understand" uses depth 2; "find" uses no graph expansion by default.
+                let max_depth = if intent == "understand" {
+                    Some(2usize)
+                } else {
+                    None
+                };
+                // Prepend symbols as BM25 boost terms when supplied.
+                let query = if input.symbols.is_empty() {
+                    input.query.clone()
+                } else {
+                    format!("{} {}", input.symbols.join(" "), input.query)
+                };
+                let response = self
+                    .search_code(SearchCodeInput {
+                        query,
+                        top_k: input.top_k,
+                        include_graph,
+                        max_depth,
+                        diversity: input.diversity,
+                        max_tokens,
+                        branch_scope: input.branch_scope,
+                        session_id: input.session_id.clone(),
+                    })
+                    .await?;
+                let mut rows = response.results;
+                if let Some(ref scope) = input.scope {
+                    rows.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
+                }
+                Ok(SmartSearchOutput {
+                    strategy: intent.to_string(),
+                    results: SmartSearchResults::Semantic(rows),
+                })
+            }
+            "impact" => {
+                if input.symbols.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "impact intent requires at least one symbol in the 'symbols' field"
+                    ));
+                }
+                let file_path = input.symbols.first().cloned().unwrap();
+                let impact = self
+                    .find_impact_set(FindImpactSetInput {
+                        file_path,
+                        max_depth: None, // use find_impact_set default (3, capped at 5)
+                    })
+                    .await?;
+                Ok(SmartSearchOutput {
+                    strategy: "impact".to_string(),
+                    results: SmartSearchResults::Impact(impact),
+                })
+            }
+            "trace" => {
+                Err(anyhow::anyhow!("trace intent not yet implemented"))
+            }
+            other => {
+                Err(anyhow::anyhow!(
+                    "unknown intent {:?}; valid values are: find, understand, impact, trace",
+                    other
+                ))
+            }
+        }
+    }
+
 
     /// Find symbol definitions by name, optionally filtered by kind.
     pub async fn find_symbol(
@@ -542,7 +738,7 @@ impl SkeleSearchServer {
         input: FindImpactSetInput,
     ) -> anyhow::Result<ImpactSetOutput> {
         let max_depth = input.max_depth.unwrap_or(3).min(5);
-        let all_importers = match self.backend.traverse_importers(&input.file_path, max_depth).await {
+        let all_importers = match self.backend.traverse_importers(&input.file_path, max_depth, None).await {
             Ok(v) => v,
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
@@ -676,7 +872,7 @@ impl SkeleSearchServer {
         self.search_code(input)
             .await
             .map_err(|e| e.to_string())
-            .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
+            .and_then(|response| serde_json::to_string(&response).map_err(|e| e.to_string()))
     }
 
     /// Index a directory for code search. Run once, updates incrementally.
@@ -771,11 +967,21 @@ impl ServerHandler for SkeleSearchServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "skelesearch -- code search for agents. Use smart_search to find code by concept or keyword. \
-                 Results are ranked code blocks with file paths and line numbers. \
-                 Set max_tokens to control output size (default: 8192). \
-                 Set session_id to avoid seeing the same results twice."
-                    .into(),
+                "skelesearch -- semantic code search for agents.\n\n\
+                 Tools:\n\
+                 - smart_search: Find code by concept, keyword, or symbol. Auto-routes between grep and semantic search.\n\
+                 - search_code: Direct hybrid semantic + keyword search with full control over parameters.\n\
+                 - find_symbol: Exact symbol name lookup.\n\
+                 - find_impact_set: Find all files that depend on a given file (reverse import graph).\n\
+                 - find_test_context: Find test files for a source file.\n\n\
+                 Query tips for best results:\n\
+                 - Describe what the target code DOES, not a question: \"middleware that validates JWT tokens\" not \"how does auth work\"\n\
+                 - Include known symbol names: \"AsyncClient connection pooling retry logic\"\n\
+                 - Use `intent: \"understand\"` when you need a symbol plus its structural context\n\
+                 - Use `intent: \"impact\"` with `symbols: [\"SymbolName\"]` to find all dependents before refactoring\n\
+                 - Set `scope: \"src/auth\"` to narrow results to a directory\n\
+                 - Set `max_tokens` to control output size (default: 8192)\n\
+                 - Set `session_id` to deduplicate across multi-turn searches".into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {

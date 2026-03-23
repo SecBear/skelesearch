@@ -49,15 +49,10 @@ struct Args {
 }
 
 fn main() {
-    // Initialise tracing to stderr before touching anything else.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .init();
+    // Initialise tracing to stderr. When OTEL_EXPORTER_OTLP_ENDPOINT is set
+    // and the `otlp` feature is enabled on skelesearch-telemetry, spans are
+    // also exported to the configured OTLP collector.
+    let _telemetry = skelesearch_telemetry::init_tracing("skelesearch-mcp", "info");
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     if let Err(e) = rt.block_on(async_main()) {
