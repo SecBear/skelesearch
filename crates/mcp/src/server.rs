@@ -175,9 +175,17 @@ fn is_uninitialized_index_error(err: &anyhow::Error) -> bool {
 /// CozoDB schema errors ("stored relation not found", "arity mismatch") are common
 /// sources of confusing output — translate them to instructions the user can act on.
 fn friendly_index_error(err: &anyhow::Error) -> String {
+    friendly_index_error_inner(err, false)
+}
+
+fn friendly_index_error_inner(err: &anyhow::Error, indexing_active: bool) -> String {
     let msg = err.to_string();
     if msg.contains("stored relation") && msg.contains("not found") {
-        "Index not initialized. Run index_codebase or set VOYAGE_API_KEY for auto-indexing.".to_string()
+        if indexing_active {
+            "Index is being built. Poll index_status to check progress; search will work once indexing completes.".to_string()
+        } else {
+            "Index not initialized. Run index_codebase or set VOYAGE_API_KEY for auto-indexing.".to_string()
+        }
     } else if msg.contains("arity mismatch") || msg.contains("Arity mismatch") {
         "Index schema is outdated. Delete .skelesearch/ directory and re-index.".to_string()
     } else {
@@ -205,6 +213,12 @@ impl SkeleSearchServer {
             cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
             index_state: Arc::new(tokio::sync::RwLock::new(IndexProgress::default())),
         }
+    }
+
+    /// Map an error to a friendly string, noting if indexing is in progress.
+    async fn friendly_err(&self, err: anyhow::Error) -> String {
+        let active = self.index_state.read().await.status == IndexingStatus::Running;
+        friendly_index_error_inner(&err, active)
     }
 
     // -----------------------------------------------------------------------
@@ -1412,10 +1426,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<SearchCodeInput>,
     ) -> Result<String, String> {
-        self.search_code(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|response| serde_json::to_string(&response).map_err(|e| e.to_string()))
+        match self.search_code(input).await {
+                    Ok(response) => serde_json::to_string(&response).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Index a directory for code search. Run once, updates incrementally.
@@ -1424,10 +1438,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<IndexCodebaseInput>,
     ) -> Result<String, String> {
-        self.index_codebase(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
+        match self.index_codebase(input).await {
+                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Check if the code index exists and is current.
@@ -1436,10 +1450,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<IndexStatusInput>,
     ) -> Result<String, String> {
-        self.index_status(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
+        match self.index_status(input).await {
+                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Get all indexed chunks and import graph for a specific file.
@@ -1448,10 +1462,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<GetFileContextInput>,
     ) -> Result<String, String> {
-        self.get_file_context(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
+        match self.get_file_context(input).await {
+                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Find code by concept or keyword. Auto-routes to best search strategy.
@@ -1460,10 +1474,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<SmartSearchInput>,
     ) -> Result<String, String> {
-        self.smart_search(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
+        match self.smart_search(input).await {
+                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Look up a symbol definition by exact name. Returns file path, line range, and kind. Use for 'where is X defined' questions.
@@ -1472,10 +1486,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<FindSymbolInput>,
     ) -> Result<String, String> {
-        self.find_symbol(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
+        match self.find_symbol(input).await {
+                    Ok(rows) => serde_json::to_string(&rows).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Find all files affected by changes to a given file. Returns direct importers,
@@ -1485,10 +1499,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<FindImpactSetInput>,
     ) -> Result<String, String> {
-        self.find_impact_set(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
+        match self.find_impact_set(input).await {
+                    Ok(r) => serde_json::to_string(&r).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Find test files covering a source file. Returns test files that import it
@@ -1498,10 +1512,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<FindTestContextInput>,
     ) -> Result<String, String> {
-        self.find_test_context(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
+        match self.find_test_context(input).await {
+                    Ok(r) => serde_json::to_string(&r).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 
     /// Return source code, import graph edges, and test files for a named symbol.
@@ -1511,10 +1525,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<GetSymbolContextInput>,
     ) -> Result<String, String> {
-        self.get_symbol_context(input)
-            .await
-            .map_err(|e| friendly_index_error(&e))
-            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
+        match self.get_symbol_context(input).await {
+                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+                    Err(e) => Err(self.friendly_err(e).await),
+                }
     }
 }
 
