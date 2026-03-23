@@ -202,6 +202,7 @@ async fn list_tools_exposes_the_v1_tools() -> anyhow::Result<()> {
             "find_symbol",
             "find_test_context",
             "get_file_context",
+            "get_symbol_context",
             "index_codebase",
             "index_status",
             "search_code",

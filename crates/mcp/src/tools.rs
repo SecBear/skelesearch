@@ -315,3 +315,36 @@ pub struct TestContextOutput {
     /// Test files in the same directory or a sibling test directory.
     pub colocated_tests: Vec<String>,
 }
+
+fn default_true() -> bool {
+    true
+}
+
+/// Input for the `get_symbol_context` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetSymbolContextInput {
+    /// Symbol name to look up.
+    pub name: String,
+    /// Optional kind filter (e.g., "function", "struct", "class").
+    pub kind: Option<String>,
+    /// Include test files that reference this symbol (default: true).
+    #[serde(default = "default_true")]
+    pub include_tests: bool,
+}
+
+/// Output of the `get_symbol_context` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SymbolContextOutput {
+    /// The first matching symbol definition, if found.
+    pub symbol: Option<SymbolRow>,
+    /// Source code of the chunk containing this symbol.
+    pub source: Option<String>,
+    /// Files that import the symbol's file (callers at file level).
+    pub imported_by: Vec<String>,
+    /// Files that the symbol's file imports (dependencies).
+    pub imports: Vec<String>,
+    /// Test files that import the symbol's file.
+    pub test_files: Vec<String>,
+    /// Symbol role classification (reserved; always null in v1).
+    pub role: Option<String>,
+}

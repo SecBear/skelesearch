@@ -29,10 +29,10 @@ use skelesearch_embed_fastembed::provider_from_name;
 
 use crate::tools::{
     ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
-    GetFileContextInput, GrepSearchRow, ImpactEntry, ImpactSetOutput, IndexCodebaseInput,
-    IndexCodebaseOutput, IndexingProgress, IndexStatusInput, IndexStatusOutput, SearchCodeInput,
-    SearchCodeResponse, SearchCodeRow, SmartSearchInput, SmartSearchOutput, SmartSearchResults,
-    SymbolRow, TestContextOutput,
+    GetFileContextInput, GetSymbolContextInput, GrepSearchRow, ImpactEntry, ImpactSetOutput,
+    IndexCodebaseInput, IndexCodebaseOutput, IndexingProgress, IndexStatusInput, IndexStatusOutput,
+    SearchCodeInput, SearchCodeResponse, SearchCodeRow, SmartSearchInput, SmartSearchOutput,
+    SmartSearchResults, SymbolContextOutput, SymbolRow, TestContextOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1030,102 @@ impl SkeleSearchServer {
             .collect())
     }
 
+    /// Return a context bundle for a symbol: definition, source chunk, import graph edges,
+    /// and (optionally) test files that cover the symbol's file.
+    ///
+    /// Returns a partial result when the symbol is found but chunk retrieval fails —
+    /// callers always get what is available rather than an opaque error.
+    pub async fn get_symbol_context(
+        &self,
+        input: GetSymbolContextInput,
+    ) -> anyhow::Result<SymbolContextOutput> {
+        // Step 1: resolve the symbol.
+        let symbols = match self.backend.find_symbols(&input.name, input.kind.as_deref()).await {
+            Ok(r) => r,
+            Err(ref e) if is_uninitialized_index_error(e) => {
+                return Ok(SymbolContextOutput {
+                    symbol: None,
+                    source: None,
+                    imported_by: vec![],
+                    imports: vec![],
+                    test_files: vec![],
+                    role: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        let sym = match symbols.into_iter().next() {
+            Some(s) => s,
+            None => {
+                return Ok(SymbolContextOutput {
+                    symbol: None,
+                    source: None,
+                    imported_by: vec![],
+                    imports: vec![],
+                    test_files: vec![],
+                    role: None,
+                });
+            }
+        };
+
+        let symbol_row = SymbolRow {
+            file_path: sym.file_path.clone(),
+            name: sym.name.clone(),
+            kind: sym.kind.clone(),
+            start_line: sym.start_line,
+            end_line: sym.end_line,
+        };
+
+        // Step 2: find the chunk containing the symbol's start line.
+        let source = self.backend
+            .get_chunks_for_file(&sym.file_path)
+            .await
+            .ok() // source is best-effort — don't fail the whole call on a missing chunk
+            .and_then(|chunks| {
+                chunks.into_iter()
+                    .find(|c| c.start_line <= sym.start_line && sym.start_line <= c.end_line)
+                    .map(|c| c.content)
+            });
+
+        // Step 3: import graph edges for the symbol's file.
+        let imports = self.backend
+            .get_imports(&sym.file_path)
+            .await
+            .unwrap_or_default();
+        let all_importers = self.backend
+            .get_importers(&sym.file_path)
+            .await
+            .unwrap_or_default();
+
+        // Step 4: filter importers to test files when requested.
+        let test_files = if input.include_tests {
+            all_importers.iter()
+                .filter(|f| is_test_file_path(f))
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        };
+        let imported_by: Vec<String> = all_importers
+            .into_iter()
+            .filter(|f| !is_test_file_path(f))
+            .collect();
+
+        // Step 5: role lookup — symbol_roles relation not yet populated in v1.
+        let role: Option<String> = None;
+
+        Ok(SymbolContextOutput {
+            symbol: Some(symbol_row),
+            source,
+            imported_by,
+            imports,
+            test_files,
+            role,
+        })
+    }
+
+
     pub async fn find_impact_set(
         &self,
         input: FindImpactSetInput,
@@ -1220,7 +1316,7 @@ impl SkeleSearchServer {
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
-    /// Look up a symbol definition by exact name.
+    /// Look up a symbol definition by exact name. Returns file path, line range, and kind. Use for 'where is X defined' questions.
     #[tool(name = "find_symbol")]
     async fn mcp_find_symbol(
         &self,
@@ -1257,6 +1353,19 @@ impl SkeleSearchServer {
             .map_err(|e| e.to_string())
             .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
     }
+
+    /// Return source code, import graph edges, and test files for a named symbol.
+    /// One-call context bundle for agents that need to understand a symbol.
+    #[tool(name = "get_symbol_context")]
+    async fn mcp_get_symbol_context(
+        &self,
+        Parameters(input): Parameters<GetSymbolContextInput>,
+    ) -> Result<String, String> {
+        self.get_symbol_context(input)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1268,7 +1377,8 @@ impl ServerHandler for SkeleSearchServer {
                  Tools:\n\
                  - smart_search: Find code by concept, keyword, or symbol. Auto-routes between grep and semantic search.\n\
                  - search_code: Direct hybrid semantic + keyword search with full control over parameters.\n\
-                 - find_symbol: Exact symbol name lookup.\n\
+                 - find_symbol: Look up a symbol definition by exact name. Returns file path, line range, and kind. Use for 'where is X defined' questions.\n\
+                 - get_symbol_context: One-call context bundle for a symbol: source code, import graph edges, and test files.\n\
                  - find_impact_set: Find all files that depend on a given file (reverse import graph).\n\
                  - find_test_context: Find test files for a source file.\n\n\
                  Query tips for best results:\n\
