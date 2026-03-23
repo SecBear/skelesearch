@@ -866,11 +866,21 @@ impl ServerHandler for SkeleSearchServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "skelesearch -- code search for agents. Use smart_search to find code by concept or keyword. \
-                 Results are ranked code blocks with file paths and line numbers. \
-                 Set max_tokens to control output size (default: 8192). \
-                 Set session_id to avoid seeing the same results twice."
-                    .into(),
+                "skelesearch -- semantic code search for agents.\n\n\
+                 Tools:\n\
+                 - smart_search: Find code by concept, keyword, or symbol. Auto-routes between grep and semantic search.\n\
+                 - search_code: Direct hybrid semantic + keyword search with full control over parameters.\n\
+                 - find_symbol: Exact symbol name lookup.\n\
+                 - find_impact_set: Find all files that depend on a given file (reverse import graph).\n\
+                 - find_test_context: Find test files for a source file.\n\n\
+                 Query tips for best results:\n\
+                 - Describe what the target code DOES, not a question: \"middleware that validates JWT tokens\" not \"how does auth work\"\n\
+                 - Include known symbol names: \"AsyncClient connection pooling retry logic\"\n\
+                 - Use `intent: \"understand\"` when you need a symbol plus its structural context\n\
+                 - Use `intent: \"impact\"` with `symbols: [\"SymbolName\"]` to find all dependents before refactoring\n\
+                 - Set `scope: \"src/auth\"` to narrow results to a directory\n\
+                 - Set `max_tokens` to control output size (default: 8192)\n\
+                 - Set `session_id` to deduplicate across multi-turn searches".into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
