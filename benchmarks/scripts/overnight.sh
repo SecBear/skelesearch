@@ -69,7 +69,7 @@ fi
 echo ""
 echo "=== Step 6: ContextBench quick-bench ==="
 if [[ -f "$ROOT/benchmarks/scripts/quick_bench.py" ]]; then
-  uv run --with datasets --with huggingface_hub \
+  VOYAGE_API_KEY="$VOYAGE_API_KEY" uv run --with datasets --with huggingface_hub \
     python3 "$ROOT/benchmarks/scripts/quick_bench.py" \
     --binary "$BIN" \
     --n 30 \
@@ -85,7 +85,7 @@ fi
 echo ""
 echo "=== Step 7: SWE-bench eval ==="
 if [[ -f "$ROOT/benchmarks/scripts/swebench-eval.py" ]]; then
-  uv run --with datasets --with huggingface_hub \
+  VOYAGE_API_KEY="$VOYAGE_API_KEY" uv run --with datasets --with huggingface_hub \
     python3 "$ROOT/benchmarks/scripts/swebench-eval.py" \
     --binary "$BIN" \
     --provider voyage \

@@ -48,7 +48,7 @@ fi
 # Data cache: parquet file avoids 14s HuggingFace download on repeated runs.
 DATA_CACHE="$(dirname "$0")/../data/contextbench.parquet"
 
-exec uv run --with datasets --with huggingface_hub --with pandas --with pyarrow \
+exec env VOYAGE_API_KEY="$VOYAGE_API_KEY" uv run --with datasets --with huggingface_hub --with pandas --with pyarrow \
   python3 "$(dirname "$0")/quick_bench.py" \
   --binary "$BINARY" \
   --provider voyage \
