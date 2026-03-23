@@ -915,12 +915,43 @@ impl SkeleSearchServer {
                 if paths.is_empty() {
                     SmartSearchResults::Grep(vec![])
                 } else {
-                    // If scope is set, use it as the grep root; otherwise use common ancestor.
+                    // If scope is set, use it as the grep root; otherwise derive from the
+                    // common ancestor of indexed paths.  Fall back to the process cwd when
+                    // the ancestor collapses to "/" (filesystem root, useless) or ".",
+                    // which would mean the paths were relative and the ancestor is ambiguous.
                     let root = if let Some(ref scope) = input.scope {
                         PathBuf::from(scope)
                     } else {
-                        common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"))
+                        common_ancestor(&paths)
+                            .filter(|p| p != &PathBuf::from("/") && p.as_os_str() != "." && !p.as_os_str().is_empty())
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| PathBuf::from("."))
                     };
+                    // Guard: if the resolved root doesn't exist on disk, grep will
+                    // produce an IO error.  Fall back to semantic search so the caller
+                    // always gets results rather than a crash.
+                    if !root.exists() {
+                        let response = self
+                            .search_code(SearchCodeInput {
+                                query: query.clone(),
+                                top_k: input.top_k,
+                                include_graph: input.include_graph,
+                                max_depth: None,
+                                diversity: input.diversity,
+                                max_tokens,
+                                branch_scope: input.branch_scope,
+                                session_id: input.session_id.clone(),
+                            })
+                            .await?;
+                        let mut rows = response.results;
+                        if let Some(ref scope) = input.scope {
+                            rows.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
+                        }
+                        return Ok(SmartSearchOutput {
+                            strategy: "semantic".to_string(),
+                            results: SmartSearchResults::Semantic(rows),
+                        });
+                    }
                     let opts = GrepOptions { max_results: input.top_k.max(1), case_insensitive: false };
                     let matches = grep_codebase(&root, &query, &opts)?;
                     let mut rows: Vec<GrepSearchRow> = matches
