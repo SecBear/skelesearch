@@ -1,3 +1,4 @@
+use crate::cochange::CoChangePair;
 use crate::symbols::SymbolDef;
 
 use async_trait::async_trait;
@@ -139,6 +140,9 @@ pub trait StorageBackend: Send + Sync {
     /// Retrieve PageRank scores for the given file paths.
     /// Returns a HashMap; files not in the graph get score 0.0.
     async fn get_file_ranks(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>>;
+
+    /// Upsert co-change pairs derived from git history.
+    async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()>;
     /// Walk the HNSW proximity graph at layer 0 to find vector-similar chunks
     /// without re-embedding. Returns `(file_path, chunk_idx, distance)` tuples
     /// for neighbors of any seed chunk within `max_dist` (cosine distance;
@@ -604,6 +608,11 @@ impl StorageBackend for CozoBackend {
         // Create file_ranks relation for PageRank scores — idempotent.
         self.run_mut_ignore(
             ":create file_ranks { file_path: String => pagerank: Float }",
+        )?;
+
+        // Create cochange_edges relation for git co-change signal — idempotent.
+        self.run_mut_ignore(
+            ":create cochange_edges { file_a: String, file_b: String => frequency: Int, jaccard: Float }",
         )?;
 
         Ok(())
@@ -1395,6 +1404,37 @@ impl StorageBackend for CozoBackend {
             .collect()
     }
 
+    async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        const BATCH_SIZE: usize = 500;
+        for batch in pairs.chunks(BATCH_SIZE) {
+            let rows: Vec<Vec<DataValue>> = batch
+                .iter()
+                .map(|p| {
+                    vec![
+                        Self::dv_str(&p.file_a),
+                        Self::dv_str(&p.file_b),
+                        Self::dv_int(p.cochange_count as i64),
+                        Self::dv_float(p.jaccard),
+                    ]
+                })
+                .collect();
+            let data = DataValue::List(
+                rows.into_iter().map(|r| DataValue::List(r)).collect(),
+            );
+            let mut p = BTreeMap::new();
+            p.insert("rows".into(), data);
+            self.run_mut(
+                "?[file_a, file_b, frequency, jaccard] <- $rows \
+                 :put cochange_edges { file_a, file_b => frequency, jaccard }",
+                p,
+            )?;
+        }
+        Ok(())
+    }
+
     async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> {
         let dim = self.dim.load(Ordering::Relaxed);
         let zero = vec![0.0f32; dim];
@@ -1889,6 +1929,10 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         file_paths: &[&str],
     ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
         (**self).get_file_ranks(file_paths).await
+    }
+
+    async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()> {
+        (**self).upsert_cochange_edges(pairs).await
     }
 
     async fn hnsw_neighbors(

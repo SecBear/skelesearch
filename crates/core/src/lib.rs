@@ -1,3 +1,6 @@
+pub mod cochange;
+pub use cochange::CoChangePair;
+
 pub mod summary;
 pub use summary::{NoopSummaryProvider, OpenAISummaryProvider, SummaryProvider};
 

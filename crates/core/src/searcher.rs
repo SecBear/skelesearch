@@ -1732,6 +1732,7 @@ mod tests {
         async fn get_chunk_embeddings(&self, _keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
         async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
         async fn get_file_ranks(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
+        async fn upsert_cochange_edges(&self, _pairs: &[crate::cochange::CoChangePair]) -> anyhow::Result<()> { Ok(()) }
 
         // Returns an empty neighbor set — this test targets import-graph depth,
         // not HNSW proximity expansion.

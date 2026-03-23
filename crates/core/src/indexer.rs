@@ -10,6 +10,8 @@ use crate::{
     StorageBackend,
 };
 use crate::symbols::{extract_references, extract_symbols};
+use crate::cochange;
+
 
 // ---------------------------------------------------------------------------
 // Public output type
@@ -698,6 +700,28 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 tracing::info!("PageRank computation completed");
             }
         });
+
+        // Co-change analysis: mine git history for files that frequently change
+        // together.  This is optional — if git isn't available, the repo has no
+        // commits, or the working directory is not a git repo, skip silently.
+        {
+            let cochange_backend = Arc::clone(&self.backend);
+            let cochange_root = root.to_path_buf();
+            tokio::spawn(async move {
+                match cochange::compute_cochange_pairs(&cochange_root, 3, 500) {
+                    Ok(pairs) if pairs.is_empty() => {}
+                    Ok(pairs) => {
+                        let n = pairs.len();
+                        if let Err(e) = cochange_backend.upsert_cochange_edges(&pairs).await {
+                            tracing::warn!(error = %e, "co-change edge upsert failed");
+                        } else {
+                            tracing::info!(pairs = n, "co-change analysis complete");
+                        }
+                    }
+                    Err(e) => tracing::debug!(error = %e, "co-change analysis skipped"),
+                }
+            });
+        }
 
         // Spawn LSH deduplication as a background task.  Near-duplicate chunks
         // across different files waste HNSW graph capacity; removing them improves
