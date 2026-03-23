@@ -202,22 +202,19 @@ pub trait StorageBackend: Send + Sync {
 // Role classification
 // ---------------------------------------------------------------------------
 
-/// Classify the structural role of a symbol based on its file's import-graph
-/// degree and the symbol's own kind.
+/// Classify the structural role of a symbol based on its file's import-graph degree.
+///
+/// Dead code detection is deferred until function-level call graph is available.
+/// File-level import degree is too coarse — main(), test fns, and CLI handlers
+/// all have in_degree=0 at the file level but are not dead (PER-133 #2).
 ///
 /// Roles are mutually exclusive and ordered by priority:
-/// 1. `dead`    — callable symbol (function/method) with no importers
-/// 2. `entry`   — heavily imported, few or no outbound deps (public API surface)
-/// 3. `core`    — both heavily imported and imports many others (central module)
-/// 4. `utility` — not widely imported but imports many (shared helpers)
-/// 5. `leaf`    — no outbound imports (self-contained implementation)
-/// 6. `internal`— default when no structural pattern matches
-pub(crate) fn classify_symbol_role(kind: &str, in_degree: usize, out_degree: usize) -> &'static str {
-    // Callable symbols that nobody imports are unreachable dead code.
-    let is_callable = matches!(kind, "function" | "method");
-    if is_callable && in_degree == 0 {
-        return "dead";
-    }
+/// 1. `entry`   — heavily imported, few or no outbound deps (public API surface)
+/// 2. `core`    — both heavily imported and imports many others (central module)
+/// 3. `utility` — not widely imported but imports many (shared helpers)
+/// 4. `leaf`    — no outbound imports (self-contained implementation)
+/// 5. `internal`— default when no structural pattern matches
+pub(crate) fn classify_symbol_role(in_degree: usize, out_degree: usize) -> &'static str {
     // File-level structural patterns.
     if in_degree >= 3 && out_degree <= 1 {
         "entry"
@@ -839,7 +836,7 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("tf".into(), Self::dv_str(file_path));
         let rows = self.run_imm(
-            "?[from_file] := *code_edges[from_file, _, $tf, _, _]",
+            "?[from_file] := *code_edges[from_file, _, $tf, edge_type, _], edge_type = 'imports'",
             p,
         )?;
         rows.rows.iter().map(|r| Self::str_col(&r[0])).collect()
@@ -849,7 +846,7 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("fp".into(), Self::dv_str(file_path));
         let rows = self.run_imm(
-            "?[to_file] := *code_edges[$fp, _, to_file, _, _]",
+            "?[to_file] := *code_edges[$fp, _, to_file, edge_type, _], edge_type = 'imports'",
             p,
         )?;
         rows.rows.iter().map(|r| Self::str_col(&r[0])).collect()
@@ -1705,7 +1702,7 @@ impl StorageBackend for CozoBackend {
     async fn compute_symbol_roles(&self) -> anyhow::Result<()> {
         // 1. Compute file-level in/out degree from code_edges (same source as PageRank).
         let edge_rows = self.run_imm(
-            "?[from, to] := *code_edges[from, _, to, _, _]",
+            "?[from, to] := *code_edges[from, _, to, edge_type, _], edge_type = 'imports'",
             BTreeMap::new(),
         )?;
 
@@ -1735,10 +1732,10 @@ impl StorageBackend for CozoBackend {
         for row in &sym_rows.rows {
             let fp = match Self::str_col(&row[0]) { Ok(s) => s, Err(_) => continue };
             let name = match Self::str_col(&row[1]) { Ok(s) => s, Err(_) => continue };
-            let kind = match Self::str_col(&row[2]) { Ok(s) => s, Err(_) => continue };
+            let _kind = match Self::str_col(&row[2]) { Ok(s) => s, Err(_) => continue };
             let in_d = *in_degree.get(&fp).unwrap_or(&0);
             let out_d = *out_degree.get(&fp).unwrap_or(&0);
-            let role = classify_symbol_role(&kind, in_d, out_d);
+            let role = classify_symbol_role(in_d, out_d);
             role_rows.push((fp, name, role, in_d, out_d));
         }
 
@@ -2125,55 +2122,45 @@ mod tests {
     use super::classify_symbol_role;
 
     #[test]
-    fn dead_callable_no_importers() {
-        // A function with no importers is dead.
-        assert_eq!(classify_symbol_role("function", 0, 0), "dead");
-        assert_eq!(classify_symbol_role("method", 0, 0), "dead");
-        // Even if it imports many things.
-        assert_eq!(classify_symbol_role("function", 0, 5), "dead");
-    }
-
-    #[test]
-    fn non_callable_no_importers_is_not_dead() {
-        // A struct/type/trait with no importers falls through to other rules.
-        assert_eq!(classify_symbol_role("struct", 0, 0), "leaf");
-        assert_eq!(classify_symbol_role("class", 0, 0), "leaf");
-        assert_eq!(classify_symbol_role("trait", 0, 0), "leaf");
+    fn no_importers_is_leaf_or_utility() {
+        // With dead-code classification removed, in_degree=0 falls through to structural rules.
+        assert_eq!(classify_symbol_role(0, 0), "leaf");    // no edges either way
+        assert_eq!(classify_symbol_role(0, 2), "utility"); // imports many, no importers
     }
 
     #[test]
     fn entry_rule() {
         // Heavily imported, few outbound: entry point.
-        assert_eq!(classify_symbol_role("class", 3, 0), "entry");
-        assert_eq!(classify_symbol_role("class", 3, 1), "entry");
-        assert_eq!(classify_symbol_role("function", 5, 0), "entry"); // callable but imported ≥3
+        assert_eq!(classify_symbol_role(3, 0), "entry");
+        assert_eq!(classify_symbol_role(3, 1), "entry");
+        assert_eq!(classify_symbol_role(5, 0), "entry");
     }
 
     #[test]
     fn core_rule() {
         // Both well-imported and imports many: core module.
-        assert_eq!(classify_symbol_role("class", 2, 2), "core");
-        assert_eq!(classify_symbol_role("function", 4, 3), "core");
+        assert_eq!(classify_symbol_role(2, 2), "core");
+        assert_eq!(classify_symbol_role(4, 3), "core");
     }
 
     #[test]
     fn utility_rule() {
         // Not widely imported but imports many: utility/helper.
-        assert_eq!(classify_symbol_role("struct", 0, 2), "utility");
-        assert_eq!(classify_symbol_role("struct", 1, 3), "utility");
+        assert_eq!(classify_symbol_role(0, 2), "utility");
+        assert_eq!(classify_symbol_role(1, 3), "utility");
     }
 
     #[test]
     fn leaf_rule() {
         // No outbound deps and doesn't match a higher priority rule: leaf.
-        assert_eq!(classify_symbol_role("struct", 1, 0), "leaf");
-        assert_eq!(classify_symbol_role("enum", 2, 0), "leaf"); // in=2 < 3, out=0
+        assert_eq!(classify_symbol_role(1, 0), "leaf");
+        assert_eq!(classify_symbol_role(2, 0), "leaf"); // in=2 < 3, out=0
     }
 
     #[test]
     fn internal_default() {
         // Low import counts in both directions: internal.
-        assert_eq!(classify_symbol_role("struct", 1, 1), "internal");
-        assert_eq!(classify_symbol_role("class", 2, 1), "internal"); // in=2 < 3
+        assert_eq!(classify_symbol_role(1, 1), "internal");
+        assert_eq!(classify_symbol_role(2, 1), "internal"); // in=2 < 3
     }
 }
