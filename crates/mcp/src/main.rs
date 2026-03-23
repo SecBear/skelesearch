@@ -5,7 +5,7 @@
 // corrupt the MCP framing and break the client.
 //
 // Transport: stdio (default) or Streamable HTTP (--http <addr>)
-// Framework: rmcp 0.16 (#[tool_router] + #[tool_handler])
+// Framework: rmcp 1.2 (#[tool_router] + #[tool_handler])
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -65,9 +65,7 @@ async fn async_main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let project_root = find_project_root();
-    let skelesearch_dir = project_root.join(".skelesearch");
-    std::fs::create_dir_all(&skelesearch_dir)
-        .with_context(|| format!("create .skelesearch dir at {}", skelesearch_dir.display()))?;
+    let skelesearch_dir = resolve_storage_dir(&project_root);
 
     let backend = Arc::new(
         skelesearch_core::CozoBackend::open(skelesearch_dir.join("index.db"))
@@ -108,4 +106,40 @@ fn find_project_root() -> PathBuf {
             None => return cwd,
         }
     }
+}
+
+/// Determine the `.skelesearch` storage directory. Tries the project root first;
+/// falls back to `$HOME/.skelesearch/<hash>` if the primary path is not writable,
+/// and finally to a temp directory. The server MUST always reach `serve_stdio()`
+/// — a degraded storage directory is better than a dead process.
+fn resolve_storage_dir(project_root: &std::path::Path) -> PathBuf {
+    let primary = project_root.join(".skelesearch");
+    if std::fs::create_dir_all(&primary).is_ok() {
+        return primary;
+    }
+    tracing::warn!(
+        path = %primary.display(),
+        "cannot create .skelesearch in project root — falling back"
+    );
+
+    // Deterministic fallback under $HOME so repeated launches reuse the same DB.
+    if let Ok(home) = std::env::var("HOME") {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        project_root.hash(&mut hasher);
+        let hash = hasher.finish();
+        let fallback = PathBuf::from(home)
+            .join(".skelesearch")
+            .join(format!("fallback-{hash:016x}"));
+        if std::fs::create_dir_all(&fallback).is_ok() {
+            tracing::info!(path = %fallback.display(), "using fallback storage dir");
+            return fallback;
+        }
+    }
+
+    // Last resort: temp directory (ephemeral, but the server starts).
+    let tmp = std::env::temp_dir().join(".skelesearch-tmp");
+    let _ = std::fs::create_dir_all(&tmp);
+    tracing::warn!(path = %tmp.display(), "using temp storage dir — index will not persist");
+    tmp
 }

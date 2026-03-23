@@ -661,9 +661,15 @@ impl SkeleSearchServer {
             }
         }
 
-        // Validate provider name before any I/O.
+        // Validate provider name without loading the model — provider_from_name
+        // for fastembed loads a 450MB ONNX model synchronously and must not run
+        // on the async thread (it would block on_initialized and rmcp's message loop).
         let provider_name = input.provider.as_deref().unwrap_or("fastembed");
-        let provider = provider_from_name(provider_name).map(ArcProvider::new)?;
+        match provider_name {
+            "fastembed" | "voyage" | "openai" => {}
+            unknown => return Err(anyhow::anyhow!("unknown provider: '{unknown}'. Valid: fastembed, voyage, openai")),
+        }
+        let provider_name_owned = provider_name.to_string();
 
         let path = std::path::PathBuf::from(&input.path);
 
@@ -707,7 +713,7 @@ impl SkeleSearchServer {
             let backend2 = Arc::clone(&backend);
             let manifest_path2 = Arc::clone(&manifest_path);
             let path2 = path.clone();
-            let provider_for_closure = provider.clone();
+            let provider_name_for_closure = provider_name_owned;
 
             // ManifestStore is !Send — run indexing in a dedicated current_thread
             // runtime inside spawn_blocking so the outer async task stays Send.
@@ -717,22 +723,26 @@ impl SkeleSearchServer {
                     .build()
                     .map_err(|e| anyhow::anyhow!("runtime build: {e}"))?;
                 rt.block_on(async {
+                    let provider = provider_from_name(&provider_name_for_closure)
+                        .map(ArcProvider::new)
+                        .with_context(|| format!("failed to initialize provider '{}'", provider_name_for_closure))?;
                     let manifest = Arc::new(ManifestStore::open(manifest_path2.as_path())?);
                     let config = Config::load(&path2).context("load .skelesearch.toml")?;
-                    let indexer = Indexer::new(backend2, manifest, provider_for_closure)
+                    let indexer = Indexer::new(backend2, manifest, provider.clone())
                         .with_excludes(config.index.exclude.clone())
                         .with_include_extensions(config.index.include_extensions.clone());
-                    indexer.index_path(&path2).await
+                    let result = indexer.index_path(&path2).await;
+                    result.map(|r| (r, provider))
                 })
             })
             .await;
 
             match result {
-                Ok(Ok(index_result)) => {
+                Ok(Ok((index_result, provider))) => {
                     // Promote provider only on success — a partial index must never
                     // change the server's active embedding dimension.
                     if let Ok(mut guard) = provider_arc.write() {
-                        *guard = provider;
+                        *guard = provider.clone();
                     }
                     // Invalidate cached searcher so the next search rebuilds with
                     // the new provider and any fresh config.
