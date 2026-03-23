@@ -672,12 +672,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let mut hits = hits;
         for hit in &mut hits {
             if is_test_file(&hit.file_path) {
-                hit.score *= 0.3;
+                hit.score *= 0.15;
+            } else if is_readme_or_meta(&hit.file_path) {
+                hit.score *= 0.05; // Almost never the right answer for code search
             } else if is_doc_file(&hit.file_path) {
                 if is_docs_directory(&hit.file_path) {
-                    hit.score *= 0.2; // Docs-directory files are almost never the right answer
+                    hit.score *= 0.1; // Docs-directory files are almost never the right answer
                 } else {
-                    hit.score *= 0.35; // Inline docs (README.md in root) — still penalized but less
+                    hit.score *= 0.2; // Inline docs (README.md in root) — still penalized but less
                 }
             } else if is_barrel_file(&hit.file_path) {
                 let barrel_penalty = if query_asks_about_entry_point(query) {
@@ -1066,6 +1068,25 @@ fn is_test_file(path: &str) -> bool {
         || stem.ends_with("_spec")
 }
 
+/// Returns `true` when `path` is a repository meta-file — README, CHANGELOG,
+/// LICENSE, CONTRIBUTING, etc.
+///
+/// These files match conceptual queries via prose but never contain
+/// implementation code.  They receive a near-zero score multiplier so they
+/// only surface when nothing substantive matched.
+fn is_readme_or_meta(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let filename = lower.rsplit('/').next().unwrap_or(&lower);
+    matches!(
+        filename,
+        "readme.md" | "readme.rst" | "readme.txt" | "readme"
+            | "changelog.md" | "changelog.rst" | "changes.md" | "changes.rst"
+            | "contributing.md" | "contributing.rst"
+            | "license" | "license.md" | "license.txt"
+            | "code_of_conduct.md" | "security.md"
+    )
+}
+
 /// Returns `true` when `path` looks like a documentation or prose file.
 ///
 /// Matches on (case-insensitive):
@@ -1166,7 +1187,7 @@ fn query_asks_about_entry_point(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query};
+    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -1218,6 +1239,44 @@ mod tests {
         assert!(!is_test_file("README.md"));
         // File named "tester.rs" — stem is "tester", not a match.
         assert!(!is_test_file("src/tester.rs"));
+    }
+
+    // --- is_readme_or_meta tests ---
+
+    #[test]
+    fn test_is_readme_or_meta_positive() {
+        // Common root-level meta files.
+        assert!(is_readme_or_meta("README.md"));
+        assert!(is_readme_or_meta("readme.md"));
+        assert!(is_readme_or_meta("README.rst"));
+        assert!(is_readme_or_meta("README.txt"));
+        assert!(is_readme_or_meta("README"));
+        assert!(is_readme_or_meta("CHANGELOG.md"));
+        assert!(is_readme_or_meta("CHANGELOG.rst"));
+        assert!(is_readme_or_meta("CHANGES.md"));
+        assert!(is_readme_or_meta("CHANGES.rst"));
+        assert!(is_readme_or_meta("CONTRIBUTING.md"));
+        assert!(is_readme_or_meta("CONTRIBUTING.rst"));
+        assert!(is_readme_or_meta("LICENSE"));
+        assert!(is_readme_or_meta("LICENSE.md"));
+        assert!(is_readme_or_meta("LICENSE.txt"));
+        assert!(is_readme_or_meta("CODE_OF_CONDUCT.md"));
+        assert!(is_readme_or_meta("SECURITY.md"));
+        // Works with path prefix.
+        assert!(is_readme_or_meta("packages/core/README.md"));
+        // Case-insensitive.
+        assert!(is_readme_or_meta("Readme.MD"));
+    }
+
+    #[test]
+    fn test_is_readme_or_meta_negative() {
+        // Source files that merely mention readme-like names.
+        assert!(!is_readme_or_meta("src/router.rs"));
+        assert!(!is_readme_or_meta("src/lib.rs"));
+        assert!(!is_readme_or_meta("docs/guide.md"));
+        assert!(!is_readme_or_meta("docs/changelog-notes/index.md"));
+        // CHANGELOG as a path segment, not a file name.
+        assert!(!is_readme_or_meta("changelog/entries/2024.md"));
     }
 
     // --- sanitize_fts_query tests ---
