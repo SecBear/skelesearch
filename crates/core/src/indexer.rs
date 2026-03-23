@@ -137,6 +137,37 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         let dim = self.provider.dim();
         self.backend.initialize(dim).await?;
 
+        // -- Detect provider/dimension changes ----------------------------------
+        //    If the manifest records a different embedding provider or dimension,
+        //    stored vectors are incompatible with the current provider's output.
+        //    * Dim changed  → hard error: CozoDB's typed vector column cannot
+        //      store vectors of a different length without schema recreation.
+        //      The user must delete .skelesearch/ to switch dimensions.
+        //    * Provider changed, same dim → clear file_hashes so every file
+        //      becomes a candidate and gets re-embedded with the new provider.
+        //      Phase 2b deletes stale backend data before upserting fresh vectors.
+        let stored_provider = self.manifest.get_meta("provider")?;
+        let stored_dim = self.manifest.get_meta("dim")?
+            .and_then(|s| s.parse::<usize>().ok());
+        if let (Some(prev_provider), Some(prev_dim)) = (&stored_provider, stored_dim) {
+            let cur_provider = self.provider.name();
+            if prev_dim != dim {
+                anyhow::bail!(
+                    "embedding dimension mismatch: stored index uses provider '{}' (dim={}) \
+                     but this run requests provider '{}' (dim={}). \
+                     Delete the .skelesearch/ directory to re-index with the new provider.",
+                    prev_provider, prev_dim, cur_provider, dim
+                );
+            } else if prev_provider.as_str() != cur_provider {
+                tracing::info!(
+                    prev_provider = %prev_provider,
+                    cur_provider  = %cur_provider,
+                    "embedding provider changed — forcing full re-index"
+                );
+                self.manifest.clear_file_hashes()?;
+            }
+        }
+
         let chunker = Chunker::default();
         let mut visited: HashSet<String> = HashSet::new();
         let mut result = IndexResult::default();
