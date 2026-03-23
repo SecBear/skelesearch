@@ -23,14 +23,15 @@ use rmcp::{
     model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
-use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, StorageBackend};
+use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, IndexResult, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, StorageBackend};
 use skelesearch_embed_fastembed::provider_from_name;
 
 use crate::tools::{
     ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
     GetFileContextInput, GrepSearchRow, ImpactEntry, ImpactSetOutput, IndexCodebaseInput,
-    IndexCodebaseOutput, IndexStatusInput, IndexStatusOutput, SearchCodeInput, SearchCodeResponse, SearchCodeRow,
-    SmartSearchInput, SmartSearchOutput, SmartSearchResults, SymbolRow, TestContextOutput,
+    IndexCodebaseOutput, IndexingProgress, IndexStatusInput, IndexStatusOutput, SearchCodeInput,
+    SearchCodeResponse, SearchCodeRow, SmartSearchInput, SmartSearchOutput, SmartSearchResults,
+    SymbolRow, TestContextOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,56 @@ impl EmbedProvider for ArcProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Background indexing state
+// ---------------------------------------------------------------------------
+
+/// Status of a background `index_codebase` operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexingStatus {
+    Idle,
+    Running,
+    Done,
+    Failed,
+}
+
+/// Mutable state for the background indexing task, protected by an async `RwLock`.
+/// All fields are set atomically under the write lock; readers snapshot under the read lock.
+#[derive(Debug, Clone)]
+pub struct IndexProgress {
+    pub status: IndexingStatus,
+    /// Absolute path being indexed.
+    pub path: String,
+    /// Rough file count captured before spawning (0 if quick-count timed out).
+    pub files_found: usize,
+    /// Files indexed on completion (0 while running).
+    pub files_done: usize,
+    /// Chunks written on completion (0 while running).
+    pub chunks_done: usize,
+    /// Embedding cache hits on completion (0 while running).
+    pub cache_hits: usize,
+    /// Error string if `status == Failed`.
+    pub error: Option<String>,
+    /// Wall-clock start so callers can compute elapsed seconds.
+    pub started_at: std::time::Instant,
+}
+
+impl Default for IndexProgress {
+    fn default() -> Self {
+        Self {
+            status: IndexingStatus::Idle,
+            path: String::new(),
+            files_found: 0,
+            files_done: 0,
+            chunks_done: 0,
+            cache_hits: 0,
+            error: None,
+            // Instant::now() is harmless for Idle; only read when status != Idle.
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SkeleSearchServer
 // ---------------------------------------------------------------------------
 
@@ -101,6 +152,9 @@ pub struct SkeleSearchServer {
     /// Keeps the LRU query-embedding cache and TCP connection pool alive across
     /// MCP calls, eliminating cold TLS handshakes and redundant embed API calls.
     cached_searcher: Arc<tokio::sync::RwLock<Option<Arc<CachedSearcher>>>>,
+    /// Shared state for background indexing.  Written by the spawned task,
+    /// read by `index_status` and `index_codebase` (duplicate-check).
+    index_state: Arc<tokio::sync::RwLock<IndexProgress>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +187,7 @@ impl SkeleSearchServer {
             tool_router: Self::tool_router(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
+            index_state: Arc::new(tokio::sync::RwLock::new(IndexProgress::default())),
         }
     }
 
@@ -411,46 +466,170 @@ impl SkeleSearchServer {
         Ok(SearchCodeResponse { results: rows, _timings: timings })
     }
 
-    /// Index the codebase at `input.path`.  Returns an error for unknown
-    /// provider names before any I/O.
+    /// Index the codebase at `input.path` in the background.
+    ///
+    /// Returns immediately after spawning the indexing task.
+    /// Callers should poll `index_status` to observe completion.
+    ///
+    /// # Error conditions (returned synchronously)
+    /// - Unknown provider name — rejected before any I/O.
+    /// - Indexing already in progress — returns `"already_indexing"` status (not an error).
     ///
     /// # Send safety
-    /// `ManifestStore` wraps a raw SQLite pointer and is `!Send`.  Creating an
-    /// `Indexer` (which holds `Arc<ManifestStore>`) and awaiting it in a
-    /// multi-threaded context violates the `Send` bound required by rmcp.
-    /// We avoid this by moving the indexing work into `spawn_blocking`, where a
-    /// dedicated single-thread runtime runs the `!Send` future without crossing
-    /// thread boundaries.
+    /// `ManifestStore` wraps a raw SQLite pointer and is `!Send`.  The background
+    /// task runs the indexer inside `spawn_blocking` → `current_thread` runtime,
+    /// which prevents the `!Send` future from crossing thread boundaries.
     #[tracing::instrument(skip_all, fields(path = %input.path))]
     pub async fn index_codebase(
         &self,
         input: IndexCodebaseInput,
     ) -> anyhow::Result<IndexCodebaseOutput> {
+        // Reject concurrent indexing before any I/O.
+        {
+            let state = self.index_state.read().await;
+            if state.status == IndexingStatus::Running {
+                return Ok(IndexCodebaseOutput {
+                    status: "already_indexing".to_string(),
+                    path: state.path.clone(),
+                    files_queued: 0,
+                    message: format!(
+                        "indexing already in progress for '{}'; use index_status to check progress",
+                        state.path
+                    ),
+                });
+            }
+        }
+
+        // Validate provider name before any I/O.
         let provider_name = input.provider.as_deref().unwrap_or("fastembed");
-        // Validate provider name before launching any I/O.
         let provider = provider_from_name(provider_name).map(ArcProvider::new)?;
-        self.run_index(std::path::Path::new(&input.path), provider).await
+
+        let path = std::path::PathBuf::from(&input.path);
+
+        // Quick best-effort file count before spawning.
+        // Capped at 1 second so large repos don't delay the response.
+        let count_path = path.clone();
+        let files_queued = {
+            let timeout_result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || count_files_recursive(&count_path)),
+            )
+            .await;
+            match timeout_result {
+                Ok(Ok(n)) => n,
+                _ => 0,
+            }
+        };
+
+        // Mark Running before spawning to prevent TOCTOU: a second concurrent call
+        // arriving before the spawned task runs would otherwise see Idle.
+        {
+            let mut state = self.index_state.write().await;
+            state.status = IndexingStatus::Running;
+            state.path = input.path.clone();
+            state.files_found = files_queued;
+            state.files_done = 0;
+            state.chunks_done = 0;
+            state.cache_hits = 0;
+            state.error = None;
+            state.started_at = std::time::Instant::now();
+        }
+
+        // Clone Arcs that the background task needs.
+        let backend = Arc::clone(&self.backend);
+        let manifest_path = Arc::clone(&self.manifest_path);
+        let provider_arc = Arc::clone(&self.provider);
+        let cached_searcher_arc = Arc::clone(&self.cached_searcher);
+        let index_state = Arc::clone(&self.index_state);
+
+        tokio::task::spawn(async move {
+            let backend2 = Arc::clone(&backend);
+            let manifest_path2 = Arc::clone(&manifest_path);
+            let path2 = path.clone();
+            let provider_for_closure = provider.clone();
+
+            // ManifestStore is !Send — run indexing in a dedicated current_thread
+            // runtime inside spawn_blocking so the outer async task stays Send.
+            let result = tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("runtime build: {e}"))?;
+                rt.block_on(async {
+                    let manifest = Arc::new(ManifestStore::open(manifest_path2.as_path())?);
+                    let config = Config::load(&path2).context("load .skelesearch.toml")?;
+                    let indexer = Indexer::new(backend2, manifest, provider_for_closure)
+                        .with_excludes(config.index.exclude.clone())
+                        .with_include_extensions(config.index.include_extensions.clone());
+                    indexer.index_path(&path2).await
+                })
+            })
+            .await;
+
+            match result {
+                Ok(Ok(index_result)) => {
+                    // Promote provider only on success — a partial index must never
+                    // change the server's active embedding dimension.
+                    if let Ok(mut guard) = provider_arc.write() {
+                        *guard = provider;
+                    }
+                    // Invalidate cached searcher so the next search rebuilds with
+                    // the new provider and any fresh config.
+                    *cached_searcher_arc.write().await = None;
+                    tracing::info!("searcher cache invalidated after background indexing");
+
+                    let mut state = index_state.write().await;
+                    state.status = IndexingStatus::Done;
+                    state.files_done = index_result.indexed_files;
+                    state.chunks_done = index_result.total_chunks;
+                    state.cache_hits = index_result.cache_hits;
+                    tracing::info!(
+                        path = %state.path,
+                        indexed = index_result.indexed_files,
+                        chunks = index_result.total_chunks,
+                        "background indexing complete"
+                    );
+                }
+                Ok(Err(index_err)) => {
+                    tracing::error!(error = %index_err, "background indexing failed");
+                    let mut state = index_state.write().await;
+                    state.status = IndexingStatus::Failed;
+                    state.error = Some(index_err.to_string());
+                }
+                Err(join_err) => {
+                    tracing::error!(error = %join_err, "indexer task panicked");
+                    let mut state = index_state.write().await;
+                    state.status = IndexingStatus::Failed;
+                    state.error = Some(format!("indexer task panicked: {join_err}"));
+                }
+            }
+        });
+
+        Ok(IndexCodebaseOutput {
+            status: "indexing_started".to_string(),
+            path: input.path,
+            files_queued,
+            message: "Indexing started in the background. Use index_status to check progress.".to_string(),
+        })
     }
 
-    /// Index a path using an already-constructed provider.
+    /// Index a path synchronously using an already-constructed provider.
     ///
-    /// Extracted from `index_codebase` so tests can inject a provider directly
-    /// without going through the string-based factory (which requires network).
-    /// Production callers always go through `index_codebase`.
+    /// Used directly by tests to exercise the indexing pipeline without going
+    /// through the async background machinery or the string-based provider factory.
+    /// Production code goes through `index_codebase`, which spawns this logic
+    /// in a background task.
     pub async fn run_index(
         &self,
         path: &std::path::Path,
         provider: ArcProvider,
-    ) -> anyhow::Result<IndexCodebaseOutput> {
+    ) -> anyhow::Result<IndexResult> {
         let backend = Arc::clone(&self.backend);
         let manifest_path = Arc::clone(&self.manifest_path);
         let path = path.to_path_buf();
-        // Clone the provider so the closure can take ownership of one copy
-        // while we retain another for promotion after successful indexing.
         let provider_for_closure = provider.clone();
 
-        // ManifestStore is !Send; run indexing in a dedicated single-thread runtime
-        // inside spawn_blocking so the outer future remains Send.
+        // ManifestStore is !Send; run in a dedicated single-thread runtime.
         let result = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -469,28 +648,18 @@ impl SkeleSearchServer {
         .context("indexer task panicked")?
         .context("indexer.index_path")?;
 
-        // Promote the provider so subsequent searches use the same embedding
-        // dimension as the newly-built index.  Only runs on success so the
-        // server never holds a provider for a failed/partial index.
         *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = provider;
-
-        // Invalidate cached searcher so the next search picks up the new provider
-        // and any config changes from the freshly indexed project.
         self.invalidate_searcher_cache().await;
 
-        Ok(IndexCodebaseOutput {
-            status: "ok".to_string(),
-            indexed: result.indexed_files,
-            chunks: result.total_chunks,
-            cache_hits: result.cache_hits,
-        })
+        Ok(result)
     }
 
-    /// Return current index statistics.
+    /// Return current index statistics, including live background-indexing progress.
     pub async fn index_status(
         &self,
         _input: IndexStatusInput,
     ) -> anyhow::Result<IndexStatusOutput> {
+        let indexing = self.current_indexing_progress().await;
         let stats = match self.backend.stats().await {
             Ok(s) => s,
             Err(ref e) if is_uninitialized_index_error(e) => {
@@ -500,6 +669,7 @@ impl SkeleSearchServer {
                     last_indexed: None,
                     estimated_stale: 0,
                     watching: false,
+                    indexing,
                 });
             }
             Err(e) => return Err(e),
@@ -511,7 +681,35 @@ impl SkeleSearchServer {
             // v1: no file-change detection; always 0 after a fresh index run.
             estimated_stale: 0,
             watching: false,
+            indexing,
         })
+    }
+
+    /// Snapshot the current background indexing progress for inclusion in `IndexStatusOutput`.
+    /// Returns `None` when no indexing has been started on this server instance.
+    async fn current_indexing_progress(&self) -> Option<IndexingProgress> {
+        let state = self.index_state.read().await;
+        match state.status {
+            IndexingStatus::Idle => None,
+            _ => {
+                let elapsed = state.started_at.elapsed().as_secs_f64();
+                Some(IndexingProgress {
+                    status: match state.status {
+                        IndexingStatus::Running => "running".to_string(),
+                        IndexingStatus::Done => "done".to_string(),
+                        IndexingStatus::Failed => "failed".to_string(),
+                        IndexingStatus::Idle => unreachable!(),
+                    },
+                    path: state.path.clone(),
+                    files_done: state.files_done,
+                    files_total: state.files_found,
+                    chunks_done: state.chunks_done,
+                    cache_hits: state.cache_hits,
+                    elapsed_seconds: elapsed,
+                    error: state.error.clone(),
+                })
+            }
+        }
     }
 
     /// Return all chunks, outbound imports, and inbound importers for a file.
@@ -1039,4 +1237,26 @@ fn common_ancestor(paths: &[String]) -> Option<PathBuf> {
         }
     }
     Some(common)
+}
+
+/// Recursively count files under `path`, following symlinks.
+///
+/// Used for a quick pre-spawn file count in `index_codebase`.  Does not
+/// apply extension filters or `.gitignore` rules — the goal is a fast upper
+/// bound, not a precise match of what the indexer will process.
+///
+/// The caller wraps this in `tokio::time::timeout` so it never blocks long.
+fn count_files_recursive(path: &std::path::Path) -> usize {
+    let mut count = 0usize;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                count += count_files_recursive(&p);
+            } else if p.is_file() {
+                count += 1;
+            }
+        }
+    }
+    count
 }
