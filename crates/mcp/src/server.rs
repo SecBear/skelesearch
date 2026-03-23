@@ -1112,8 +1112,15 @@ impl SkeleSearchServer {
             .filter(|f| !is_test_file_path(f))
             .collect();
 
-        // Step 5: role lookup — symbol_roles relation not yet populated in v1.
-        let role: Option<String> = None;
+        // Step 5: role lookup — query symbol_roles if available; gracefully returns None
+        // when the relation has not been populated yet (e.g. freshly indexed repo).
+        let role: Option<String> = self
+            .backend
+            .get_symbol_roles(&[sym.file_path.as_str()])
+            .await
+            .ok()
+            .and_then(|mut m| m.remove(sym.file_path.as_str()));
+
 
         Ok(SymbolContextOutput {
             symbol: Some(symbol_row),

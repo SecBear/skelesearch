@@ -715,17 +715,30 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             let cochange_backend = Arc::clone(&self.backend);
             let cochange_root = root.to_path_buf();
             tokio::spawn(async move {
-                match cochange::compute_cochange_pairs(&cochange_root, 3, 500) {
-                    Ok(pairs) if pairs.is_empty() => {}
-                    Ok(pairs) => {
-                        let n = pairs.len();
-                        if let Err(e) = cochange_backend.upsert_cochange_edges(&pairs).await {
-                            tracing::warn!(error = %e, "co-change edge upsert failed");
-                        } else {
-                            tracing::info!(pairs = n, "co-change analysis complete");
-                        }
+                // compute_cochange_pairs calls std::process::Command (git log), which is
+                // a blocking subprocess.  Offload it to the blocking thread pool so the
+                // tokio worker thread is not stalled while git runs.
+                let pairs = match tokio::task::spawn_blocking(move || {
+                    cochange::compute_cochange_pairs(&cochange_root, 3, 500)
+                })
+                .await
+                {
+                    Ok(Ok(p)) if p.is_empty() => return,
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        tracing::debug!(error = %e, "co-change analysis skipped");
+                        return;
                     }
-                    Err(e) => tracing::debug!(error = %e, "co-change analysis skipped"),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "co-change spawn_blocking panicked");
+                        return;
+                    }
+                };
+                let n = pairs.len();
+                if let Err(e) = cochange_backend.upsert_cochange_edges(&pairs).await {
+                    tracing::warn!(error = %e, "co-change edge upsert failed");
+                } else {
+                    tracing::info!(pairs = n, "co-change analysis complete");
                 }
             });
         }
