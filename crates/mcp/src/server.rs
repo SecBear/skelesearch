@@ -170,6 +170,21 @@ fn is_uninitialized_index_error(err: &anyhow::Error) -> bool {
     msg.contains("stored relation") && msg.contains("not found")
 }
 
+/// Translate a backend error into a user-actionable message for MCP callers.
+///
+/// CozoDB schema errors ("stored relation not found", "arity mismatch") are common
+/// sources of confusing output — translate them to instructions the user can act on.
+fn friendly_index_error(err: &anyhow::Error) -> String {
+    let msg = err.to_string();
+    if msg.contains("stored relation") && msg.contains("not found") {
+        "Index not initialized. Run index_codebase or set VOYAGE_API_KEY for auto-indexing.".to_string()
+    } else if msg.contains("arity mismatch") || msg.contains("Arity mismatch") {
+        "Index schema is outdated. Delete .skelesearch/ directory and re-index.".to_string()
+    } else {
+        msg
+    }
+}
+
 
 impl SkeleSearchServer {
     /// Construct the server.
@@ -294,13 +309,22 @@ impl SkeleSearchServer {
             "no index found; auto-starting background indexing"
         );
 
-        // Errors here are logged inside index_codebase; we discard the Result
-        // since a failed auto-index must not crash the server — the user can
-        // always call index_codebase explicitly.
-        let _ = self.index_codebase(IndexCodebaseInput {
+        // Surface auto-index failures so the user can act on them.
+        // A failed auto-index must not crash the server, but silence is worse —
+        // the user needs to know why search tools are returning errors.
+        match self.index_codebase(IndexCodebaseInput {
             path: cwd.to_string_lossy().to_string(),
             provider: Some(provider_name.to_string()),
-        }).await;
+        }).await {
+            Ok(_) => {}
+            Err(e) => {
+                let friendly = friendly_index_error(&e);
+                tracing::error!(error = %friendly, "auto-index failed to start; search tools may not be available");
+                let mut state = self.index_state.write().await;
+                state.status = IndexingStatus::Failed;
+                state.error = Some(friendly);
+            }
+        }
     }
 
     /// Ensure a usable embedding provider is ready before a search.
@@ -690,10 +714,21 @@ impl SkeleSearchServer {
                     );
                 }
                 Ok(Err(index_err)) => {
-                    tracing::error!(error = %index_err, "background indexing failed");
+                    let err_str = index_err.to_string();
+                    let err_lower = err_str.to_lowercase();
+                    if err_lower.contains("dimension mismatch") || err_lower.contains("arity mismatch") {
+                        tracing::error!(
+                            error = %index_err,
+                            "Auto-index failed: index was built with a different provider \
+                             (dimension mismatch). Delete .skelesearch/ directory and restart, \
+                             or set VOYAGE_API_KEY in the MCP server environment."
+                        );
+                    } else {
+                        tracing::error!(error = %index_err, "background indexing failed");
+                    }
                     let mut state = index_state.write().await;
                     state.status = IndexingStatus::Failed;
-                    state.error = Some(index_err.to_string());
+                    state.error = Some(friendly_index_error(&index_err));
                 }
                 Err(join_err) => {
                     tracing::error!(error = %join_err, "indexer task panicked");
@@ -1271,7 +1306,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.search_code(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|response| serde_json::to_string(&response).map_err(|e| e.to_string()))
     }
 
@@ -1283,7 +1318,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.index_codebase(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
@@ -1295,7 +1330,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.index_status(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
@@ -1307,7 +1342,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.get_file_context(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
@@ -1319,7 +1354,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.smart_search(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 
@@ -1331,7 +1366,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.find_symbol(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|rows| serde_json::to_string(&rows).map_err(|e| e.to_string()))
     }
 
@@ -1344,7 +1379,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.find_impact_set(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
     }
 
@@ -1357,7 +1392,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.find_test_context(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
     }
 
@@ -1370,7 +1405,7 @@ impl SkeleSearchServer {
     ) -> Result<String, String> {
         self.get_symbol_context(input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_index_error(&e))
             .and_then(|out| serde_json::to_string(&out).map_err(|e| e.to_string()))
     }
 }
@@ -1415,6 +1450,26 @@ impl ServerHandler for SkeleSearchServer {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
             self.auto_index_if_needed().await;
+            // Quick health check: verify the index backend is queryable.
+            // Does not block startup — logs clearly so the user sees problems in server logs.
+            // An uninitialized index is expected on first launch (auto-indexing runs in background).
+            match self.backend.stats().await {
+                Ok(stats) => {
+                    tracing::info!(
+                        indexed_files = stats.indexed_files,
+                        total_chunks = stats.total_chunks,
+                        "index health check passed"
+                    );
+                }
+                Err(ref e) if is_uninitialized_index_error(e) => {
+                    // Expected on fresh start before any indexing has run.
+                    tracing::info!("index health check: not yet initialized (auto-indexing will handle this)");
+                }
+                Err(e) => {
+                    let friendly = friendly_index_error(&e);
+                    tracing::error!(error = %friendly, "index health check FAILED — search tools will return errors until resolved");
+                }
+            }
         }
     }
 
