@@ -172,6 +172,24 @@ pub struct SmartSearchInput {
     /// are deprioritized (moved to bottom of results).
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Search intent that controls retrieval strategy.
+    /// - "find": pure vector + BM25 search (default)
+    /// - "understand": vector search + deep graph expansion (2-3 hops)
+    /// - "impact": reverse graph traversal — what depends on the query target
+    /// - "trace": find connection path between two symbols
+    /// When omitted, auto-detected from query content.
+    #[serde(default)]
+    pub intent: Option<String>,
+    /// Known symbol names or file paths to anchor the search.
+    /// For "impact" intent: the file path of the target to analyze (first entry used).
+    /// For "trace" intent: [start_symbol, end_symbol].
+    /// For other intents: prepended to the query as BM25 boost terms.
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    /// Scope search to a specific directory or module path.
+    /// Example: "src/auth" limits results to files under that path.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// A single grep result row returned by `smart_search` on the grep path.
@@ -188,6 +206,8 @@ pub struct GrepSearchRow {
 pub enum SmartSearchResults {
     Grep(Vec<GrepSearchRow>),
     Semantic(Vec<SearchCodeRow>),
+    /// Returned when intent = "impact"; wraps the full ImpactSetOutput.
+    Impact(ImpactSetOutput),
 }
 
 /// Output of the `smart_search` tool.

@@ -554,7 +554,21 @@ impl SkeleSearchServer {
         input: SmartSearchInput,
     ) -> anyhow::Result<SmartSearchOutput> {
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
-        let strategy = classify_query(&input.query);
+
+        // Intent-based routing takes priority over auto-detection.
+        if let Some(ref intent) = input.intent.clone() {
+            return self.smart_search_by_intent(intent, input, max_tokens).await;
+        }
+
+        // No explicit intent — auto-detect from query content (backward compatible).
+        // Prepend any supplied symbols as BM25 boost terms.
+        let query = if input.symbols.is_empty() {
+            input.query.clone()
+        } else {
+            format!("{} {}", input.symbols.join(" "), input.query)
+        };
+
+        let strategy = classify_query(&query);
         let results = match &strategy {
             QueryStrategy::Grep => {
                 let paths = match self.backend.list_indexed_paths().await {
@@ -565,9 +579,14 @@ impl SkeleSearchServer {
                 if paths.is_empty() {
                     SmartSearchResults::Grep(vec![])
                 } else {
-                    let root = common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"));
+                    // If scope is set, use it as the grep root; otherwise use common ancestor.
+                    let root = if let Some(ref scope) = input.scope {
+                        PathBuf::from(scope)
+                    } else {
+                        common_ancestor(&paths).unwrap_or_else(|| PathBuf::from("/"))
+                    };
                     let opts = GrepOptions { max_results: input.top_k.max(1), case_insensitive: false };
-                    let matches = grep_codebase(&root, &input.query, &opts)?;
+                    let matches = grep_codebase(&root, &query, &opts)?;
                     let mut rows: Vec<GrepSearchRow> = matches
                         .into_iter()
                         .map(|m| GrepSearchRow {
@@ -593,22 +612,97 @@ impl SkeleSearchServer {
             QueryStrategy::Semantic => {
                 let response = self
                     .search_code(SearchCodeInput {
-                        query: input.query.clone(),
+                        query: query.clone(),
                         top_k: input.top_k,
                         include_graph: input.include_graph,
                         max_depth: None,
                         diversity: input.diversity,
                         max_tokens,
-                        // branch_scope and session_id are forwarded to search_code
                         branch_scope: input.branch_scope,
                         session_id: input.session_id.clone(),
                     })
                     .await?;
-                SmartSearchResults::Semantic(response.results)
+                // Apply scope filter before returning.
+                let mut rows = response.results;
+                if let Some(ref scope) = input.scope {
+                    rows.retain(|r| r.file_path.starts_with(scope.as_str()));
+                }
+                SmartSearchResults::Semantic(rows)
             }
         };
         Ok(SmartSearchOutput { strategy: strategy.to_string(), results })
     }
+
+    /// Intent-based dispatch for explicit `intent` values.
+    async fn smart_search_by_intent(
+        &self,
+        intent: &str,
+        input: SmartSearchInput,
+        max_tokens: Option<usize>,
+    ) -> anyhow::Result<SmartSearchOutput> {
+        match intent {
+            "find" | "understand" => {
+                let include_graph = intent == "understand" || input.include_graph;
+                // "understand" uses depth 2; "find" uses no graph expansion by default.
+                let max_depth = if intent == "understand" {
+                    Some(2usize)
+                } else {
+                    None
+                };
+                // Prepend symbols as BM25 boost terms when supplied.
+                let query = if input.symbols.is_empty() {
+                    input.query.clone()
+                } else {
+                    format!("{} {}", input.symbols.join(" "), input.query)
+                };
+                let response = self
+                    .search_code(SearchCodeInput {
+                        query,
+                        top_k: input.top_k,
+                        include_graph,
+                        max_depth,
+                        diversity: input.diversity,
+                        max_tokens,
+                        branch_scope: input.branch_scope,
+                        session_id: input.session_id.clone(),
+                    })
+                    .await?;
+                let mut rows = response.results;
+                if let Some(ref scope) = input.scope {
+                    rows.retain(|r| r.file_path.starts_with(scope.as_str()));
+                }
+                Ok(SmartSearchOutput {
+                    strategy: intent.to_string(),
+                    results: SmartSearchResults::Semantic(rows),
+                })
+            }
+            "impact" => {
+                let file_path = input.symbols.first()
+                    .cloned()
+                    .unwrap_or_else(|| input.query.clone());
+                let impact = self
+                    .find_impact_set(FindImpactSetInput {
+                        file_path,
+                        max_depth: None, // use find_impact_set default (3, capped at 5)
+                    })
+                    .await?;
+                Ok(SmartSearchOutput {
+                    strategy: "impact".to_string(),
+                    results: SmartSearchResults::Impact(impact),
+                })
+            }
+            "trace" => {
+                Err(anyhow::anyhow!("trace intent not yet implemented"))
+            }
+            other => {
+                Err(anyhow::anyhow!(
+                    "unknown intent {:?}; valid values are: find, understand, impact, trace",
+                    other
+                ))
+            }
+        }
+    }
+
 
     /// Find symbol definitions by name, optionally filtered by kind.
     pub async fn find_symbol(
