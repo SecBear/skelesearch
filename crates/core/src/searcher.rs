@@ -855,9 +855,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Phase 4a: Distribute graph chunks filtered by query relevance.
         // Chunks with cosine similarity < 0.25 are discarded to avoid flooding results
         // with tangentially related code from imported files.
-        // Score = best_score × sim × 0.7^depth (closer import + more relevant = higher score).
+        // Score = best_score × sim × GRAPH_HOP_DECAY^depth (closer import + more relevant = higher score).
+        // GRAPH_HOP_DECAY is 0.3 per hop: hop-1 chunks score at most 0.30×best_score,
+        // hop-2 at most 0.09×best_score.  This keeps graph results clearly subordinate
+        // to primary hits while still surfacing cross-file context.
         let pre_graph_count = hits.len();
         const GRAPH_SIM_THRESHOLD: f64 = 0.25;
+        // Per-hop score multiplier: 0.3^depth keeps graph results well below primary hits.
+        const GRAPH_HOP_DECAY: f64 = 0.3;
         for chunk in all_graph_chunks {
             let key = (chunk.file_path.clone(), chunk.chunk_idx);
             if !seen_chunks.insert(key) {
@@ -873,7 +878,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 continue;
             }
             let depth = *depth_map.get(&chunk.file_path).unwrap_or(&1);
-            let score = (best_score * sim * 0.7_f64.powi(depth as i32)).min(best_score * 0.5);
+            let score = best_score * sim * GRAPH_HOP_DECAY.powi(depth as i32);
             hits.push(SearchResult {
                 file_path: chunk.file_path,
                 chunk_idx: chunk.chunk_idx,
@@ -942,13 +947,13 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             }
         }
 
-        // Cap graph-added results to top 20 to prevent result flooding.
+        // Cap graph-added results to top 30 to prevent result flooding.
         // Sort the graph portion by score descending before truncating so the
         // highest-relevance graph chunks survive.
-        if hits.len() > pre_graph_count + 20 {
+        if hits.len() > pre_graph_count + 30 {
             let graph_part = &mut hits[pre_graph_count..];
             graph_part.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            hits.truncate(pre_graph_count + 20);
+            hits.truncate(pre_graph_count + 30);
         }
 
         tracing::debug!(
@@ -1519,4 +1524,206 @@ mod tests {
         assert_eq!(result, query);
     }
 
+    // -----------------------------------------------------------------------
+    // graph augmentation depth tests
+    // -----------------------------------------------------------------------
+
+    use std::sync::Arc;
+    use async_trait::async_trait;
+    use crate::schema::{ChunkRecord, SearchResult, StorageBackend, IndexStats};
+    use crate::symbols::SymbolDef;
+    use crate::EmbedProvider;
+    use super::Searcher;
+
+    // A minimal 4-dimensional embedding provider used only to satisfy the
+    // generic bound on `Searcher<B, P>`.  `augment_with_graph` never calls
+    // `embed_batch`, so the implementation is a no-op.
+    struct MockProvider;
+
+    #[async_trait]
+    impl EmbedProvider for MockProvider {
+        fn dim(&self) -> usize { 4 }
+        async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+    }
+
+    // Simulates a 3-file import chain: a.rs → b.rs → c.rs.
+    // traverse_imports honours max_depth: depth=1 returns only b.rs;
+    // depth=2 also returns c.rs.
+    struct MockImportBackend;
+
+    fn make_chunk(file_path: &str, chunk_idx: usize) -> ChunkRecord {
+        ChunkRecord {
+            file_path: file_path.to_string(),
+            chunk_idx,
+            content: format!("content of {}:{}", file_path, chunk_idx),
+            normalized: String::new(),
+            description: String::new(),
+            chunk_type: "function".to_string(),
+            start_line: 1,
+            end_line: 10,
+            // embedding [1, 0, 0, 0] has cosine_sim=1.0 with query_vec [1, 0, 0, 0],
+            // well above the GRAPH_SIM_THRESHOLD=0.25 gate.
+            embedding: Some(vec![1.0_f32, 0.0, 0.0, 0.0]),
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for MockImportBackend {
+        async fn initialize(&self, _dim: usize) -> anyhow::Result<()> { Ok(()) }
+        async fn upsert_file(&self, _r: &crate::schema::FileRecord) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+
+        async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> {
+            match file_path {
+                "b.rs" => Ok(vec![make_chunk("b.rs", 0)]),
+                "c.rs" => Ok(vec![make_chunk("c.rs", 0)]),
+                _ => Ok(vec![]),
+            }
+        }
+
+        async fn get_chunks_for_files(&self, file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> {
+            let mut out = vec![];
+            for &fp in file_paths {
+                match fp {
+                    "b.rs" => out.push(make_chunk("b.rs", 0)),
+                    "c.rs" => out.push(make_chunk("c.rs", 0)),
+                    _ => {}
+                }
+            }
+            Ok(out)
+        }
+
+        async fn upsert_edges(&self, _e: &[crate::schema::EdgeRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+
+        /// Simulate the import chain a.rs → b.rs → c.rs.
+        /// Depth 1 from a.rs: only b.rs.  Depth 2: b.rs + c.rs.
+        async fn traverse_imports(
+            &self,
+            file_path: &str,
+            max_depth: usize,
+            _edge_types: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            if max_depth == 0 || file_path != "a.rs" {
+                return Ok(vec![]);
+            }
+            let mut out = vec![("b.rs".to_string(), 1)];
+            if max_depth >= 2 {
+                out.push(("c.rs".to_string(), 2));
+            }
+            Ok(out)
+        }
+
+        async fn traverse_importers(
+            &self,
+            _file_path: &str,
+            _max_depth: usize,
+            _edge_types: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            Ok(vec![])
+        }
+
+        async fn hybrid_search(
+            &self,
+            _query_vec: &[f32],
+            _query_str: &str,
+            _top_k: usize,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+
+        async fn stats(&self) -> anyhow::Result<IndexStats> {
+            Ok(IndexStats {
+                indexed_files: 0,
+                total_chunks: 0,
+                last_indexed: None,
+                watching: false,
+                estimated_stale: 0,
+            })
+        }
+
+        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn find_symbols(&self, _name: &str, _kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> { Ok(vec![]) }
+        async fn get_chunk_embeddings(&self, _keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
+        async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
+        async fn get_file_ranks(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
+
+        // Returns an empty neighbor set — this test targets import-graph depth,
+        // not HNSW proximity expansion.
+        async fn hnsw_neighbors(
+            &self,
+            _seeds: &[(String, usize)],
+            _max_dist: f64,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+            Ok(vec![])
+        }
+
+        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
+    }
+
+    fn seed_hit(file_path: &str) -> SearchResult {
+        SearchResult {
+            file_path: file_path.to_string(),
+            chunk_idx: 0,
+            content: "seed".to_string(),
+            start_line: 1,
+            end_line: 5,
+            chunk_type: "function".to_string(),
+            score: 1.0,
+            match_quality: "high".to_string(),
+            why: "vector".to_string(),
+        }
+    }
+
+    /// Verify that depth=2 graph augmentation returns one more file (c.rs) than
+    /// depth=1 because the recursive import traversal reaches the second hop.
+    #[tokio::test]
+    async fn graph_augment_depth2_returns_more_than_depth1() {
+        let backend = Arc::new(MockImportBackend);
+        let searcher = Searcher::new(backend, MockProvider);
+        let query_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let best_score = 1.0_f64;
+
+        let hits_d1 = searcher
+            .augment_with_graph(vec![seed_hit("a.rs")], 1, best_score, &query_vec)
+            .await
+            .expect("depth=1 augmentation failed");
+
+        let hits_d2 = searcher
+            .augment_with_graph(vec![seed_hit("a.rs")], 2, best_score, &query_vec)
+            .await
+            .expect("depth=2 augmentation failed");
+
+        // depth=1: seed a.rs + graph b.rs  = 2 total
+        // depth=2: seed a.rs + graph b.rs + graph c.rs = 3 total
+        assert!(
+            hits_d2.len() > hits_d1.len(),
+            "depth=2 should return more hits than depth=1: got d1={}, d2={}",
+            hits_d1.len(), hits_d2.len()
+        );
+
+        // Verify c.rs appears only in the depth=2 result.
+        let d1_files: Vec<&str> = hits_d1.iter().map(|h| h.file_path.as_str()).collect();
+        let d2_files: Vec<&str> = hits_d2.iter().map(|h| h.file_path.as_str()).collect();
+        assert!(!d1_files.contains(&"c.rs"), "c.rs must not appear in depth=1: {:?}", d1_files);
+        assert!(d2_files.contains(&"c.rs"), "c.rs must appear in depth=2: {:?}", d2_files);
+
+        // Verify hop-2 (c.rs) scores less than hop-1 (b.rs).
+        let score_b_d2 = hits_d2.iter().find(|h| h.file_path == "b.rs").map(|h| h.score).unwrap_or(0.0);
+        let score_c_d2 = hits_d2.iter().find(|h| h.file_path == "c.rs").map(|h| h.score).unwrap_or(0.0);
+        assert!(
+            score_b_d2 > score_c_d2,
+            "hop-1 (b.rs, score={}) should score higher than hop-2 (c.rs, score={})",
+            score_b_d2, score_c_d2
+        );
+    }
 }
