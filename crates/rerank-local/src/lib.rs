@@ -121,6 +121,7 @@ impl LocalReranker {
             tokenizer_path.display()
         );
 
+        #[allow(unused_mut)]
         let mut builder = Session::builder()?;
 
         // Register hardware-accelerated execution providers when feature-enabled.

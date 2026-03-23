@@ -177,14 +177,11 @@ fn parse_workspace_members(toml_content: &str) -> Option<Vec<String>> {
 /// (but not `[[`, which is a TOML array-of-tables header that may legitimately
 /// appear inside a section we are scanning).
 fn find_section_end(s: &str) -> usize {
-    let mut offset = 0;
+    let mut offset = match s.find('\n') {
+        Some(nl) => nl + 1,
+        None => return s.len(),
+    };
 
-    // Skip any remaining content on the current (opening) line.
-    if let Some(nl) = s.find('\n') {
-        offset = nl + 1;
-    } else {
-        return s.len();
-    }
 
     while offset < s.len() {
         let rest = &s[offset..];

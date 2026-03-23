@@ -93,6 +93,20 @@ skelesearch-mcp
 skelesearch-mcp --http 127.0.0.1:3000
 ```
 
+### Install for global OMP use
+
+> Recommended when you want skelesearch available to all OMP sessions across directories.
+
+```bash
+cargo install --path crates/mcp --root ~/.local --force
+# or use the helper script
+./scripts/install-mcp.sh
+```
+
+This installs `skelesearch-mcp` to `~/.local/bin/skelesearch-mcp`. Add that binary to
+`~/.omp/agent/mcp.json` for system-wide use. After rebuilding or reinstalling, restart OMP.
+
+
 ### MCP tools
 
 | Tool | Description |

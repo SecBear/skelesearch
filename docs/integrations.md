@@ -76,27 +76,45 @@ Recommended workflow:
 
 ## 3. OpenClaw / OMP
 
-OpenClaw uses MCP servers. Add skelesearch to your `.omp/config.yml` (or the
-equivalent project-level config — the exact key name may differ by OMP
-version):
+Use the global MCP config at `~/.omp/agent/mcp.json` when you want skelesearch
+available to all OMP sessions across directories.
 
-```yaml
-mcp_servers:
-  skelesearch:
-    command: skelesearch-mcp
-    args: []
+Recommended install:
+```bash
+cargo install --path crates/mcp --root ~/.local --force
+# or use the helper script
+./scripts/install-mcp.sh
 ```
 
-Tool recommendations:
+Recommended global config:
+```json
+{
+  "mcpServers": {
+    "skelesearch": {
+      "command": "/Users/bear/.local/bin/skelesearch-mcp",
+      "env": {
+        "VOYAGE_API_KEY": "<set-me>",
+        "SKELESEARCH_RERANKER": "local",
+        "SKELESEARCH_RERANKER_MODEL_DIR": "~/.cache/skelesearch/reranker/gte-modernbert-base",
+        "RUST_LOG": "skelesearch=info"
+      }
+    }
+  }
+}
+```
 
+Workflow:
+1. Install or rebuild the MCP binary
+2. Update `~/.omp/agent/mcp.json`
+3. Restart OMP
+4. skelesearch will auto-index on startup when needed (unless `SKELESEARCH_NO_AUTO_INDEX` is set)
+
+Tool recommendations:
 - **`smart_search`** — recommended default. It auto-classifies the query
-  and routes between grep-style and semantic retrieval, so callers don't need
-  to decide upfront.
+  and routes between grep-style and semantic retrieval.
 - **`find_symbol`** — for precise definition lookup. Pass `kind` to narrow
   to a specific symbol type (e.g. `"struct"`, `"function"`, `"trait"`).
-
-> **Note:** The config format above is approximate. Consult your OMP
-> installation's documentation for the authoritative MCP server config schema.
+- **`get_symbol_context`** — best one-call context bundle for dogfooding today.
 
 ---
 
