@@ -104,13 +104,20 @@ pub struct SearchCodeResponse {
 }
 
 /// Output of the `index_codebase` tool.
+///
+/// The handler returns immediately; indexing runs in the background.
+/// Poll `index_status` to observe progress and detect completion.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct IndexCodebaseOutput {
+    /// `"indexing_started"` or `"already_indexing"`.
     pub status: String,
-    pub indexed: usize,
-    pub chunks: usize,
-    /// Embedding cache hits during this indexing run.
-    pub cache_hits: usize,
+    /// The path that is being (or was already being) indexed.
+    pub path: String,
+    /// Best-effort count of indexable files discovered before spawning.
+    /// Zero when the quick-count timed out or when already indexing.
+    pub files_queued: usize,
+    /// Human-readable description of what happened.
+    pub message: String,
 }
 
 /// Output of the `index_status` tool.
@@ -124,6 +131,30 @@ pub struct IndexStatusOutput {
     pub estimated_stale: usize,
     /// Whether a watch process is running (v1: always false).
     pub watching: bool,
+    /// Live progress for an active or recently-completed background index.
+    /// `null` when `index_codebase` has never been called on this server instance.
+    pub indexing: Option<IndexingProgress>,
+}
+
+/// Progress snapshot for a background `index_codebase` operation.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct IndexingProgress {
+    /// `"running"`, `"done"`, or `"failed"`.
+    pub status: String,
+    /// The path being indexed.
+    pub path: String,
+    /// Files indexed so far (set after completion, 0 while running).
+    pub files_done: usize,
+    /// Total files discovered before indexing started (0 if quick-count timed out).
+    pub files_total: usize,
+    /// Total chunks written to the backend.
+    pub chunks_done: usize,
+    /// Embedding cache hits during this run.
+    pub cache_hits: usize,
+    /// Seconds elapsed since indexing started.
+    pub elapsed_seconds: f64,
+    /// Error message when `status` is `"failed"`; null otherwise.
+    pub error: Option<String>,
 }
 
 /// A single indexed chunk record.

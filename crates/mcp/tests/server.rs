@@ -257,7 +257,7 @@ async fn get_file_context_returns_empty_arrays_for_unknown_file() -> anyhow::Res
 
 #[tokio::test]
 async fn index_codebase_returns_status_indexed_and_chunk_counts() -> anyhow::Result<()> {
-    // Fresh server (not pre-indexed) so `indexed > 0` on first run.
+    // Fresh server (not pre-indexed) so `indexed_files > 0` on first run.
     let backend_dir = TempDir::new()?;
     let manifest_dir = TempDir::new()?;
     let backend = Arc::new(CozoBackend::open(backend_dir.path().join("index.db"))?);
@@ -267,12 +267,12 @@ async fn index_codebase_returns_status_indexed_and_chunk_counts() -> anyhow::Res
     std::mem::forget(manifest_dir);
 
     // Use run_index so the test is network-independent (bypasses provider factory).
+    // run_index returns IndexResult directly after synchronous foreground indexing.
     let out = server
         .run_index(&fixture_repo_path()?, det_provider())
         .await?;
-    assert!(!out.status.is_empty());
-    assert!(out.indexed > 0, "expected indexed > 0 on first run, got {}", out.indexed);
-    assert!(out.chunks > 0, "expected chunks > 0, got {}", out.chunks);
+    assert!(out.indexed_files > 0, "expected indexed_files > 0 on first run, got {}", out.indexed_files);
+    assert!(out.total_chunks > 0, "expected total_chunks > 0, got {}", out.total_chunks);
     Ok(())
 }
 
