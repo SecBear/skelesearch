@@ -698,6 +698,13 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 tracing::warn!(error = %e, "background PageRank computation failed");
             } else {
                 tracing::info!("PageRank computation completed");
+                // Chain symbol role classification immediately after PageRank so
+                // roles are available for the next search without a separate trigger.
+                if let Err(e) = backend.compute_symbol_roles().await {
+                    tracing::warn!(error = %e, "background symbol role classification failed");
+                } else {
+                    tracing::info!("symbol role classification completed");
+                }
             }
         });
 

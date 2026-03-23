@@ -694,6 +694,28 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 hit.score *= barrel_penalty;
             }
         }
+        // Role-based score adjustment: structurally important symbols get a mild
+        // boost; dead code (unreachable callables) is suppressed.
+        // Applied after source-type penalties so both signals combine correctly.
+        // Skipped when symbol_roles has not been computed yet (empty map).
+        {
+            let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
+            let roles = self.backend.get_symbol_roles(&file_paths).await.unwrap_or_default();
+            if !roles.is_empty() {
+                for hit in &mut hits {
+                    let factor = match roles.get(&hit.file_path).map(|s| s.as_str()) {
+                        Some("core")  => 1.1,
+                        Some("entry") => 1.05,
+                        Some("dead")  => 0.5,
+                        _ => 1.0,
+                    };
+                    if factor != 1.0 {
+                        hit.score *= factor;
+                    }
+                }
+            }
+        }
+
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
         // Label quality using relative thresholds against the post-penalty
@@ -1733,6 +1755,8 @@ mod tests {
         async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
         async fn get_file_ranks(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
         async fn upsert_cochange_edges(&self, _pairs: &[crate::cochange::CoChangePair]) -> anyhow::Result<()> { Ok(()) }
+        async fn compute_symbol_roles(&self) -> anyhow::Result<()> { Ok(()) }
+        async fn get_symbol_roles(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> { Ok(Default::default()) }
 
         // Returns an empty neighbor set — this test targets import-graph depth,
         // not HNSW proximity expansion.

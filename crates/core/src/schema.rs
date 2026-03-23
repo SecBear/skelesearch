@@ -141,6 +141,15 @@ pub trait StorageBackend: Send + Sync {
     /// Returns a HashMap; files not in the graph get score 0.0.
     async fn get_file_ranks(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>>;
 
+    /// Compute file-level import-degree roles for all indexed symbols and store
+    /// results in `symbol_roles`.  Files with no edges get conservative defaults.
+    /// No-op when no symbols have been indexed yet.
+    async fn compute_symbol_roles(&self) -> anyhow::Result<()>;
+
+    /// Retrieve the role for each requested file path.
+    /// Returns a map of `file_path → role`; files with no computed role are absent.
+    /// Gracefully returns an empty map when `symbol_roles` does not exist yet.
+    async fn get_symbol_roles(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>>;
     /// Upsert co-change pairs derived from git history.
     async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()>;
     /// Walk the HNSW proximity graph at layer 0 to find vector-similar chunks
@@ -188,6 +197,40 @@ pub trait StorageBackend: Send + Sync {
 // ---------------------------------------------------------------------------
 // CozoBackend — the only place in the codebase that touches Cozo directly.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Role classification
+// ---------------------------------------------------------------------------
+
+/// Classify the structural role of a symbol based on its file's import-graph
+/// degree and the symbol's own kind.
+///
+/// Roles are mutually exclusive and ordered by priority:
+/// 1. `dead`    — callable symbol (function/method) with no importers
+/// 2. `entry`   — heavily imported, few or no outbound deps (public API surface)
+/// 3. `core`    — both heavily imported and imports many others (central module)
+/// 4. `utility` — not widely imported but imports many (shared helpers)
+/// 5. `leaf`    — no outbound imports (self-contained implementation)
+/// 6. `internal`— default when no structural pattern matches
+pub(crate) fn classify_symbol_role(kind: &str, in_degree: usize, out_degree: usize) -> &'static str {
+    // Callable symbols that nobody imports are unreachable dead code.
+    let is_callable = matches!(kind, "function" | "method");
+    if is_callable && in_degree == 0 {
+        return "dead";
+    }
+    // File-level structural patterns.
+    if in_degree >= 3 && out_degree <= 1 {
+        "entry"
+    } else if in_degree >= 2 && out_degree >= 2 {
+        "core"
+    } else if in_degree <= 1 && out_degree >= 2 {
+        "utility"
+    } else if out_degree == 0 {
+        "leaf"
+    } else {
+        "internal"
+    }
+}
 
 pub struct CozoBackend {
     db: DbInstance,
@@ -613,6 +656,11 @@ impl StorageBackend for CozoBackend {
         // Create cochange_edges relation for git co-change signal — idempotent.
         self.run_mut_ignore(
             ":create cochange_edges { file_a: String, file_b: String => frequency: Int, jaccard: Float }",
+        )?;
+
+        // Create symbol_roles relation for file-level import-degree role classification — idempotent.
+        self.run_mut_ignore(
+            ":create symbol_roles { file_path: String, name: String => role: String, in_degree: Int, out_degree: Int }",
         )?;
 
         Ok(())
@@ -1654,6 +1702,107 @@ impl StorageBackend for CozoBackend {
         Ok(ranks)
     }
 
+    async fn compute_symbol_roles(&self) -> anyhow::Result<()> {
+        // 1. Compute file-level in/out degree from code_edges (same source as PageRank).
+        let edge_rows = self.run_imm(
+            "?[from, to] := *code_edges[from, _, to, _, _]",
+            BTreeMap::new(),
+        )?;
+
+        let mut in_degree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut out_degree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for row in &edge_rows.rows {
+            if let (DataValue::Str(from), DataValue::Str(to)) = (&row[0], &row[1]) {
+                *out_degree.entry(from.to_string()).or_insert(0) += 1;
+                *in_degree.entry(to.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        // 2. Get all symbols: (file_path, name, kind).
+        let sym_rows = self.run_imm(
+            "?[fp, name, kind] := *symbols[fp, name, _, kind, _]",
+            BTreeMap::new(),
+        )?;
+
+        if sym_rows.rows.is_empty() {
+            tracing::debug!("compute_symbol_roles: no symbols indexed, skipping");
+            return Ok(());
+        }
+
+        // 3. Classify each symbol based on its file's degree and its own kind.
+        //    All symbols in a file share the same in/out degree (file-level edges).
+        let mut role_rows: Vec<(String, String, &'static str, usize, usize)> = Vec::with_capacity(sym_rows.rows.len());
+        for row in &sym_rows.rows {
+            let fp = match Self::str_col(&row[0]) { Ok(s) => s, Err(_) => continue };
+            let name = match Self::str_col(&row[1]) { Ok(s) => s, Err(_) => continue };
+            let kind = match Self::str_col(&row[2]) { Ok(s) => s, Err(_) => continue };
+            let in_d = *in_degree.get(&fp).unwrap_or(&0);
+            let out_d = *out_degree.get(&fp).unwrap_or(&0);
+            let role = classify_symbol_role(&kind, in_d, out_d);
+            role_rows.push((fp, name, role, in_d, out_d));
+        }
+
+        // 4. Batch-upsert into symbol_roles, replacing any stale data.
+        const BATCH_SIZE: usize = 500;
+        for batch in role_rows.chunks(BATCH_SIZE) {
+            let rows: Vec<DataValue> = batch
+                .iter()
+                .map(|(fp, name, role, in_d, out_d)| {
+                    DataValue::List(vec![
+                        Self::dv_str(fp),
+                        Self::dv_str(name),
+                        Self::dv_str(role),
+                        Self::dv_int(*in_d as i64),
+                        Self::dv_int(*out_d as i64),
+                    ])
+                })
+                .collect();
+            let mut p = BTreeMap::new();
+            p.insert("rows".into(), DataValue::List(rows));
+            self.run_mut(
+                "?[file_path, name, role, in_degree, out_degree] <- $rows \
+                 :put symbol_roles { file_path, name => role, in_degree, out_degree }",
+                p,
+            )?;
+        }
+
+        tracing::info!(symbol_count = role_rows.len(), "symbol role classification complete");
+        Ok(())
+    }
+
+    async fn get_symbol_roles(
+        &self,
+        file_paths: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        if file_paths.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let fps_dv = DataValue::List(
+            file_paths.iter().map(|fp| Self::dv_str(fp)).collect(),
+        );
+        let mut p = BTreeMap::new();
+        p.insert("fps".into(), fps_dv);
+        let rows = match self.run_imm(
+            "?[file_path, role] := *symbol_roles[file_path, _, role, _, _], is_in(file_path, $fps)",
+            p,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // symbol_roles may not exist on older indexes that predate this feature.
+                tracing::debug!(error = %e, "get_symbol_roles: query failed (relation may not exist yet)");
+                return Ok(std::collections::HashMap::new());
+            }
+        };
+        let mut roles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for row in &rows.rows {
+            if let (DataValue::Str(fp), DataValue::Str(role)) = (&row[0], &row[1]) {
+                // All symbols in a file share the same role; first occurrence wins.
+                roles.entry(fp.to_string()).or_insert_with(|| role.to_string());
+            }
+        }
+        Ok(roles)
+    }
+
     async fn hnsw_neighbors(
         &self,
         seeds: &[(String, usize)],
@@ -1931,6 +2080,14 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
         (**self).get_file_ranks(file_paths).await
     }
 
+    async fn compute_symbol_roles(&self) -> anyhow::Result<()> {
+        (**self).compute_symbol_roles().await
+    }
+
+    async fn get_symbol_roles(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        (**self).get_symbol_roles(file_paths).await
+    }
+
     async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()> {
         (**self).upsert_cochange_edges(pairs).await
     }
@@ -1960,5 +2117,63 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
 
     async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
         (**self).deduplicate_chunks().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_symbol_role;
+
+    #[test]
+    fn dead_callable_no_importers() {
+        // A function with no importers is dead.
+        assert_eq!(classify_symbol_role("function", 0, 0), "dead");
+        assert_eq!(classify_symbol_role("method", 0, 0), "dead");
+        // Even if it imports many things.
+        assert_eq!(classify_symbol_role("function", 0, 5), "dead");
+    }
+
+    #[test]
+    fn non_callable_no_importers_is_not_dead() {
+        // A struct/type/trait with no importers falls through to other rules.
+        assert_eq!(classify_symbol_role("struct", 0, 0), "leaf");
+        assert_eq!(classify_symbol_role("class", 0, 0), "leaf");
+        assert_eq!(classify_symbol_role("trait", 0, 0), "leaf");
+    }
+
+    #[test]
+    fn entry_rule() {
+        // Heavily imported, few outbound: entry point.
+        assert_eq!(classify_symbol_role("class", 3, 0), "entry");
+        assert_eq!(classify_symbol_role("class", 3, 1), "entry");
+        assert_eq!(classify_symbol_role("function", 5, 0), "entry"); // callable but imported ≥3
+    }
+
+    #[test]
+    fn core_rule() {
+        // Both well-imported and imports many: core module.
+        assert_eq!(classify_symbol_role("class", 2, 2), "core");
+        assert_eq!(classify_symbol_role("function", 4, 3), "core");
+    }
+
+    #[test]
+    fn utility_rule() {
+        // Not widely imported but imports many: utility/helper.
+        assert_eq!(classify_symbol_role("struct", 0, 2), "utility");
+        assert_eq!(classify_symbol_role("struct", 1, 3), "utility");
+    }
+
+    #[test]
+    fn leaf_rule() {
+        // No outbound deps and doesn't match a higher priority rule: leaf.
+        assert_eq!(classify_symbol_role("struct", 1, 0), "leaf");
+        assert_eq!(classify_symbol_role("enum", 2, 0), "leaf"); // in=2 < 3, out=0
+    }
+
+    #[test]
+    fn internal_default() {
+        // Low import counts in both directions: internal.
+        assert_eq!(classify_symbol_role("struct", 1, 1), "internal");
+        assert_eq!(classify_symbol_role("class", 2, 1), "internal"); // in=2 < 3
     }
 }
