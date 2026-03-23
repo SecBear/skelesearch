@@ -34,10 +34,9 @@ comparable to published Voyage/OpenAI/Jina scores on the MTEB leaderboard.
 Measures file/line retrieval quality on real GitHub issues. No published
 retrieval-only baselines exist — skelesearch is the first tool measured here.
 
-| Date | Commit | Provider | Instances | File R@5 | File F1 | Line F1 | Notes |
-|---|---|---|---|---|---|---|---|
-| — | — | — | — | — | — | — | Pilot run pending |
-
+| Date | Commit | Provider | Instances | File R@5 | Acc@5 | MRR | Region overlap | Notes |
+|---|---|---|---|---|---|---|---|---|
+| 2026-03-23 | `987c1ec` | voyage-code-3 | 30 (django+astropy cached subset) | 77.8% | 63.3% | 0.794 | 23.6% | quick-bench cached-only sample; avg search 2354ms/query |
 **Reference scores (published, full agentic systems):**
 
 | Agent | Context F1 | Efficiency | Source |
@@ -52,12 +51,10 @@ Custom benchmark: 40 cases per repo across mini-redis, hyperfine, hono, zod,
 httpx, cobra. Categories: implementation, cross_file, symbol_lookup,
 error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 
-| Date | Commit | Provider | Reranker | Profile | R@5 | R@10 | MRR | Cases |
+| Date | Commit | Provider | Profile | R@5 | Acc@5 | MRR | Cases | Notes |
 |---|---|---|---|---|---|---|---|---|
-| 2026-03-22 | `d509642` | fastembed (jina-v2-base-code) | **none (true local)** | fastembed-full | 77.3% | 83.6% | 69.8% | 240 |
-| 2026-03-22 | `0946db3` | fastembed (jina-v2-base-code) | Voyage (env leak) | fastembed-full | 88.2% | 89.6% | 85.9% | 200/240 |
-| 2026-03-15 | `e931f51` | voyage-code-3 | Voyage | voyage-full | 86.7% | 89.5% | 80.6% | 240 |
-
+| 2026-03-23 | `9359eea` | voyage-code-3 | latest main | 84.5% | 73.8% | 0.837 | 240 | after chunk merge, schema migration, intent routing, MCP/server fixes |
+| 2026-03-15 | `e931f51` | voyage-code-3 | voyage-full | 83.3% | — | 0.851 | 240 | pre-Acc@5 baseline |
 **2026-03-22 per-repo breakdown — true local (no reranker) vs Voyage reranker:**
 
 | Repo | Language | R@5 (local) | R@5 (Voyage) | Δ R@5 | MRR (local) | MRR (Voyage) | ms/40q (local) |
@@ -94,6 +91,15 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 | hyperfine | Rust | 85.0% | 88.8% | 82.2% | 40 |
 | httpx | Python | 85.8% | 85.8% | 65.2% | 40 |
 | zod | TypeScript | 70.4% | 80.8% | 63.6% | 40 |
+
+
+### SWE-bench Lite file localization (sample)
+
+> Current script checks out per-instance commits and re-indexes, so runtime is dominated by indexing on large repos. Results below are from a 50-instance sample where 44 completed and 6 timed out at the 900s per-instance indexing limit.
+
+| Date | Commit | Provider | Instances | Acc@1 | Acc@5 | R@5 | MRR | Notes |
+|---|---|---|---|---|---|---|---|---|
+| 2026-03-23 | `987c1ec` | voyage-code-3 | 44/50 completed | 61.4% | 79.5% | 79.5% | 0.688 | 6 skipped due per-instance indexing timeout on large astropy/django commits |
 
 ---
 

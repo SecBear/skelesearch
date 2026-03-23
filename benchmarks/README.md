@@ -91,39 +91,31 @@ See `docs/superpowers/plans/2026-03-19-benchmarks-and-eval-infrastructure.md` fo
 
 ## Quick eval (development feedback loop)
 
-For rapid iteration, use the quick-eval script instead of running the full suite:
+Current scripts:
 
 ```bash
-# First time: clone benchmark repos
-bun benchmarks/scripts/clone-repos.ts
+# Re-index the six hand-written eval repos (Voyage provider)
+source .env && export VOYAGE_API_KEY
+./benchmarks/scripts/reindex.sh
 
-# Quick eval: 3 diagnostic repos (~3-5 min, no API keys)
-./benchmarks/scripts/quick-eval.sh
+# Run the 240-case suite and print R@5 / Acc@5 / MRR
+./benchmarks/scripts/eval.py
 
-# Quick eval with voyage embeddings (~5-10 min, needs API keys)
-./benchmarks/scripts/quick-eval.sh --provider voyage
-
-# Tag a run for comparison
-./benchmarks/scripts/quick-eval.sh --tag post-depth-decay
-
-# Single repo deep dive
-./benchmarks/scripts/quick-eval.sh --repo zod
-
-# Full 6-repo suite (~10-15 min)
-./benchmarks/scripts/quick-eval.sh --full
-
-# Full suite with voyage
-./benchmarks/scripts/quick-eval.sh --full --provider voyage
+# Overnight / brick run: build, tests, re-index, eval, ContextBench quick-bench, SWE-bench sample
+nohup ./benchmarks/scripts/overnight.sh > overnight.log 2>&1 &
+tail -f overnight.log
 ```
 
-**Diagnostic subset:** zod (63.6% MRR, weakest), httpx (65.2% MRR, second
-weakest), cobra (96.3% MRR, regression canary). If zod/httpx improve without
-cobra regressing, the change is good.
+**Latest 240-case baseline (main, 2026-03-23):** R@5 84.5%, Acc@5 73.8%, MRR 0.837.
+
+**Latest ContextBench quick-bench (30 cached Python instances):** R@5 77.8%, Acc@5 63.3%, MRR 0.794, region overlap 23.6%.
+
+**Latest SWE-bench sample (44/50 completed):** Acc@1 61.4%, Acc@5 79.5%, MRR 0.688. Six instances timed out on per-instance indexing in large astropy/django commits.
 
 **Machine requirements:**
-- macOS M4 Pro 24GB: fastembed runs well, ~3-5 min for quick eval
-- NixOS bearbrick (7800X3D): same or faster, run `nix develop` first
-- No GPU required — fastembed uses ONNX on CPU
+- macOS M4 Pro 24GB: voyage indexing works, but large TS repos (zod) take several minutes
+- NixOS bearbrick (7800X3D): preferred for overnight runs
+- No GPU required for the current Voyage/FastEmbed paths
 
 ## External benchmarks
 
