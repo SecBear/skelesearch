@@ -356,3 +356,24 @@ pub struct SymbolContextOutput {
     /// Symbol role classification.
     pub role: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Repo Map
+// ---------------------------------------------------------------------------
+
+/// Input for the `get_repo_map` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetRepoMapInput {
+    /// Maximum token budget for the response (default: 8192).
+    /// Larger budgets include more symbols and edges.
+    #[serde(default = "default_map_tokens")]
+    pub max_tokens: usize,
+    /// If true, include per-file symbol lists (default: true).
+    #[serde(default = "default_true")]
+    pub include_symbols: bool,
+    /// If true, include file-level import edges (default: true).
+    #[serde(default = "default_true")]
+    pub include_edges: bool,
+}
+
+fn default_map_tokens() -> usize { 8192 }

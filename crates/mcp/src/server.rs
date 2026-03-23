@@ -29,10 +29,10 @@ use skelesearch_embed_fastembed::provider_from_name;
 
 use crate::tools::{
     ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
-    GetFileContextInput, GetSymbolContextInput, GrepSearchRow, ImpactEntry, ImpactSetOutput,
-    IndexCodebaseInput, IndexCodebaseOutput, IndexingProgress, IndexStatusInput, IndexStatusOutput,
-    SearchCodeInput, SearchCodeResponse, SearchCodeRow, SmartSearchInput, SmartSearchOutput,
-    SmartSearchResults, SymbolContextOutput, SymbolRow, TestContextOutput,
+    GetFileContextInput, GetRepoMapInput, GetSymbolContextInput, GrepSearchRow, ImpactEntry,
+    ImpactSetOutput, IndexCodebaseInput, IndexCodebaseOutput, IndexingProgress, IndexStatusInput,
+    IndexStatusOutput, SearchCodeInput, SearchCodeResponse, SearchCodeRow, SmartSearchInput,
+    SmartSearchOutput, SmartSearchResults, SymbolContextOutput, SymbolRow, TestContextOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -1412,6 +1412,110 @@ impl SkeleSearchServer {
             .context("HTTP server error")?;
         Ok(())
     }
+
+    /// Build a compact repo map from indexed data. Renders a tree with file
+    /// roles, symbols, and import edges, respecting the token budget.
+    pub async fn get_repo_map(&self, input: GetRepoMapInput) -> anyhow::Result<String> {
+        let data = self.backend.get_repo_map_data().await?;
+        Ok(render_repo_map(&data, &input))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Repo map rendering
+// ---------------------------------------------------------------------------
+
+use skelesearch_core::{RepoMapData, RepoMapFile};
+
+/// Render a compact text tree from indexed repo data.
+fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
+    use std::collections::BTreeMap;
+
+    if data.files.is_empty() {
+        return "No files indexed. Run index_codebase first.".to_string();
+    }
+
+    struct DirNode {
+        children: BTreeMap<String, DirNode>,
+        files: Vec<usize>,
+    }
+    impl DirNode {
+        fn new() -> Self { Self { children: BTreeMap::new(), files: Vec::new() } }
+    }
+
+    let mut root = DirNode::new();
+    for (i, file) in data.files.iter().enumerate() {
+        let parts: Vec<&str> = file.path.split('/').collect();
+        let (dir_parts, _file_name) = parts.split_at(parts.len().saturating_sub(1));
+        let mut node = &mut root;
+        for part in dir_parts {
+            node = node.children.entry(part.to_string()).or_insert_with(DirNode::new);
+        }
+        node.files.push(i);
+    }
+
+    let mut out = String::new();
+    let max_chars = input.max_tokens * 4;
+
+    out.push_str(&format!("# Repo Map ({} files, {} import edges)\n\n",
+        data.files.len(), data.import_edges.len()));
+
+    fn render_dir(
+        out: &mut String,
+        node: &DirNode,
+        files: &[RepoMapFile],
+        prefix: &str,
+        include_symbols: bool,
+        max_chars: usize,
+    ) {
+        for &idx in &node.files {
+            if out.len() > max_chars { return; }
+            let f = &files[idx];
+            let basename = f.path.rsplit('/').next().unwrap_or(&f.path);
+            let role_tag = if f.role.is_empty() { String::new() } else { format!(" [{}]", f.role) };
+            out.push_str(&format!("{}{}{} ({} chunks, {})\n",
+                prefix, basename, role_tag, f.chunk_count, f.language));
+            if include_symbols {
+                let limit = 15.min(f.symbols.len());
+                for sym in &f.symbols[..limit] {
+                    out.push_str(&format!("{}  {} {}\n", prefix, sym.kind, sym.name));
+                }
+                if f.symbols.len() > limit {
+                    out.push_str(&format!("{}  ... +{} more\n", prefix, f.symbols.len() - limit));
+                }
+            }
+        }
+        for (name, child) in &node.children {
+            if out.len() > max_chars { return; }
+            let file_count = count_files(child);
+            out.push_str(&format!("{}{}/  ({} files)\n", prefix, name, file_count));
+            render_dir(out, child, files, &format!("{}  ", prefix), include_symbols, max_chars);
+        }
+    }
+
+    fn count_files(node: &DirNode) -> usize {
+        node.files.len() + node.children.values().map(count_files).sum::<usize>()
+    }
+
+    render_dir(&mut out, &root, &data.files, "", input.include_symbols, max_chars);
+
+    if input.include_edges && !data.import_edges.is_empty() && out.len() < max_chars {
+        out.push_str(&format!("\n## Import Graph ({} edges)\n\n", data.import_edges.len()));
+        for (from, to) in &data.import_edges {
+            if out.len() > max_chars {
+                out.push_str("... truncated\n");
+                break;
+            }
+            out.push_str(&format!("{} -> {}\n", from, to));
+        }
+    }
+
+    if out.len() > max_chars {
+        out.truncate(max_chars);
+        out.push_str("\n... [truncated - increase max_tokens for full map]\n");
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,6 +1633,19 @@ impl SkeleSearchServer {
                     Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
                     Err(e) => Err(self.friendly_err(e).await),
                 }
+    }
+
+    /// Get a compact structural overview of the indexed codebase.
+    /// Returns directory tree, file roles, symbols, and import edges.
+    #[tool(name = "get_repo_map")]
+    async fn mcp_get_repo_map(
+        &self,
+        Parameters(input): Parameters<GetRepoMapInput>,
+    ) -> Result<String, String> {
+        match self.get_repo_map(input).await {
+            Ok(out) => Ok(out),
+            Err(e) => Err(self.friendly_err(e).await),
+        }
     }
 }
 

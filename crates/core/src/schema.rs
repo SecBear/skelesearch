@@ -78,6 +78,29 @@ pub struct IndexStats {
     pub estimated_stale: usize,
 }
 
+/// Compact codebase overview assembled from indexed data.
+#[derive(Debug, Clone)]
+pub struct RepoMapData {
+    pub files: Vec<RepoMapFile>,
+    pub import_edges: Vec<(String, String)>,  // (from_file, to_file)
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoMapFile {
+    pub path: String,
+    pub language: String,
+    pub chunk_count: usize,
+    pub role: String,           // entry/core/utility/leaf/unknown
+    pub symbols: Vec<RepoMapSymbol>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoMapSymbol {
+    pub name: String,
+    pub kind: String,
+    pub start_line: usize,
+}
+
 // ---------------------------------------------------------------------------
 // StorageBackend trait
 // ---------------------------------------------------------------------------
@@ -192,6 +215,10 @@ pub trait StorageBackend: Send + Sync {
     /// the rest are deleted.  Returns the number of chunks removed.
     /// No-op if the LSH index does not exist or contains no cross-file duplicates.
     async fn deduplicate_chunks(&self) -> anyhow::Result<usize>;
+
+    /// Fetch all data needed for a compact repo map in minimal round-trips.
+    /// Returns files with their symbols and roles, plus file-level import edges.
+    async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1974,6 +2001,77 @@ impl StorageBackend for CozoBackend {
         tracing::info!(removed = count, "deduplicated near-duplicate chunks across files");
         Ok(count)
     }
+
+    async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData> {
+        use std::collections::HashMap;
+
+        // 1. All indexed files
+        let files_rows = self.run_imm(
+            "?[fp, lang, cc] := *files{file_path: fp, language: lang, chunk_count: cc} :order fp",
+            BTreeMap::new(),
+        )?;
+
+        // 2. All symbols (sorted by file, start_line)
+        let symbols_rows = self.run_imm(
+            "?[fp, name, kind, sl] := *symbols{file_path: fp, name, kind, start_line: sl} :order fp, sl",
+            BTreeMap::new(),
+        )?;
+
+        // 3. All file roles (best-effort — relation may not exist)
+        let roles: HashMap<String, String> = match self.run_imm(
+            "?[fp, role] := *symbol_roles{file_path: fp, role}, role != 'unknown' :order fp",
+            BTreeMap::new(),
+        ) {
+            Ok(rows) => rows.rows.iter().filter_map(|r| {
+                let fp = Self::str_col(&r[0]).ok()?;
+                let role = Self::str_col(&r[1]).ok()?;
+                Some((fp, role))
+            }).collect(),
+            Err(_) => HashMap::new(),
+        };
+
+        // 4. File-level import edges (deduplicated)
+        let edges_rows = self.run_imm(
+            "?[from, to] := *code_edges{from_file: from, to_file: to, edge_type: 'imports'} :order from, to",
+            BTreeMap::new(),
+        )?;
+
+        // Assemble: group symbols by file
+        let mut symbols_by_file: HashMap<String, Vec<RepoMapSymbol>> = HashMap::new();
+        for row in &symbols_rows.rows {
+            if let (Ok(fp), Ok(name), Ok(kind), Ok(sl)) = (
+                Self::str_col(&row[0]),
+                Self::str_col(&row[1]),
+                Self::str_col(&row[2]),
+                Self::int_col(&row[3]),
+            ) {
+                symbols_by_file.entry(fp).or_default().push(RepoMapSymbol {
+                    name,
+                    kind,
+                    start_line: sl as usize,
+                });
+            }
+        }
+
+        // Build file list
+        let files: Vec<RepoMapFile> = files_rows.rows.iter().filter_map(|row| {
+            let path = Self::str_col(&row[0]).ok()?;
+            let language = Self::str_col(&row[1]).ok()?;
+            let chunk_count = Self::int_col(&row[2]).ok()? as usize;
+            let role = roles.get(&path).cloned().unwrap_or_default();
+            let symbols = symbols_by_file.remove(&path).unwrap_or_default();
+            Some(RepoMapFile { path, language, chunk_count, role, symbols })
+        }).collect();
+
+        // Build edge list
+        let import_edges: Vec<(String, String)> = edges_rows.rows.iter().filter_map(|row| {
+            let from = Self::str_col(&row[0]).ok()?;
+            let to = Self::str_col(&row[1]).ok()?;
+            Some((from, to))
+        }).collect();
+
+        Ok(RepoMapData { files, import_edges })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,6 +2212,9 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
 
     async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
         (**self).deduplicate_chunks().await
+    }
+    async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData> {
+        (**self).get_repo_map_data().await
     }
 }
 
