@@ -64,6 +64,10 @@ impl EmbedProvider for ArcProvider {
     async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         self.0.embed_queries(texts).await
     }
+
+    fn query_prefix(&self) -> Option<&str> {
+        self.0.query_prefix()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +629,7 @@ impl SkeleSearchServer {
                 // Apply scope filter before returning.
                 let mut rows = response.results;
                 if let Some(ref scope) = input.scope {
-                    rows.retain(|r| r.file_path.starts_with(scope.as_str()));
+                    rows.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
                 }
                 SmartSearchResults::Semantic(rows)
             }
@@ -669,7 +673,7 @@ impl SkeleSearchServer {
                     .await?;
                 let mut rows = response.results;
                 if let Some(ref scope) = input.scope {
-                    rows.retain(|r| r.file_path.starts_with(scope.as_str()));
+                    rows.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
                 }
                 Ok(SmartSearchOutput {
                     strategy: intent.to_string(),
@@ -677,9 +681,12 @@ impl SkeleSearchServer {
                 })
             }
             "impact" => {
-                let file_path = input.symbols.first()
-                    .cloned()
-                    .unwrap_or_else(|| input.query.clone());
+                if input.symbols.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "impact intent requires at least one symbol in the 'symbols' field"
+                    ));
+                }
+                let file_path = input.symbols.first().cloned().unwrap();
                 let impact = self
                     .find_impact_set(FindImpactSetInput {
                         file_path,

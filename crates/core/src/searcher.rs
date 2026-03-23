@@ -90,8 +90,17 @@ pub fn preprocess_query(query: &str) -> String {
     let mut symbols: Vec<String> = Vec::new();
     let mut lines: Vec<&str> = Vec::new();
 
+    let mut in_fence = false;
     for line in query.lines() {
         let trimmed = line.trim();
+
+        // Track fenced code blocks — content inside ``` ... ``` is literal code
+        // (tracebacks, stack dumps, diffs) that should not be treated as prose.
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence { continue; }
 
         // Skip empty lines.
         if trimmed.is_empty() { continue; }
@@ -130,7 +139,6 @@ pub fn preprocess_query(query: &str) -> String {
 
         lines.push(trimmed);
     }
-
     // If the query is already short (<40 words), return it with symbols appended.
     let word_count: usize = lines.iter().map(|l| l.split_whitespace().count()).sum();
     if word_count <= 40 {
@@ -165,51 +173,16 @@ pub fn preprocess_query(query: &str) -> String {
         }
     }
 
-    result.join(" ")
-}
-
-/// Boost backtick-quoted symbols and CamelCase identifiers in BM25 queries.
-///
-/// BM25 uses term frequency (TF) — duplicating high-confidence identifiers
-/// increases their match weight relative to surrounding prose. 88% of real
-/// queries contain symbol names; boosting them helps BM25 rank correctly.
-pub fn boost_symbols_for_bm25(query: &str) -> String {
-    let mut symbols: Vec<String> = Vec::new();
-
-    // Extract backtick-quoted tokens.
-    let mut rest = query;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        if let Some(end) = rest.find('`') {
-            let sym = &rest[..end];
-            if !sym.is_empty() && sym.len() <= 80 {
-                symbols.push(sym.to_string());
-            }
-            rest = &rest[end + 1..];
-        } else {
-            break;
-        }
-    }
-
-    // Extract CamelCase / PascalCase identifiers (3+ chars, mixed case).
-    for word in query.split_whitespace() {
-        let clean: String = word.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
-        if clean.len() >= 3
-            && clean.chars().any(|c| c.is_uppercase())
-            && clean.chars().any(|c| c.is_lowercase())
-            && !symbols.contains(&clean)
-        {
-            symbols.push(clean);
-        }
-    }
-
-    if symbols.is_empty() {
+    let result = result.join(" ");
+    // If every line was filtered out (e.g. the query was pure boilerplate), avoid
+    // returning an empty string: that would produce a zero-vector embedding and
+    // zero BM25 matches. Fall back to the original query instead.
+    if result.trim().is_empty() {
         return query.to_string();
     }
-
-    // Duplicate symbols for TF boost (appears 2x in the query string).
-    format!("{} {}", query, symbols.join(" "))
+    result
 }
+
 
 /// Sanitize a query string for CozoDB's FTS mini-language.
 ///
@@ -525,7 +498,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Original query terms appear first and get natural BM25 term frequency.
         // Expansion keywords are appended once (lower weight than the original
         // query which may have terms repeated from expand_query()).
-        let mut bm25_query = boost_symbols_for_bm25(&expand_query(&preprocessed));
+        // NOTE: CozoDB FTS deduplicates repeated query tokens at index time, so
+        // repeating a symbol in the query string does not increase its TF weight.
+        // Symbols are already included by preprocess_query; for true per-term
+        // boosting, run a separate symbol-index lookup and merge results.
+        let mut bm25_query = expand_query(&preprocessed);
         if !expanded_keywords.is_empty() {
             // Only append keywords not already present in the query
             let existing: std::collections::HashSet<String> = bm25_query
@@ -1189,7 +1166,7 @@ fn query_asks_about_entry_point(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, boost_symbols_for_bm25};
+    use super::{is_test_file, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -1500,29 +1477,6 @@ mod tests {
         assert!(result.contains("fill_value"));
     }
 
-    #[test]
-    fn boost_symbols_duplicates_backtick_tokens() {
-        let query = "The `IterativeImputer` has a bug";
-        let result = boost_symbols_for_bm25(query);
-        // Should contain the original + a duplicate of the symbol
-        let count = result.matches("IterativeImputer").count();
-        assert!(count >= 2, "symbol should appear at least twice, got {count}");
-    }
-
-    #[test]
-    fn boost_symbols_duplicates_camelcase() {
-        let query = "find AsyncClient usage in the codebase";
-        let result = boost_symbols_for_bm25(query);
-        let count = result.matches("AsyncClient").count();
-        assert!(count >= 2, "CamelCase symbol should appear at least twice, got {count}");
-    }
-
-    #[test]
-    fn boost_symbols_noop_for_plain_text() {
-        let query = "how does error handling work";
-        let result = boost_symbols_for_bm25(query);
-        assert_eq!(result, query);
-    }
 
     // -----------------------------------------------------------------------
     // graph augmentation depth tests
