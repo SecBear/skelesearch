@@ -906,10 +906,11 @@ impl SkeleSearchServer {
     /// Return current index statistics, including live background-indexing progress.
     pub async fn index_status(
         &self,
-        _input: IndexStatusInput,
+        input: IndexStatusInput,
     ) -> anyhow::Result<IndexStatusOutput> {
+        let (backend, _) = self.resolve_backend(input.path.as_deref()).await?;
         let indexing = self.current_indexing_progress().await;
-        let stats = match self.backend.stats().await {
+        let stats = match backend.stats().await {
             Ok(s) => s,
             Err(ref e) if is_uninitialized_index_error(e) => {
                 return Ok(IndexStatusOutput {
@@ -1004,6 +1005,32 @@ impl SkeleSearchServer {
         &self,
         input: SmartSearchInput,
     ) -> anyhow::Result<SmartSearchOutput> {
+        // If a non-default project is specified and search_code doesn't support
+        // cross-project yet, resolve the backend and build a temporary searcher.
+        if let Some(ref project) = input.project {
+            let (backend, _) = self.resolve_backend(Some(project.as_str())).await?;
+            let provider = self.prepare_search_provider().await?;
+            let searcher = Searcher::new(backend, provider);
+            // Delegate to a simplified search path for cross-project queries.
+            let (mut results, _timings) = searcher
+                .search_with_timings(
+                    &input.query, input.top_k.max(1), input.include_graph,
+                    if input.include_graph { 2 } else { 0 },
+                    input.diversity, input.max_tokens.or(Some(8192)),
+                )
+                .await?;
+            if let Some(ref scope) = input.scope {
+                results.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
+            }
+            let rows = results.into_iter().map(|r| SearchCodeRow {
+                file_path: r.file_path, start_line: r.start_line, end_line: r.end_line,
+                content: r.content, score: r.score, match_quality: r.match_quality, why: r.why,
+            }).collect();
+            return Ok(SmartSearchOutput {
+                strategy: input.intent.as_deref().unwrap_or("semantic").to_string(),
+                results: SmartSearchResults::Semantic(rows),
+            });
+        }
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
 
         // Intent-based routing takes priority over auto-detection.
