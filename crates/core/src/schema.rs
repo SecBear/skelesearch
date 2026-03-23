@@ -193,7 +193,25 @@ pub struct CozoBackend {
 
 impl CozoBackend {
     pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
-        let path_str = path.as_ref().to_string_lossy();
+        let path = path.as_ref();
+
+        // Enable WAL journal mode before CozoDB opens the file.  WAL is persistent
+        // in the SQLite file header (idempotent on subsequent opens) and allows
+        // concurrent readers while a writer holds the db — so CLI `search` can
+        // proceed while the MCP server is running.  See PER-112.
+        //
+        // rusqlite and CozoDB's `sqlite` crate share the same native library via
+        // the vendored sqlite3-sys shim, so the pragma takes effect for all
+        // subsequent connections regardless of which crate opens them.
+        {
+            let conn = rusqlite::Connection::open(path)
+                .map_err(|e| anyhow::anyhow!("sqlite WAL setup: {}", e))?;
+            conn.execute_batch("PRAGMA journal_mode=WAL;")
+                .map_err(|e| anyhow::anyhow!("sqlite WAL pragma: {}", e))?;
+            // Drop conn before CozoDB opens the file.
+        }
+
+        let path_str = path.to_string_lossy();
         let db = DbInstance::new("sqlite", path_str.as_ref(), Default::default())
             .map_err(|e| anyhow::anyhow!("cozo open: {}", e))?;
         Ok(Self { db, dim: Arc::new(AtomicUsize::new(0)) })

@@ -129,3 +129,22 @@ async fn upsert_edges_batch_handles_many_edges() -> anyhow::Result<()> {
     assert_eq!(importers.len(), 200);
     Ok(())
 }
+
+/// Verify that WAL journal mode is active after CozoBackend::open (PER-112).
+/// WAL lets concurrent readers proceed while a writer holds the db, which is
+/// what allows CLI `search` to work while the MCP server is running.
+#[tokio::test]
+async fn cozo_backend_opens_with_wal_journal_mode() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db_path = temp.path().join("index.db");
+    let _backend = CozoBackend::open(&db_path)?;
+
+    // Open the same file with rusqlite and check the active journal mode.
+    let conn = rusqlite::Connection::open(&db_path)?;
+    let mode: String = conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0))?;
+    assert_eq!(
+        mode, "wal",
+        "expected WAL journal mode but got '{mode}' — concurrent CLI access will fail"
+    );
+    Ok(())
+}
