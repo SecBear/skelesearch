@@ -89,9 +89,6 @@ def run_skelesearch(binary: str, project_dir: Path, query: str,
     """Index and search with skelesearch. Returns list of result dicts."""
     env = os.environ.copy()
     env["RUST_LOG"] = "skelesearch=info"
-    # Unset cloud reranker keys for pure local evaluation
-    for key in ["VOYAGE_API_KEY", "JINA_API_KEY", "COHERE_API_KEY"]:
-        env.pop(key, None)
 
     # Always run index — skelesearch's incremental indexer hash-checks files
     # and only re-embeds changed ones. After git checkout, most files are unchanged
