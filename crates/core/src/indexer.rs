@@ -165,8 +165,18 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                     "embedding provider changed — forcing full re-index"
                 );
                 self.manifest.clear_file_hashes()?;
+                // Also clear the embedding cache: vectors are provider-specific.
+                // Same-dim providers produce incompatible vectors; keeping stale
+                // entries would silently serve the old provider's embeddings.
+                self.manifest.clear_embedding_cache()?;
             }
         }
+        // Write provider/dim metadata now (before any indexing work) so that
+        // a crash mid-index still leaves the metadata in a consistent state.
+        // On the next run the mismatch check above can make correct decisions
+        // rather than operating on stale values written only at the very end.
+        self.manifest.set_meta("provider", self.provider.name())?;
+        self.manifest.set_meta("dim", &self.provider.dim().to_string())?;
 
         let chunker = Chunker::default();
         let mut visited: HashSet<String> = HashSet::new();
@@ -655,9 +665,6 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         // Clean up completed batch records for this run.
         self.manifest.clear_completed_batches(&run_id)?;
 
-        // Record which provider and dimension were used for this index.
-        self.manifest.set_meta("provider", self.provider.name())?;
-        self.manifest.set_meta("dim", &self.provider.dim().to_string())?;
 
         // -- Phase 3: Reconcile deletions and renames ------------------------
         //    Any manifest path not visited this run is stale (file gone or
