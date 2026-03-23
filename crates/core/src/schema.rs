@@ -457,10 +457,58 @@ impl StorageBackend for CozoBackend {
 
         // The embedding field uses CozoDB's fixed-dimension vector type <F32; dim>.
         // The relation is created with the specific dim supplied at initialization time.
-        let chunks_schema = format!(
+        //
+        // Schema migration: if the relation already exists with a different column count,
+        // drop the dependent indexes (HNSW/FTS/LSH) and the relation itself, then recreate.
+        // CozoDB has no ALTER TABLE, so a full drop+recreate is the only path.
+        // This loses existing data — the caller must re-index after a migration.
+        const CHUNKS_EXPECTED_COLS: usize = 9;
+        let chunks_create = format!(
             ":create chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
         );
-        self.run_mut_ignore(&chunks_schema)?;
+        match self.run_mut(&chunks_create, BTreeMap::new()) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("already exists") || msg.contains("conflicts with an existing one") {
+                    // Relation exists. Inspect column count to detect schema drift.
+                    match self.run_mut("::columns chunks", BTreeMap::new()) {
+                        Ok(cols) if cols.rows.len() != CHUNKS_EXPECTED_COLS => {
+                            tracing::warn!(
+                                current_cols = cols.rows.len(),
+                                expected_cols = CHUNKS_EXPECTED_COLS,
+                                "chunks schema migrated: dropped old relation and indexes, re-index required"
+                            );
+                            // Indexes must be removed before the relation that they reference.
+                            // Ignore errors — an index may not exist if a prior migration was partial.
+                            let _ = self.run_mut("::remove chunks:semantic", BTreeMap::new());
+                            let _ = self.run_mut("::remove chunks:text", BTreeMap::new());
+                            let _ = self.run_mut("::remove chunks:dedup", BTreeMap::new());
+                            // :replace drops the existing relation and recreates it with the new schema.
+                            // An empty output rule is required — :replace cannot omit the query unlike :create.
+                            let chunks_replace = format!(
+                                "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] <- [] \
+                                 :replace chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
+                            );
+                            self.run_mut(&chunks_replace, BTreeMap::new())
+                                .map_err(|e| anyhow::anyhow!("chunks schema migration failed: {}", e))?;
+                        }
+                        Ok(_) => {
+                            // Column count matches expected — schema is compatible, nothing to do.
+                        }
+                        Err(inspect_err) => {
+                            // Cannot inspect schema; assume compatible and proceed.
+                            tracing::warn!(
+                                error = %inspect_err,
+                                "could not inspect chunks columns; assuming schema is compatible"
+                            );
+                        }
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        }
 
         self.run_mut_ignore(
             ":create code_edges { from_file: String, from_chunk: Int, to_file: String => edge_type: String, created_at: Int }",
