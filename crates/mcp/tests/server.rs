@@ -19,7 +19,10 @@ use async_trait::async_trait;
 use skelesearch_core::{CozoBackend, EmbedProvider, Indexer, ManifestStore};
 use skelesearch_mcp::{
     server::{ArcProvider, SkeleSearchServer},
-    tools::{GetFileContextInput, IndexCodebaseInput, IndexStatusInput, SearchCodeInput},
+    tools::{
+        GetFileContextInput, GetSymbolContextInput, IndexCodebaseInput, IndexStatusInput, SearchCodeInput,
+        SmartSearchInput,
+    },
 };
 use tempfile::TempDir;
 
@@ -310,6 +313,52 @@ async fn index_status_exposes_estimated_stale_and_watching() -> anyhow::Result<(
         "last_indexed should be RFC 3339, got: {:?}",
         status.last_indexed
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn smart_search_exact_symbol_prefers_grep() -> anyhow::Result<()> {
+    let server = test_server().await?;
+    let out = server
+        .smart_search(SmartSearchInput {
+            query: "OldStruct".into(),
+            top_k: 3,
+            include_graph: false,
+            diversity: 0.0,
+            max_tokens: Some(1024),
+            branch_scope: false,
+            session_id: None,
+            intent: None,
+            symbols: vec![],
+            scope: None,
+        })
+        .await?;
+    assert_eq!(out.strategy, "grep");
+    match out.results {
+        skelesearch_mcp::tools::SmartSearchResults::Grep(rows) => {
+            assert!(!rows.is_empty(), "expected grep rows for exact symbol query");
+            assert!(rows.iter().any(|r| r.file_path.ends_with("src/old.rs") || r.file_path.ends_with("src/lib.rs")));
+        }
+        other => panic!("expected grep results, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_symbol_context_returns_role_and_context() -> anyhow::Result<()> {
+    let server = test_server().await?;
+    let ctx = server
+        .get_symbol_context(GetSymbolContextInput {
+            name: "helper".into(),
+            kind: Some("function".into()),
+            include_tests: true,
+        })
+        .await?;
+    assert!(ctx.symbol.is_some(), "expected symbol match");
+    assert_eq!(ctx.match_count, 1);
+    assert!(!ctx.ambiguous);
+    assert!(ctx.source.as_deref().unwrap_or("").contains("pub fn helper"));
+    assert!(ctx.role.is_some(), "expected non-null role");
     Ok(())
 }
 

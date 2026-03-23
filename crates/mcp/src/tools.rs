@@ -337,14 +337,22 @@ pub struct GetSymbolContextInput {
 pub struct SymbolContextOutput {
     /// The first matching symbol definition, if found.
     pub symbol: Option<SymbolRow>,
+    /// Number of matches found for the requested symbol name/kind.
+    pub match_count: usize,
+    /// True when multiple definitions matched and only the first was returned.
+    pub ambiguous: bool,
     /// Source code of the chunk containing this symbol.
     pub source: Option<String>,
     /// Files that import the symbol's file (callers at file level).
     pub imported_by: Vec<String>,
+    /// True when imported_by was truncated for token efficiency.
+    pub imported_by_truncated: bool,
     /// Files that the symbol's file imports (dependencies).
     pub imports: Vec<String>,
+    /// True when imports was truncated for token efficiency.
+    pub imports_truncated: bool,
     /// Test files that import the symbol's file.
     pub test_files: Vec<String>,
-    /// Symbol role classification (reserved; always null in v1).
+    /// Symbol role classification.
     pub role: Option<String>,
 }

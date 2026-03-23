@@ -953,15 +953,26 @@ impl SkeleSearchServer {
                 if paths.is_empty() {
                     SmartSearchResults::Grep(vec![])
                 } else {
-                    // If scope is set, use it as the grep root; otherwise derive from the
-                    // common ancestor of indexed paths.  Fall back to the process cwd when
-                    // the ancestor collapses to "/" (filesystem root, useless) or ".",
-                    // which would mean the paths were relative and the ancestor is ambiguous.
+                    // Resolve grep root from explicit scope, manifest index_root, or indexed paths.
                     let root = if let Some(ref scope) = input.scope {
-                        PathBuf::from(scope)
+                        let p = PathBuf::from(scope);
+                        if p.is_absolute() { p } else {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+                        }
                     } else {
-                        common_ancestor(&paths)
-                            .filter(|p| p != &PathBuf::from("/") && p.as_os_str() != "." && !p.as_os_str().is_empty())
+                        let manifest_root = ManifestStore::open(self.manifest_path.as_path())
+                            .ok()
+                            .and_then(|m| m.get_meta("index_root").ok().flatten())
+                            .map(PathBuf::from);
+                        manifest_root
+                            .or_else(|| {
+                                common_ancestor(&paths).map(|p| {
+                                    if p.is_absolute() { p } else {
+                                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+                                    }
+                                })
+                            })
+                            .filter(|p| p != &PathBuf::from("/") && !p.as_os_str().is_empty())
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| PathBuf::from("."))
                     };
@@ -1149,24 +1160,33 @@ impl SkeleSearchServer {
             Err(ref e) if is_uninitialized_index_error(e) => {
                 return Ok(SymbolContextOutput {
                     symbol: None,
+                    match_count: 0,
+                    ambiguous: false,
                     source: None,
                     imported_by: vec![],
+                    imported_by_truncated: false,
                     imports: vec![],
+                    imports_truncated: false,
                     test_files: vec![],
                     role: None,
                 });
             }
             Err(e) => return Err(e),
         };
+        let match_count = symbols.len();
 
         let sym = match symbols.into_iter().next() {
             Some(s) => s,
             None => {
                 return Ok(SymbolContextOutput {
                     symbol: None,
+                    match_count: 0,
+                    ambiguous: false,
                     source: None,
                     imported_by: vec![],
+                    imported_by_truncated: false,
                     imports: vec![],
+                    imports_truncated: false,
                     test_files: vec![],
                     role: None,
                 });
@@ -1202,8 +1222,8 @@ impl SkeleSearchServer {
             .await
             .unwrap_or_default();
 
-        // Step 4: filter importers to test files when requested.
-        let test_files = if input.include_tests {
+        // Step 4: filter importers to test files when requested and cap lists for token efficiency.
+        let test_files_raw: Vec<String> = if input.include_tests {
             all_importers.iter()
                 .filter(|f| is_test_file_path(f))
                 .cloned()
@@ -1211,26 +1231,35 @@ impl SkeleSearchServer {
         } else {
             vec![]
         };
-        let imported_by: Vec<String> = all_importers
+        let imported_by_raw: Vec<String> = all_importers
             .into_iter()
             .filter(|f| !is_test_file_path(f))
             .collect();
+        let (imports, imports_truncated) = truncate_vec(imports, 20);
+        let (imported_by, imported_by_truncated) = truncate_vec(imported_by_raw, 20);
+        let (test_files, _test_files_truncated) = truncate_vec(test_files_raw, 20);
 
-        // Step 5: role lookup — query symbol_roles if available; gracefully returns None
-        // when the relation has not been populated yet (e.g. freshly indexed repo).
-        let role: Option<String> = self
-            .backend
+        // Step 5: role lookup — use persisted role when available; otherwise infer
+        // an approximate file-level role from import graph degrees so ordinary
+        // indexed repos do not surface a null role to MCP callers.
+        let role: Option<String> = match self.backend
             .get_symbol_roles(&[sym.file_path.as_str()])
             .await
             .ok()
-            .and_then(|mut m| m.remove(sym.file_path.as_str()));
-
+            .and_then(|mut m| m.remove(sym.file_path.as_str())) {
+                Some(r) => Some(r),
+                None => Some(infer_file_role(&imports, &imported_by)),
+            };
 
         Ok(SymbolContextOutput {
             symbol: Some(symbol_row),
+            match_count,
+            ambiguous: match_count > 1,
             source,
             imported_by,
+            imported_by_truncated,
             imports,
+            imports_truncated,
             test_files,
             role,
         })
@@ -1586,15 +1615,17 @@ fn looks_like_project(dir: &std::path::Path) -> bool {
 }
 
 /// Returns true when `path` looks like a test file based on common naming conventions.
-/// This is a heuristic — it covers Go, Rust, JS/TS, Ruby, and directory-based conventions.
+/// This is a heuristic — it covers Go, Rust, Python, JS/TS, Ruby, and directory-based conventions.
 fn is_test_file_path(path: &str) -> bool {
     let lower = path.to_lowercase();
+    let filename = lower.rsplit('/').next().unwrap_or(&lower);
     lower.contains("/test/")
         || lower.contains("/tests/")
         || lower.contains("/__tests__/")
         || lower.contains("/spec/")
         || lower.contains("/specs/")
         || lower.ends_with("_test.go")
+        || lower.ends_with("_test.rs")
         || lower.ends_with(".test.ts")
         || lower.ends_with(".test.js")
         || lower.ends_with(".test.tsx")
@@ -1603,8 +1634,32 @@ fn is_test_file_path(path: &str) -> bool {
         || lower.ends_with(".spec.js")
         || lower.ends_with(".spec.tsx")
         || lower.ends_with(".spec.jsx")
-        || lower.ends_with("_test.rs")
         || lower.ends_with("_spec.rb")
+        || (filename.starts_with("test_") && filename.ends_with(".py"))
+}
+
+fn infer_file_role(imports: &[String], imported_by: &[String]) -> String {
+    let in_degree = imported_by.len();
+    let out_degree = imports.len();
+    if in_degree >= 3 && out_degree <= 1 {
+        "entry".to_string()
+    } else if in_degree >= 2 && out_degree >= 2 {
+        "core".to_string()
+    } else if in_degree <= 1 && out_degree >= 2 {
+        "utility".to_string()
+    } else if imports.is_empty() {
+        "leaf".to_string()
+    } else {
+        "internal".to_string()
+    }
+}
+
+fn truncate_vec(mut items: Vec<String>, limit: usize) -> (Vec<String>, bool) {
+    let truncated = items.len() > limit;
+    if truncated {
+        items.truncate(limit);
+    }
+    (items, truncated)
 }
 
 

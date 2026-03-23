@@ -179,6 +179,11 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         // rather than operating on stale values written only at the very end.
         self.manifest.set_meta("provider", self.provider.name())?;
         self.manifest.set_meta("dim", &self.provider.dim().to_string())?;
+        if let Ok(index_root) = root.canonicalize() {
+            self.manifest.set_meta("index_root", &index_root.to_string_lossy())?;
+        } else {
+            self.manifest.set_meta("index_root", &root.to_string_lossy())?;
+        }
 
         let chunker = Chunker::default();
         let mut visited: HashSet<String> = HashSet::new();
