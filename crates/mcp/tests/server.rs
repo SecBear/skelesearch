@@ -201,16 +201,14 @@ async fn list_tools_exposes_the_v1_tools() -> anyhow::Result<()> {
     assert_eq!(
         names,
         vec![
-            "find_impact_set",
+            "find_dependents",
             "find_symbol",
-            "find_test_context",
-            "get_file_context",
+            "find_tests",
+            "get_index_status",
             "get_repo_map",
-            "get_symbol_context",
-            "index_codebase",
-            "index_status",
+            "get_symbol_info",
+            "index",
             "search_code",
-            "smart_search",
         ]
     );
     Ok(())

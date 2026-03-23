@@ -1533,20 +1533,8 @@ fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
 
 #[tool_router]
 impl SkeleSearchServer {
-    /// Hybrid semantic + keyword code search. Returns ranked code blocks.
-    #[tool(name = "search_code")]
-    async fn mcp_search_code(
-        &self,
-        Parameters(input): Parameters<SearchCodeInput>,
-    ) -> Result<String, String> {
-        match self.search_code(input).await {
-                    Ok(response) => serde_json::to_string(&response).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
-    }
-
     /// Index a directory for code search. Run once, updates incrementally.
-    #[tool(name = "index_codebase")]
+    #[tool(name = "index")]
     async fn mcp_index_codebase(
         &self,
         Parameters(input): Parameters<IndexCodebaseInput>,
@@ -1558,7 +1546,7 @@ impl SkeleSearchServer {
     }
 
     /// Check if the code index exists and is current.
-    #[tool(name = "index_status")]
+    #[tool(name = "get_index_status")]
     async fn mcp_index_status(
         &self,
         Parameters(input): Parameters<IndexStatusInput>,
@@ -1569,20 +1557,8 @@ impl SkeleSearchServer {
                 }
     }
 
-    /// Get all indexed chunks and import graph for a specific file.
-    #[tool(name = "get_file_context")]
-    async fn mcp_get_file_context(
-        &self,
-        Parameters(input): Parameters<GetFileContextInput>,
-    ) -> Result<String, String> {
-        match self.get_file_context(input).await {
-                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
-    }
-
     /// Find code by concept or keyword. Auto-routes to best search strategy.
-    #[tool(name = "smart_search")]
+    #[tool(name = "search_code")]
     async fn mcp_smart_search(
         &self,
         Parameters(input): Parameters<SmartSearchInput>,
@@ -1607,7 +1583,7 @@ impl SkeleSearchServer {
 
     /// Find all files affected by changes to a given file. Returns direct importers,
     /// transitive importers by depth, and affected test files.
-    #[tool(name = "find_impact_set")]
+    #[tool(name = "find_dependents")]
     async fn mcp_find_impact_set(
         &self,
         Parameters(input): Parameters<FindImpactSetInput>,
@@ -1620,7 +1596,7 @@ impl SkeleSearchServer {
 
     /// Find test files covering a source file. Returns test files that import it
     /// and colocated test files.
-    #[tool(name = "find_test_context")]
+    #[tool(name = "find_tests")]
     async fn mcp_find_test_context(
         &self,
         Parameters(input): Parameters<FindTestContextInput>,
@@ -1633,7 +1609,7 @@ impl SkeleSearchServer {
 
     /// Return source code, import graph edges, and test files for a named symbol.
     /// One-call context bundle for agents that need to understand a symbol.
-    #[tool(name = "get_symbol_context")]
+    #[tool(name = "get_symbol_info")]
     async fn mcp_get_symbol_context(
         &self,
         Parameters(input): Parameters<GetSymbolContextInput>,
@@ -1666,20 +1642,19 @@ impl ServerHandler for SkeleSearchServer {
             .with_instructions(
                 "skelesearch -- semantic code search for agents.\n\n\
                  Tools:\n\
-                 - smart_search: Find code by concept, keyword, or symbol. Auto-routes between grep and semantic search.\n\
-                 - search_code: Direct hybrid semantic + keyword search with full control over parameters.\n\
-                 - find_symbol: Look up a symbol definition by exact name. Returns file path, line range, and kind. Use for 'where is X defined' questions.\n\
-                 - get_symbol_context: One-call context bundle for a symbol: source code, import graph edges, and test files.\n\
-                 - find_impact_set: Find all files that depend on a given file (reverse import graph).\n\
-                 - find_test_context: Find test files for a source file.\n\n\
-                 Query tips for best results:\n\
-                 - Describe what the target code DOES, not a question: \"middleware that validates JWT tokens\" not \"how does auth work\"\n\
-                 - Include known symbol names: \"AsyncClient connection pooling retry logic\"\n\
-                 - Use `intent: \"understand\"` when you need a symbol plus its structural context\n\
-                 - Use `intent: \"impact\"` with `symbols: [\"SymbolName\"]` to find all dependents before refactoring\n\
-                 - Set `scope: \"src/auth\"` to narrow results to a directory\n\
-                 - Set `max_tokens` to control output size (default: 8192)\n\
-                 - Set `session_id` to deduplicate across multi-turn searches"
+                 - search_code: Find code by concept, keyword, or symbol. Primary search tool.\n\
+                 - get_repo_map: Compact structural overview of the indexed codebase.\n\
+                 - get_symbol_info: Source code, imports, dependents, tests, and role for a named symbol.\n\
+                 - find_symbol: Look up a symbol definition by exact name.\n\
+                 - find_dependents: Find all files that depend on a given file (reverse import graph).\n\
+                 - find_tests: Find test files for a source file.\n\
+                 - index: Index a codebase for search. Incremental.\n\
+                 - get_index_status: Check if the index exists and is current.\n\n\
+                 Query tips:\n\
+                 - Describe what the target code DOES: \"middleware that validates JWT tokens\"\n\
+                 - Include known symbol names: \"AsyncClient retry logic\"\n\
+                 - Use intent: \"understand\" for structural context with graph expansion\n\
+                 - Use scope: \"src/auth\" to narrow results to a directory"
             )
     }
 
