@@ -1,4 +1,5 @@
 use crate::cochange::CoChangePair;
+use crate::sparse::SparseEmbedding;
 use crate::symbols::SymbolDef;
 
 use async_trait::async_trait;
@@ -203,6 +204,33 @@ pub trait StorageBackend: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<(String, usize, f64)>>;
 
+    /// Store sparse embedding entries for a chunk.
+    /// Called at index time for each chunk when a sparse provider is active.
+    async fn store_sparse_vectors(
+        &self,
+        _file_path: &str,
+        _chunk_idx: usize,
+        _sparse: &SparseEmbedding,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Remove all sparse index entries for the given file.
+    async fn delete_sparse_for_file(&self, _file_path: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Dot-product search over the sparse index.
+    /// Returns `(file_path, chunk_idx, score)` tuples sorted by score descending,
+    /// truncated to `top_k`. Empty when no sparse index exists.
+    async fn sparse_search(
+        &self,
+        _query_sparse: &SparseEmbedding,
+        _top_k: usize,
+    ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+        Ok(vec![])
+    }
+
 
     /// Single-query retrieval combining FTS + HNSW + graph walk + PageRank boost.
     /// Returns results with provenance (\"hybrid\", \"graph\").
@@ -277,10 +305,28 @@ pub(crate) fn classify_symbol_role(in_degree: usize, out_degree: usize) -> &'sta
     }
 }
 
+/// In-memory inverted index for sparse dot-product search.
+/// Loaded lazily from CozoDB on first `sparse_search` call;
+/// kept in sync on subsequent store/delete calls.
+struct SparseIndexState {
+    /// token_id → [(file_path, chunk_idx, weight)]
+    postings: std::collections::HashMap<u32, Vec<(String, usize, f32)>>,
+    /// `true` once postings has been loaded from CozoDB.
+    loaded: bool,
+}
+
+impl SparseIndexState {
+    fn new() -> Self {
+        Self { postings: std::collections::HashMap::new(), loaded: false }
+    }
+}
+
 pub struct CozoBackend {
     db: DbInstance,
     /// Embedding dimension set during `initialize`; 0 until initialized.
     dim: Arc<AtomicUsize>,
+    /// In-memory inverted index populated lazily on first `sparse_search`.
+    sparse_idx: Arc<std::sync::RwLock<SparseIndexState>>,
 }
 
 impl CozoBackend {
@@ -306,7 +352,7 @@ impl CozoBackend {
         let path_str = path.to_string_lossy();
         let db = DbInstance::new("sqlite", path_str.as_ref(), Default::default())
             .map_err(|e| anyhow::anyhow!("cozo open: {}", e))?;
-        Ok(Self { db, dim: Arc::new(AtomicUsize::new(0)) })
+        Ok(Self { db, dim: Arc::new(AtomicUsize::new(0)), sparse_idx: Arc::new(std::sync::RwLock::new(SparseIndexState::new())) })
     }
 
     // ------------------------------------------------------------------
@@ -365,6 +411,39 @@ impl CozoBackend {
 
     fn dv_float(f: f64) -> DataValue {
         DataValue::Num(cozo::Num::Float(f))
+    }
+
+    /// Populate `guard.postings` from CozoDB and set `guard.loaded = true`.
+    /// Silently succeeds if the `sparse_index` relation does not exist yet
+    /// (old index without sparse data).
+    fn load_sparse_index(&self, guard: &mut SparseIndexState) {
+        match self.run_imm("?[tid, fp, ci, w] := *sparse_index[tid, fp, ci, w]", BTreeMap::new()) {
+            Ok(rows) => {
+                for row in rows.rows {
+                    let (tid, fp, ci, weight) = match (&row[0], &row[1], &row[2], &row[3]) {
+                        (
+                            DataValue::Num(cozo::Num::Int(tid)),
+                            DataValue::Str(fp),
+                            DataValue::Num(cozo::Num::Int(ci)),
+                            DataValue::Num(w),
+                        ) => {
+                            let wf = match w {
+                                cozo::Num::Float(f) => *f as f32,
+                                cozo::Num::Int(i) => *i as f32,
+                            };
+                            (*tid as u32, fp.to_string(), *ci as usize, wf)
+                        }
+                        _ => continue,
+                    };
+                    guard.postings.entry(tid).or_default().push((fp, ci, weight));
+                }
+            }
+            Err(e) => {
+                // sparse_index doesn't exist yet — old index without sparse data.
+                tracing::debug!(error = %e, "sparse_index not found, in-memory index left empty");
+            }
+        }
+        guard.loaded = true;
     }
 
     fn embedding_to_dv(emb: &Option<Vec<f32>>, dim: usize) -> DataValue {
@@ -739,6 +818,11 @@ impl StorageBackend for CozoBackend {
         // callee_file/callee_symbol use empty string to represent unresolved (no NULL in stored relations).
         self.run_mut_ignore(
             ":create call_edges { caller_file: String, caller_symbol: String, callee_name: String, start_line: Int => callee_file: String, callee_symbol: String, confidence: Float, dynamic: Int }",
+        )?;
+
+        // Create sparse_index relation for BGE-M3/SPLADE sparse vectors — idempotent.
+        self.run_mut_ignore(
+            ":create sparse_index { token_id: Int, file_path: String, chunk_idx: Int => weight: Float }",
         )?;
         Ok(())
     }
@@ -2030,6 +2114,116 @@ impl StorageBackend for CozoBackend {
                 results.push((to_fp, to_ci, dist));
             }
         }
+        Ok(results)
+    }
+
+    async fn store_sparse_vectors(
+        &self,
+        file_path: &str,
+        chunk_idx: usize,
+        sparse: &SparseEmbedding,
+    ) -> anyhow::Result<()> {
+        if sparse.is_empty() {
+            return Ok(());
+        }
+        // Persist to CozoDB.
+        let rows: Vec<Vec<DataValue>> = sparse
+            .indices
+            .iter()
+            .zip(sparse.values.iter())
+            .map(|(&tid, &w)| {
+                vec![
+                    Self::dv_int(tid as i64),
+                    Self::dv_str(file_path),
+                    Self::dv_int(chunk_idx as i64),
+                    Self::dv_float(w as f64),
+                ]
+            })
+            .collect();
+        let data = DataValue::List(rows.into_iter().map(DataValue::List).collect());
+        let mut p = BTreeMap::new();
+        p.insert("rows".into(), data);
+        self.run_mut(
+            "?[token_id, file_path, chunk_idx, weight] <- $rows \
+             :put sparse_index { token_id, file_path, chunk_idx => weight }",
+            p,
+        )?;
+        // Update in-memory index if it has been loaded.
+        let mut guard = self.sparse_idx.write().unwrap();
+        if guard.loaded {
+            // Remove stale entries for this (file, chunk) pair.
+            for list in guard.postings.values_mut() {
+                list.retain(|(fp, ci, _)| fp != file_path || *ci != chunk_idx);
+            }
+            // Insert new entries.
+            for (&tid, &w) in sparse.indices.iter().zip(sparse.values.iter()) {
+                guard
+                    .postings
+                    .entry(tid)
+                    .or_default()
+                    .push((file_path.to_string(), chunk_idx, w));
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_sparse_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        let mut p = BTreeMap::new();
+        p.insert("fp".into(), Self::dv_str(file_path));
+        self.run_mut(
+            "?[token_id, file_path, chunk_idx] := *sparse_index[token_id, file_path, chunk_idx, _], file_path = $fp \
+             :rm sparse_index { token_id, file_path, chunk_idx }",
+            p,
+        )?;
+        // Update in-memory index if loaded.
+        let mut guard = self.sparse_idx.write().unwrap();
+        if guard.loaded {
+            for list in guard.postings.values_mut() {
+                list.retain(|(fp, _, _)| fp != file_path);
+            }
+            guard.postings.retain(|_, v| !v.is_empty());
+        }
+        Ok(())
+    }
+
+    async fn sparse_search(
+        &self,
+        query_sparse: &SparseEmbedding,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+        if query_sparse.is_empty() || top_k == 0 {
+            return Ok(vec![]);
+        }
+        // Lazy load: check loaded flag without a write lock first.
+        {
+            let need_load = !self.sparse_idx.read().unwrap().loaded;
+            if need_load {
+                let mut guard = self.sparse_idx.write().unwrap();
+                // Re-check after acquiring write lock — another thread may have loaded it.
+                if !guard.loaded {
+                    self.load_sparse_index(&mut guard);
+                }
+            }
+        }
+        let guard = self.sparse_idx.read().unwrap();
+        let postings = &guard.postings;
+        // Dot-product accumulation: score(doc) = sum over query tokens of qw * idx_w.
+        let mut scores: std::collections::HashMap<(String, usize), f64> =
+            std::collections::HashMap::new();
+        for (&tid, &qw) in query_sparse.indices.iter().zip(query_sparse.values.iter()) {
+            if let Some(list) = postings.get(&tid) {
+                for (fp, ci, iw) in list {
+                    *scores.entry((fp.clone(), *ci)).or_insert(0.0) +=
+                        qw as f64 * *iw as f64;
+                }
+            }
+        }
+        let mut results: Vec<(String, usize, f64)> = scores
+            .into_iter()
+            .map(|((fp, ci), s)| (fp, ci, s))
+            .collect();
+        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_k);
         Ok(results)
     }
 

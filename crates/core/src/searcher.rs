@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{expander::QueryExpander, reranker::{RerankCandidate, Reranker}, ChunkRecord, EmbedProvider, SearchResult, StorageBackend};
+use crate::{expander::QueryExpander, reranker::{RerankCandidate, Reranker}, ChunkRecord, EmbedProvider, SearchResult, SparseEmbedding, SparseEmbedProvider, StorageBackend};
 
 // ---------------------------------------------------------------------------
 // Public output types
@@ -288,6 +288,55 @@ fn expand_query(query: &str) -> String {
     format!("{} {}", query, keywords.join(" "))
 }
 
+/// Re-rank `hybrid_hits` using sparse dot-product results as a second signal.
+///
+/// Computes two-way RRF between:
+/// - `hybrid_rank`: position in `hybrid_hits` (already FTS + vector fused)
+/// - `sparse_rank`: position in `sparse_hits`
+///
+/// Weight: hybrid leg receives `1.0 - w_sparse`, sparse leg receives `w_sparse`.
+/// Chunks present only in sparse results are ignored (no metadata available);
+/// this keeps the function allocation-light and avoids extra backend lookups.
+fn apply_sparse_rrf(
+    hybrid_hits: Vec<SearchResult>,
+    sparse_hits: &[(String, usize, f64)],
+    w_sparse: f64,
+) -> Vec<SearchResult> {
+    use std::collections::HashMap;
+    type Key = (String, usize);
+
+    let hybrid_rank: HashMap<Key, usize> = hybrid_hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| ((h.file_path.clone(), h.chunk_idx), i + 1))
+        .collect();
+
+    let sparse_rank: HashMap<Key, usize> = sparse_hits
+        .iter()
+        .enumerate()
+        .map(|(i, (fp, ci, _))| ((fp.clone(), *ci), i + 1))
+        .collect();
+
+    const SENTINEL: usize = 1000;
+    let w_hybrid = 1.0 - w_sparse;
+
+    let mut rescored: Vec<(f64, SearchResult)> = hybrid_hits
+        .into_iter()
+        .map(|hit| {
+            let key = (hit.file_path.clone(), hit.chunk_idx);
+            let hr = hybrid_rank.get(&key).copied().unwrap_or(SENTINEL);
+            let sr = sparse_rank.get(&key).copied().unwrap_or(SENTINEL);
+            let score = w_hybrid / (60.0 + hr as f64) + w_sparse / (60.0 + sr as f64);
+            let mut r = hit;
+            r.score = score;
+            (score, r)
+        })
+        .collect();
+
+    rescored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    rescored.into_iter().map(|(_, r)| r).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Searcher
 // ---------------------------------------------------------------------------
@@ -324,6 +373,11 @@ pub struct Searcher<B, P> {
     /// Keyed by normalized query + retrieval knobs so repeated searches skip
     /// redundant backend retrieval work. Bounded at 128 entries.
     candidate_cache: std::sync::Mutex<lru::LruCache<String, Vec<SearchResult>>>,
+    /// Optional sparse embedding provider for the third RRF leg.
+    sparse_provider: Option<Arc<dyn SparseEmbedProvider>>,
+    /// RRF weight for the sparse leg when sparse is active. Default: 0.20.
+    /// Hybrid (FTS + vector) leg receives `1.0 - sparse_weight`.
+    sparse_weight: f64,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
@@ -345,6 +399,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             candidate_cache: std::sync::Mutex::new(
                 lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()),
             ),
+            sparse_provider: None,
+            sparse_weight: 0.20,
         }
     }
 
@@ -369,6 +425,9 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         self.graph_score_factor = config.search.graph_score_factor();
         self.graph_min_score = config.search.graph_min_score();
         self.pagerank_factor = config.search.pagerank_factor();
+        if config.search.sparse.enabled {
+            self.sparse_weight = config.search.sparse.weight();
+        }
         self
     }
 
@@ -383,6 +442,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     /// the reranker runs after MMR and before the token-budget filter.
     pub fn with_reranker(mut self, reranker: Box<dyn Reranker>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Attach a sparse embedding provider for three-way RRF fusion.
+    /// The sparse leg uses BGE-M3 sparse (or similar) to provide a lexical
+    /// co-occurrence signal orthogonal to BM25 and dense retrieval.
+    /// When not set, the two-way FTS + vector fusion is unchanged.
+    pub fn with_sparse_provider(mut self, provider: Arc<dyn SparseEmbedProvider>) -> Self {
+        self.sparse_provider = Some(provider);
         self
     }
 
@@ -642,6 +710,45 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 timings.graph_ms = graph_start.elapsed().as_millis() as u64;
             }
 
+            // -- Sparse re-ranking -------------------------------------------
+            // When a sparse provider is configured and the hybrid result set
+            // is non-empty, compute a sparse query embedding and use it as a
+            // third RRF leg to re-rank the existing candidates.
+            // Failures degrade gracefully: sparse signal is skipped on error.
+            if let Some(ref sp) = self.sparse_provider {
+                if !hits.is_empty() {
+                    let sp_arc = Arc::clone(sp);
+                    let qtext = normalized_query.clone();
+                    let sparse_result = tokio::task::spawn_blocking(move || {
+                        sp_arc
+                            .embed_batch(&[qtext.as_str()])
+                            .map(|mut v| v.pop().unwrap_or(SparseEmbedding { indices: vec![], values: vec![] }))
+                    })
+                    .await;
+                    match sparse_result {
+                        Ok(Ok(sq)) if !sq.is_empty() => {
+                            let fetch_k = hits.len().max(top_k * 2).max(50);
+                            match self.backend.sparse_search(&sq, fetch_k).await {
+                                Ok(sparse_hits) if !sparse_hits.is_empty() => {
+                                    hits = apply_sparse_rrf(hits, &sparse_hits, self.sparse_weight);
+                                }
+                                Ok(_) => {} // empty sparse results — keep hybrid order
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "sparse_search failed, skipping sparse leg");
+                                }
+                            }
+                        }
+                        Ok(Ok(_)) => {} // empty sparse embedding
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "sparse embed failed, skipping sparse leg");
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "sparse embed task panicked, skipping sparse leg");
+                        }
+                    }
+                }
+            }
+
             self.candidate_cache
                 .lock()
                 .expect("candidate_cache mutex poisoned")
@@ -882,13 +989,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         max_depth: usize,
     ) -> String {
         format!(
-            "q={normalized_query}\nfts={bm25_query}\ntop_k={top_k}\ngraph={include_graph}\ndepth={max_depth}\nunified={}\npagerank_boost={}\nfts_weight={:016x}\ngraph_score_factor={:016x}\ngraph_min_score={:016x}\npagerank_factor={:016x}",
+            "q={normalized_query}\nfts={bm25_query}\ntop_k={top_k}\ngraph={include_graph}\ndepth={max_depth}\nunified={}\npagerank_boost={}\nfts_weight={:016x}\ngraph_score_factor={:016x}\ngraph_min_score={:016x}\npagerank_factor={:016x}\nsparse_weight={:016x}",
             self.use_unified_search,
             self.pagerank_boost,
             self.fts_weight.to_bits(),
             self.graph_score_factor.to_bits(),
             self.graph_min_score.to_bits(),
             self.pagerank_factor.to_bits(),
+            self.sparse_weight.to_bits(),
         )
     }
 

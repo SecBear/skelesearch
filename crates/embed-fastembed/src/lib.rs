@@ -8,10 +8,10 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use fastembed::{
-    EmbeddingModel, InitOptionsUserDefined, Pooling, TextEmbedding, TextInitOptions,
-    TokenizerFiles, UserDefinedEmbeddingModel,
+    EmbeddingModel, InitOptionsUserDefined, Pooling, SparseInitOptions, SparseModel,
+    SparseTextEmbedding, TextEmbedding, TextInitOptions, TokenizerFiles, UserDefinedEmbeddingModel,
 };
-use skelesearch_core::EmbedProvider;
+use skelesearch_core::{EmbedProvider, SparseEmbedding, SparseEmbedProvider};
 
 /// Configuration for constructing a [`FastEmbedProvider`].
 ///
@@ -323,6 +323,64 @@ impl EmbedProvider for FastEmbedProvider {
         })
         .await
         .context("embedding task panicked")?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sparse provider
+// ---------------------------------------------------------------------------
+
+/// A [`SparseEmbedProvider`] backed by [`fastembed::SparseTextEmbedding`].
+///
+/// Default model: BGE-M3 sparse (8192-token context, 100+ languages).
+/// Downloads ONNX weights on first use (~50 MB). Subsequent calls use the
+/// local fastembed cache (`$FASTEMBED_CACHE_DIR` / `~/.fastembed_cache`).
+///
+/// `SparseTextEmbedding::embed` takes `&mut self`, so we wrap it in a
+/// `std::sync::Mutex` for interior mutability across shared references.
+pub struct FastEmbedSparseProvider {
+    model: std::sync::Arc<std::sync::Mutex<SparseTextEmbedding>>,
+}
+
+impl FastEmbedSparseProvider {
+    /// Construct a [`FastEmbedSparseProvider`] using the BGE-M3 sparse model.
+    ///
+    /// # Errors
+    /// Returns an error if the model cannot be loaded (network unavailable,
+    /// disk full, ONNX runtime failure, etc.).
+    pub fn bgem3() -> anyhow::Result<Self> {
+        let model = SparseTextEmbedding::try_new(SparseInitOptions::new(SparseModel::BGEM3))
+            .context("failed to initialize BGE-M3 sparse model")?;
+        Ok(Self { model: std::sync::Arc::new(std::sync::Mutex::new(model)) })
+    }
+}
+
+impl SparseEmbedProvider for FastEmbedSparseProvider {
+    fn name(&self) -> &str {
+        "bgem3-sparse"
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<SparseEmbedding>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut locked = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SparseTextEmbedding mutex poisoned"))?;
+        let results = locked
+            .embed(texts.to_vec(), None)
+            .context("SparseTextEmbedding::embed failed")?;
+        // fastembed uses `usize` for indices; we normalise to `u32` because
+        // vocabulary sizes for code models fit comfortably in 32 bits and
+        // u32 halves the memory footprint of the in-memory inverted index.
+        Ok(results
+            .into_iter()
+            .map(|r| SparseEmbedding {
+                indices: r.indices.into_iter().map(|i| i as u32).collect(),
+                values: r.values,
+            })
+            .collect())
     }
 }
 

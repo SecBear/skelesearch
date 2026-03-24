@@ -7,7 +7,7 @@ use anyhow::Context as _;
 
 use crate::{
     content_hash, CallEdge, ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore,
-    StorageBackend,
+    SparseEmbedProvider, StorageBackend,
 };
 use crate::symbols::{extract_import_aliases, extract_references, extract_symbols};
 use crate::cochange;
@@ -71,6 +71,9 @@ pub struct Indexer<B, P> {
     summary_provider: Option<Box<dyn crate::summary::SummaryProvider>>,
     /// Prepend AST scope chain to embedding text for structural context.
     scope_prefix: bool,
+    /// Optional sparse embedding provider (e.g. BGE-M3 sparse).
+    /// When set, sparse vectors are computed and stored for each chunk at index time.
+    sparse_provider: Option<Arc<dyn SparseEmbedProvider>>,
 }
 
 impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
@@ -85,6 +88,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             include_extensions: None,
             summary_provider: None,
             scope_prefix: false,
+            sparse_provider: None,
         }
     }
 
@@ -127,6 +131,13 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         });
         self
     }
+    /// Attach a sparse embedding provider. When set, sparse vectors are computed
+    /// and stored alongside dense embeddings for each chunk during indexing.
+    pub fn with_sparse_provider(mut self, provider: Arc<dyn SparseEmbedProvider>) -> Self {
+        self.sparse_provider = Some(provider);
+        self
+    }
+
     /// Attach an LLM summary provider.  When set, each chunk's description is
     /// generated before embedding; the HNSW index stores description-based
     /// vectors instead of raw-code vectors.
@@ -419,6 +430,9 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 self.backend
                     .delete_symbols_for_file(&bf.candidate.rel_path)
                     .await?;
+                self.backend
+                    .delete_sparse_for_file(&bf.candidate.rel_path)
+                    .await?;
             }
 
             // 2c. Build a cross-file pending list of (file_idx, chunk) pairs —
@@ -602,6 +616,53 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                     self.backend.upsert_chunks(chunk_records).await?;
                 }
 
+                // -- Sparse embeddings ------------------------------------------------
+                // When a sparse provider is configured, compute sparse representations
+                // for this file's chunks and store them. Failures are logged and skipped
+                // rather than aborting the index run — sparse is an optional enhancement.
+                if let Some(ref sp) = self.sparse_provider {
+                    let texts: Vec<&str> =
+                        chunk_records.iter().map(|cr| cr.content.as_str()).collect();
+                    let sp_arc = Arc::clone(sp);
+                    let texts_owned: Vec<String> =
+                        texts.iter().map(|t| t.to_string()).collect();
+                    match tokio::task::spawn_blocking(move || {
+                        let refs: Vec<&str> =
+                            texts_owned.iter().map(|s| s.as_str()).collect();
+                        sp_arc.embed_batch(&refs)
+                    })
+                    .await
+                    {
+                        Ok(Ok(sparse_embs)) => {
+                            for (cr, sparse) in chunk_records.iter().zip(sparse_embs.iter()) {
+                                if !sparse.is_empty() {
+                                    if let Err(e) = self
+                                        .backend
+                                        .store_sparse_vectors(
+                                            &cr.file_path,
+                                            cr.chunk_idx,
+                                            sparse,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            file_path = %cr.file_path,
+                                            error = %e,
+                                            "store_sparse_vectors failed, skipping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "sparse embed_batch failed, skipping chunk batch");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "sparse embed_batch task panicked, skipping");
+                        }
+                    }
+                }
+
                 // Resolve raw import captures to canonical project-relative paths.
                 // Unresolvable edges (external deps, unknown languages, parse
                 // failures) are silently dropped — only intra-project edges are stored.
@@ -758,6 +819,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             self.backend.delete_edges_for_file(path).await?;
             self.backend.delete_symbols_for_file(path).await?;
             self.backend.delete_call_edges_for_file(path).await?;
+            self.backend.delete_sparse_for_file(path).await?;
             self.backend.delete_file(path).await?;
             self.manifest.remove(path)?;
         }

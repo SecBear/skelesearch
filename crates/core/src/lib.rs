@@ -1,3 +1,6 @@
+pub mod sparse;
+pub use sparse::{SparseEmbedding, SparseEmbedProvider};
+
 pub mod cochange;
 pub use cochange::CoChangePair;
 
@@ -29,7 +32,7 @@ pub use schema::{
 pub use searcher::{FileContext, Searcher, SearchTimings};
 pub use gc::collect_garbage;
 pub use grep::{grep_codebase, GrepMatch, GrepOptions};
-pub use config::{Config, ExpansionConfig, GraphConfig, IndexConfig, RerankerConfig, SearchConfig};
+pub use config::{Config, ExpansionConfig, GraphConfig, IndexConfig, RerankerConfig, SearchConfig, SparseConfig};
 pub mod reranker;
 pub use reranker::{NoopReranker, RerankCandidate, Reranker};
 pub mod router;

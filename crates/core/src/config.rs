@@ -67,6 +67,9 @@ pub struct SearchConfig {
     /// Graph / import-edge traversal configuration.
     #[serde(default)]
     pub graph: GraphConfig,
+    /// Sparse retrieval (BGE-M3 sparse / SPLADE) as a third RRF leg.
+    #[serde(default)]
+    pub sparse: SparseConfig,
 }
 
 /// Reranker configuration.
@@ -90,6 +93,34 @@ pub struct ExpansionConfig {
     /// Enable LLM query expansion.  Absent = auto-detect from OPENAI_API_KEY.
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// Sparse retrieval configuration (BGE-M3 sparse / SPLADE).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SparseConfig {
+    /// Enable sparse retrieval as a third RRF leg. Default: `false`.
+    pub enabled: bool,
+    /// Sparse model name.  Currently only `"bgem3"` is supported.
+    pub model: Option<String>,
+    /// RRF weight for the sparse leg. Default: 0.20.
+    /// The hybrid (FTS + vector) leg receives `1.0 - weight`.
+    pub weight: Option<f64>,
+}
+
+impl Default for SparseConfig {
+    fn default() -> Self {
+        Self { enabled: false, model: None, weight: None }
+    }
+}
+
+impl SparseConfig {
+    pub fn weight(&self) -> f64 {
+        self.weight.unwrap_or(0.20)
+    }
+    pub fn model_name(&self) -> &str {
+        self.model.as_deref().unwrap_or("bgem3")
+    }
 }
 
 /// Graph search (import-edge traversal) configuration.
@@ -123,6 +154,7 @@ impl Default for SearchConfig {
             reranker: RerankerConfig::default(),
             expansion: ExpansionConfig::default(),
             graph: GraphConfig::default(),
+            sparse: SparseConfig::default(),
         }
     }
 }
