@@ -65,12 +65,16 @@ rustup component add clippy rustfmt
 ### Workspace structure
 
 | Crate | Purpose |
-|-------|---------|
+|---|---|
 | `skelesearch-core` | Storage, indexing, search, chunking, manifest |
 | `skelesearch-embed-fastembed` | Default embedding provider (jina-v2-base-code) |
+| `skelesearch-embed-openai` | OpenAI embedding provider (text-embedding-3-small) |
+| `skelesearch-embed-voyage` | Voyage AI embedding provider (voyage-code-3) |
 | `skelesearch-cli` | CLI binary with clap subcommands |
 | `skelesearch-mcp` | MCP server with rmcp 1.2 |
-
+| `skelesearch-rerank-api` | Cloud cross-encoder reranker (API-based) |
+| `skelesearch-rerank-local` | Local ONNX cross-encoder reranker |
+| `skelesearch-telemetry` | Shared tracing setup (fmt + optional OTLP) |
 ### Documentation
 
 - Inline `///` doc comments on **every** public item.

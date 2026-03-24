@@ -3,7 +3,7 @@
 ## Prerequisites
 
 ```bash
-source .env && export VOYAGE_API_KEY
+export VOYAGE_API_KEY=<your-key>
 cargo build --release --features storage-sqlite
 ```
 

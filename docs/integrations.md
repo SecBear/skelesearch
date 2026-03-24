@@ -76,89 +76,54 @@ Recommended workflow:
 
 ## 3. Custom MCP host (stdio)
 
-
-
 For any MCP host that launches tools as local subprocesses, configure
 `skelesearch-mcp` as a stdio server and pass environment variables through the
 host's normal MCP config mechanism.
 
-
-
 Example install:
 
 ```bash
-
 cargo install --path crates/mcp --root ~/.local --force --features storage-rocksdb
-
 # or use the helper script
-
 ./scripts/install-mcp.sh
-
 ```
-
-
 
 Example MCP entry:
 
 ```json
-
 {
-
   "mcpServers": {
-
     "skelesearch": {
-
       "command": "skelesearch-mcp",
-
       "env": {
-
         "VOYAGE_API_KEY": "<set-me>",
-
         "RUST_LOG": "skelesearch=info"
-
       }
-
     }
-
   }
-
 }
-
 ```
-
-
 
 Workflow:
 
 1. Install or rebuild the MCP binary
-
 2. Update your host's MCP config
-
 3. Restart the host
-
 4. skelesearch will auto-index on startup when needed (unless `SKELESEARCH_NO_AUTO_INDEX` is set)
-
-
 
 Tool recommendations:
 
 - **`search_code`** — primary default for semantic code retrieval.
-
 - **`find_symbol`** — precise definition lookup. Pass `kind` to narrow
   to a specific symbol type (e.g. `"struct"`, `"function"`, `"trait"`).
-
 - **`get_symbol_info`** — best one-call context bundle for a known symbol.
-
 - **`get_repo_map`** — fastest structural overview when you need repo shape before querying.
 
-
-
----
 ---
 
 ## 4. HTTP transport (generic)
 
-> **New in v1.2.** For systems that cannot spawn subprocesses directly —
+> **Available in current builds.** For systems that cannot spawn subprocesses directly —
 > VS Code extensions, remote agents, web-based tools — skelesearch-mcp will
 > expose a Streamable HTTP transport:
 
