@@ -35,11 +35,13 @@ The index lives in `.skelesearch/` at the project root. Add it to `.gitignore`.
    (functions, structs, impl blocks). Unknown languages fall back to a sliding
    window.
 
-2. **Embedding** — two providers:
+2. **Embedding** — three providers:
    - **fastembed** (default) — [jina-embeddings-v2-base-code](https://huggingface.co/jinaai/jina-embeddings-v2-base-code)
      (768-dim, code-specialized ONNX model, runs locally via fastembed-rs)
    - **openai** — `text-embedding-3-small` via the OpenAI API (`--provider openai`);
      requires `OPENAI_API_KEY` in the environment
+   - **voyage** — `voyage-code-3` via the Voyage AI API (`--provider voyage`);
+     requires `VOYAGE_API_KEY` in the environment
 
    An **embedding cache** (SQLite-backed, keyed by content hash) skips
    re-embedding unchanged chunks on subsequent runs. The **provider manifest**
@@ -58,13 +60,13 @@ The index lives in `.skelesearch/` at the project root. Add it to `.gitignore`.
 
 ```
 skelesearch index <path>              Index a directory
-  --provider fastembed|openai            Embedding backend (default: fastembed)
+  --provider fastembed|openai|voyage   Embedding backend (default: fastembed)
 skelesearch search <query>            Hybrid semantic + FTS search
   --top-k N                             Max results (default: 5)
   --diversity 0.3                       MMR re-ranking (0=off, 1=max diversity)
   --max-tokens N                        Cap output to a token budget
   --branch                              Scope results to files changed on current git branch
-  --provider fastembed|openai            Must match the provider used at index time
+  --provider fastembed|openai|voyage   Must match the provider used at index time
   --json                                JSON output
 skelesearch grep <pattern>            Regex search over indexed files
   -i, --ignore-case                     Case insensitive
@@ -145,11 +147,12 @@ Kotlin, Swift, Scala. Unknown extensions use a sliding-window fallback.
 
 ```
 crates/
-  core/            Schema, indexer, searcher, chunker, manifest, GC, grep, symbols
+  core/             Schema, indexer, searcher, chunker, manifest, GC, grep, symbols
   embed-fastembed/  FastEmbed ONNX provider (jina-v2-base-code)
   embed-openai/     OpenAI API provider (text-embedding-3-small)
-  mcp/             MCP server (stdio + HTTP transport)
-  cli/             CLI binary
+  embed-voyage/     Voyage AI provider (voyage-code-3)
+  mcp/              MCP server (stdio + HTTP transport)
+  cli/              CLI binary
 ```
 
 Key design boundaries:

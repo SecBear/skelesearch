@@ -72,16 +72,17 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 
 | Repo | Language | R@5 (local) | R@5 (Voyage) | Δ R@5 | MRR (local) | MRR (Voyage) | ms/40q (local) |
 |---|---|---|---|---|---|---|---|
-| mini-redis | Rust | 92.5% | 93.8% | -1.3 | 0.724 | 0.913 | 3,779 |
+| mini-redis | Rust | 92.5% | 93.8% | +1.3 | 0.724 | 0.913 | 3,779 |
 | cobra | Go | 90.4% | 90.4% | +0.0 | 0.908 | 0.938 | 3,615 |
 | httpx | Python | 89.0% | 89.0% | +0.0 | 0.868 | 0.842 | 4,398 |
-| hyperfine | Rust | 70.0% | 81.3% | -11.3 | 0.625 | 0.801 | 3,794 |
-| hono | TypeScript | 69.2% | 86.3% | -17.1 | 0.528 | 0.803 | 6,799 |
+| hyperfine | Rust | 70.0% | 81.3% | +11.3 | 0.625 | 0.801 | 3,794 |
+| hono | TypeScript | 69.2% | 86.3% | +17.1 | 0.528 | 0.803 | 6,799 |
 | zod | TypeScript | 52.9% | (429 rate-limited) | — | 0.535 | — | 7,373 |
 
-> **Analysis:** Reranker adds +10.9pp R@5 on average. Impact is uneven: httpx/cobra
-> gain nothing, mini-redis loses 1.3pp, but hono (-17.1pp) and hyperfine (-11.3pp)
-> regress significantly. TypeScript repos are weakest overall.
+ > **Analysis:** Reranker adds +10.9pp R@5 on average. Impact is uneven: httpx/cobra
+ > gain nothing, mini-redis gains 1.3pp, while hono (+17.1pp) and hyperfine (+11.3pp)
+ > improve the most. TypeScript repos benefit strongly overall.
+ >
 >
 > **Reranker findings (2026-03-22):**
 > - MiniLM-L6-v2 (22M, CPU): **hurts results** (-3.8pp R@5 avg). Demotes code below docs.

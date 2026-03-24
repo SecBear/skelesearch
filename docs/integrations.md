@@ -172,7 +172,6 @@ skelesearch-mcp --http 127.0.0.1:3000
 
 This transport is available in current builds. Use stdio transport only if your
 client lacks Streamable HTTP support.
-the interim.
 
 ---
 
