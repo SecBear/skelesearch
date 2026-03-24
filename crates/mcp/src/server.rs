@@ -25,7 +25,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, IndexResult, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, StorageBackend};
-use skelesearch_embed_fastembed::provider_from_name;
+use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 
 use crate::tools::{
     CallEdgeInfo, ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
@@ -630,8 +630,19 @@ impl SkeleSearchServer {
                 .unwrap_or_else(|| PathBuf::from("/"));
             let config = Config::load(&root).unwrap_or_default();
             let searcher = searcher.with_search_tuning(&config);
-            if config.search.pagerank_boost == Some(false) {
+            let searcher = if config.search.pagerank_boost == Some(false) {
                 searcher.with_pagerank_boost(false)
+            } else {
+                searcher
+            };
+            if config.search.sparse.enabled {
+                match FastEmbedSparseProvider::bgem3() {
+                    Ok(sp) => searcher.with_sparse_provider(Arc::new(sp)),
+                    Err(e) => {
+                        tracing::warn!("sparse provider init failed: {e}, skipping sparse search");
+                        searcher
+                    }
+                }
             } else {
                 searcher
             }
@@ -826,6 +837,17 @@ impl SkeleSearchServer {
                         .with_excludes(config.index.exclude.clone())
                         .with_include_extensions(config.index.include_extensions.clone())
                         .with_scope_prefix(config.index.scope_prefix);
+                    let indexer = if config.search.sparse.enabled {
+                        match FastEmbedSparseProvider::bgem3() {
+                            Ok(sp) => indexer.with_sparse_provider(Arc::new(sp)),
+                            Err(e) => {
+                                tracing::warn!("sparse provider init failed: {e}, skipping sparse indexing");
+                                indexer
+                            }
+                        }
+                    } else {
+                        indexer
+                    };
                     let result = indexer.index_path(&path2).await;
                     result.map(|r| (r, provider))
                 })
@@ -919,6 +941,17 @@ impl SkeleSearchServer {
                     .with_excludes(config.index.exclude.clone())
                     .with_include_extensions(config.index.include_extensions.clone())
                     .with_scope_prefix(config.index.scope_prefix);
+                let indexer = if config.search.sparse.enabled {
+                    match FastEmbedSparseProvider::bgem3() {
+                        Ok(sp) => indexer.with_sparse_provider(Arc::new(sp)),
+                        Err(e) => {
+                            tracing::warn!("sparse provider init failed: {e}, skipping sparse indexing");
+                            indexer
+                        }
+                    }
+                } else {
+                    indexer
+                };
                 indexer.index_path(&path).await
             })
         })

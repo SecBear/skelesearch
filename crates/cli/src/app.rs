@@ -9,7 +9,7 @@ use serde_json::json;
 use skelesearch_core::{
     CozoBackend, Config, EmbedProvider, IndexStats, Indexer, ManifestStore, Searcher, StorageBackend,
 };
-use skelesearch_embed_fastembed::provider_from_name;
+use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 
 use crate::cli::{Cli, Commands};
 use crate::eval;
@@ -160,6 +160,20 @@ where
     P: EmbedProvider + Send + Sync + 'static,
 {
     let config = Config::load(root).unwrap_or_default();
+
+    // Sparse provider: attach if enabled so subsequent with_search_tuning picks
+    // up sparse_weight and callers get the third RRF leg.
+    let searcher = if config.search.sparse.enabled {
+        match FastEmbedSparseProvider::bgem3() {
+            Ok(sp) => searcher.with_sparse_provider(Arc::new(sp)),
+            Err(e) => {
+                tracing::warn!("sparse provider init failed: {e}, skipping sparse search");
+                searcher
+            }
+        }
+    } else {
+        searcher
+    };
 
     // PageRank boost: disabled when config explicitly sets pagerank_boost = false.
     let searcher = match config.search.pagerank_boost {
@@ -327,6 +341,17 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
         .with_include_extensions(config.index.include_extensions.clone())
         .with_symbol_enrichment(config.index.symbol_enrichment)
         .with_scope_prefix(config.index.scope_prefix);
+    let indexer = if config.search.sparse.enabled {
+        match FastEmbedSparseProvider::bgem3() {
+            Ok(sp) => indexer.with_sparse_provider(Arc::new(sp)),
+            Err(e) => {
+                tracing::warn!("sparse provider init failed: {e}, skipping sparse indexing");
+                indexer
+            }
+        }
+    } else {
+        indexer
+    };
     let indexer = if config.index.summarize {
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))

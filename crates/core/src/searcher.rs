@@ -380,6 +380,9 @@ pub struct Searcher<B, P> {
     sparse_weight: f64,
     /// Co-change boost coefficient.  `None` disables the boost (default).
     cochange_boost: Option<f64>,
+    /// When `true`, also search `chunks:doc_index` (doc-comment embeddings)
+    /// and merge via RRF as a second vector leg. Default: `false`.
+    dual_embedding: bool,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
@@ -404,6 +407,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             sparse_provider: None,
             sparse_weight: 0.20,
             cochange_boost: None,
+            dual_embedding: false,
         }
     }
 
@@ -430,6 +434,9 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         self.pagerank_factor = config.search.pagerank_factor();
         if config.search.sparse.enabled {
             self.sparse_weight = config.search.sparse.weight();
+        }
+        if let Some(true) = config.index.dual_embedding {
+            self.dual_embedding = true;
         }
         self.cochange_boost = config.search.cochange_boost;
         self
@@ -463,6 +470,13 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
     /// When not set, the two-way FTS + vector fusion is unchanged.
     pub fn with_sparse_provider(mut self, provider: Arc<dyn SparseEmbedProvider>) -> Self {
         self.sparse_provider = Some(provider);
+        self
+    }
+
+    /// Enable dual-HNSW search: query `chunks:doc_index` in addition to the
+    /// code-embedding index and merge results via RRF.
+    pub fn with_dual_embedding(mut self, enabled: bool) -> Self {
+        self.dual_embedding = enabled;
         self
     }
 
@@ -742,6 +756,49 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                             let fetch_k = hits.len().max(top_k * 2).max(50);
                             match self.backend.sparse_search(&sq, fetch_k).await {
                                 Ok(sparse_hits) if !sparse_hits.is_empty() => {
+                                    // Promote sparse-only hits: fetch their chunk metadata
+                                    // so they participate in RRF fusion alongside hybrid
+                                    // candidates. Without this, documents found ONLY by
+                                    // sparse search are silently dropped.
+                                    let hybrid_keys: std::collections::HashSet<(String, usize)> =
+                                        hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
+                                    // Group sparse-only hits by file to minimise backend calls.
+                                    let mut sparse_only_by_file: std::collections::HashMap<String, Vec<usize>> =
+                                        std::collections::HashMap::new();
+                                    for (fp, ci, _) in &sparse_hits {
+                                        if !hybrid_keys.contains(&(fp.clone(), *ci)) {
+                                            sparse_only_by_file.entry(fp.clone()).or_default().push(*ci);
+                                        }
+                                    }
+                                    if !sparse_only_by_file.is_empty() {
+                                        let fp_refs: Vec<&str> = sparse_only_by_file.keys().map(|s| s.as_str()).collect();
+                                        match self.backend.get_chunks_for_files(&fp_refs).await {
+                                            Ok(chunks) => {
+                                                let needed: std::collections::HashSet<(String, usize)> =
+                                                    sparse_only_by_file.iter()
+                                                        .flat_map(|(fp, idxs)| idxs.iter().map(|&ci| (fp.clone(), ci)))
+                                                        .collect();
+                                                for chunk in chunks {
+                                                    if needed.contains(&(chunk.file_path.clone(), chunk.chunk_idx)) {
+                                                        hits.push(crate::SearchResult {
+                                                            file_path: chunk.file_path,
+                                                            chunk_idx: chunk.chunk_idx,
+                                                            content: chunk.content,
+                                                            start_line: chunk.start_line,
+                                                            end_line: chunk.end_line,
+                                                            chunk_type: chunk.chunk_type,
+                                                            score: 0.0,
+                                                            match_quality: String::new(),
+                                                            why: "sparse".to_string(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(error = %e, "sparse-only chunk fetch failed, dropping sparse-only hits");
+                                            }
+                                        }
+                                    }
                                     hits = apply_sparse_rrf(hits, &sparse_hits, self.sparse_weight);
                                 }
                                 Ok(_) => {} // empty sparse results — keep hybrid order
@@ -768,6 +825,30 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             if let Some(boost) = self.cochange_boost {
                 if boost > 0.0 && !hits.is_empty() {
                     hits = apply_cochange_boost(&*self.backend, hits, boost).await;
+                }
+            }
+
+            // -- Dual HNSW: doc-embedding leg ----------------------------------
+            // When dual_embedding is enabled, search the doc index for this query
+            // and merge via RRF as a second vector leg (weight 0.25 for doc leg).
+            // Falls back gracefully when the doc index is empty or unavailable.
+            if self.dual_embedding && !hits.is_empty() {
+                let doc_fetch_k = hits.len().max(top_k * 2).max(50);
+                match self.backend.doc_vector_search(&query_vec, doc_fetch_k).await {
+                    Ok(doc_hits) if !doc_hits.is_empty() => {
+                        // Convert cosine distance to a score (higher = better) for
+                        // rank-ordering by apply_sparse_rrf.  Cosine dist is in [0, 2];
+                        // clamping at 0.0 ensures non-negative scores.
+                        let doc_scored: Vec<(String, usize, f64)> = doc_hits
+                            .into_iter()
+                            .map(|(fp, ci, dist)| (fp, ci, (1.0_f64 - dist).max(0.0)))
+                            .collect();
+                        hits = apply_sparse_rrf(hits, &doc_scored, 0.25);
+                    }
+                    Ok(_) => {} // doc index empty or not built — skip gracefully
+                    Err(e) => {
+                        tracing::debug!(error = %e, "doc_vector_search failed, skipping doc leg");
+                    }
                 }
             }
 
@@ -1011,7 +1092,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         max_depth: usize,
     ) -> String {
         format!(
-            "q={normalized_query}\nfts={bm25_query}\ntop_k={top_k}\ngraph={include_graph}\ndepth={max_depth}\nunified={}\npagerank_boost={}\nfts_weight={:016x}\ngraph_score_factor={:016x}\ngraph_min_score={:016x}\npagerank_factor={:016x}\nsparse_weight={:016x}\ncochange_boost={:?}",
+            "q={normalized_query}\nfts={bm25_query}\ntop_k={top_k}\ngraph={include_graph}\ndepth={max_depth}\nunified={}\npagerank_boost={}\nfts_weight={:016x}\ngraph_score_factor={:016x}\ngraph_min_score={:016x}\npagerank_factor={:016x}\nsparse_weight={:016x}\ncochange_boost={:?}\ndual_embedding={}",
             self.use_unified_search,
             self.pagerank_boost,
             self.fts_weight.to_bits(),
@@ -1020,6 +1101,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             self.pagerank_factor.to_bits(),
             self.sparse_weight.to_bits(),
             self.cochange_boost,
+            self.dual_embedding,
         )
     }
 
@@ -1979,6 +2061,7 @@ mod tests {
             // embedding [1, 0, 0, 0] has cosine_sim=1.0 with query_vec [1, 0, 0, 0],
             // well above the GRAPH_SIM_THRESHOLD=0.25 gate.
             embedding: Some(vec![1.0_f32, 0.0, 0.0, 0.0]),
+            doc_embedding: None,
         }
     }
 
@@ -2383,5 +2466,108 @@ mod tests {
             "cochange_boost must default to None (disabled)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // apply_sparse_rrf tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: make a SearchResult at a given rank-position with a known score.
+    fn make_sparse_sr(file_path: &str, chunk_idx: usize, score: f64) -> SearchResult {
+        SearchResult {
+            file_path: file_path.to_string(),
+            chunk_idx,
+            content: String::new(),
+            start_line: 1,
+            end_line: 1,
+            chunk_type: "function".to_string(),
+            score,
+            match_quality: String::new(),
+            why: "hybrid".to_string(),
+        }
+    }
+
+    /// 1. Empty sparse_hits: hybrid order must be preserved exactly.
+    #[test]
+    fn sparse_rrf_empty_sparse_hits_preserves_hybrid_order() {
+        let hits = vec![
+            make_sparse_sr("a.rs", 0, 0.9),
+            make_sparse_sr("b.rs", 0, 0.6),
+            make_sparse_sr("c.rs", 0, 0.3),
+        ];
+        let result = super::apply_sparse_rrf(hits, &[], 0.3);
+        let order: Vec<&str> = result.iter().map(|h| h.file_path.as_str()).collect();
+        assert_eq!(
+            order, vec!["a.rs", "b.rs", "c.rs"],
+            "empty sparse hits must preserve hybrid order"
+        );
+    }
+
+    /// 2. A high-ranking sparse hit boosts a lower-ranked hybrid item above a
+    ///    higher-ranked-hybrid-only item.
+    ///
+    ///    Setup: a=hybrid#1 sparse#5, b=hybrid#2 sparse#1.
+    ///    With w_sparse=0.5 the sparse leg dominates enough to lift b above a.
+    #[test]
+    fn sparse_rrf_high_sparse_rank_boosts_lower_hybrid_item() {
+        // a: hybrid rank 1, but sparse rank 9 (last in the list)
+        // b: hybrid rank 2, but sparse rank 1 (best in sparse)
+        // With w_sparse=0.5:
+        //   score_a = 0.5/(60+1) + 0.5/(60+9) = 0.5/61 + 0.5/69 ≈ 0.01545
+        //   score_b = 0.5/(60+2) + 0.5/(60+1) = 0.5/62 + 0.5/61 ≈ 0.01626
+        // b > a, so b should appear first after RRF.
+        let hits = vec![
+            make_sparse_sr("a.rs", 0, 0.9),  // hybrid rank 1
+            make_sparse_sr("b.rs", 0, 0.5),  // hybrid rank 2
+            make_sparse_sr("c.rs", 0, 0.4),
+            make_sparse_sr("d.rs", 0, 0.3),
+            make_sparse_sr("e.rs", 0, 0.2),
+            make_sparse_sr("f.rs", 0, 0.15),
+            make_sparse_sr("g.rs", 0, 0.1),
+            make_sparse_sr("h.rs", 0, 0.05),
+            make_sparse_sr("i.rs", 0, 0.04),  // hybrid rank 9
+        ];
+        let sparse_hits = vec![
+            ("b.rs".to_string(), 0_usize, 1.0_f64),  // sparse rank 1
+            ("c.rs".to_string(), 0_usize, 0.9_f64),
+            ("d.rs".to_string(), 0_usize, 0.8_f64),
+            ("e.rs".to_string(), 0_usize, 0.7_f64),
+            ("f.rs".to_string(), 0_usize, 0.6_f64),
+            ("g.rs".to_string(), 0_usize, 0.5_f64),
+            ("h.rs".to_string(), 0_usize, 0.4_f64),
+            ("i.rs".to_string(), 0_usize, 0.3_f64),
+            ("a.rs".to_string(), 0_usize, 0.1_f64),  // sparse rank 9
+        ];
+        let result = super::apply_sparse_rrf(hits, &sparse_hits, 0.5);
+        let a_pos = result.iter().position(|h| h.file_path == "a.rs").unwrap();
+        let b_pos = result.iter().position(|h| h.file_path == "b.rs").unwrap();
+        assert!(
+            b_pos < a_pos,
+            "b (sparse rank 1) should outrank a (sparse rank 9); b_pos={b_pos}, a_pos={a_pos}"
+        );
+    }
+
+    /// 3. w_sparse=0 behaves as pure hybrid RRF: order must match input order
+    ///    because each item's score is 1.0/(60+hybrid_rank) and hybrid_rank=input_position+1.
+    #[test]
+    fn sparse_rrf_w_sparse_zero_preserves_hybrid_order() {
+        let hits = vec![
+            make_sparse_sr("x.rs", 0, 0.8),
+            make_sparse_sr("y.rs", 0, 0.5),
+            make_sparse_sr("z.rs", 0, 0.2),
+        ];
+        let sparse_hits = vec![
+            ("z.rs".to_string(), 0_usize, 1.0_f64),  // z ranks #1 in sparse
+            ("y.rs".to_string(), 0_usize, 0.9_f64),
+            ("x.rs".to_string(), 0_usize, 0.1_f64),  // x ranks #3 in sparse
+        ];
+        // w_sparse=0 means sparse leg contributes nothing; hybrid order wins.
+        let result = super::apply_sparse_rrf(hits, &sparse_hits, 0.0);
+        let order: Vec<&str> = result.iter().map(|h| h.file_path.as_str()).collect();
+        assert_eq!(
+            order, vec!["x.rs", "y.rs", "z.rs"],
+            "w_sparse=0 must preserve hybrid order; got {order:?}"
+        );
+    }
+
 
 }
