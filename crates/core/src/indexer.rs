@@ -69,6 +69,8 @@ pub struct Indexer<B, P> {
     /// When set, descriptions are embedded instead of raw code, bridging the
     /// vocabulary gap between natural-language queries and source code.
     summary_provider: Option<Box<dyn crate::summary::SummaryProvider>>,
+    /// Prepend AST scope chain to embedding text for structural context.
+    scope_prefix: bool,
 }
 
 impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
@@ -82,6 +84,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             symbol_enrichment: true,
             include_extensions: None,
             summary_provider: None,
+            scope_prefix: false,
         }
     }
 
@@ -96,6 +99,13 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
     /// normalised text.  Enabled by default; disable to benchmark without.
     pub fn with_symbol_enrichment(mut self, enabled: bool) -> Self {
         self.symbol_enrichment = enabled;
+        self
+    }
+
+    /// Enable AST scope-chain prefixes in embedding text.
+    /// Prepends `File: X\nScope: impl Foo > fn bar\nType: code` to each chunk.
+    pub fn with_scope_prefix(mut self, enabled: bool) -> Self {
+        self.scope_prefix = enabled;
         self
     }
 
@@ -447,7 +457,26 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                             desc.clone()
                         } else {
                             let rel_path = &batch_files[*fi].candidate.rel_path;
-                            format!("{} {}\n{}", rel_path, chunk.chunk_type, chunk.content)
+                            if self.scope_prefix {
+                                let scope = build_scope_chain(
+                                    &batch_files[*fi].symbols,
+                                    chunk.start_line,
+                                    chunk.end_line,
+                                );
+                                if scope.is_empty() {
+                                    format!(
+                                        "File: {}\nType: {}\n\n{}",
+                                        rel_path, chunk.chunk_type, chunk.content
+                                    )
+                                } else {
+                                    format!(
+                                        "File: {}\nScope: {}\nType: {}\n\n{}",
+                                        rel_path, scope, chunk.chunk_type, chunk.content
+                                    )
+                                }
+                            } else {
+                                format!("{} {}\n{}", rel_path, chunk.chunk_type, chunk.content)
+                            }
                         }
                     })
                     .collect();
@@ -978,4 +1007,128 @@ fn path_proximity(a: &str, b: &str) -> f64 {
         return 0.5;
     }
     0.3
+}
+
+/// Build a human-readable scope chain from symbols that enclose a chunk's line range.
+///
+/// Returns e.g. `"impl Searcher > fn search"` for a chunk inside a method,
+/// or an empty string for top-level code with no enclosing symbol.
+///
+/// Algorithm:
+/// 1. Find all symbols whose line range fully contains the chunk.
+/// 2. Sort widest (outermost) first.
+/// 3. Join as `"{kind} {name} > ..."` from outer to inner.
+pub(crate) fn build_scope_chain(
+    symbols: &[crate::symbols::SymbolDef],
+    chunk_start: usize,
+    chunk_end: usize,
+) -> String {
+    let mut enclosing: Vec<&crate::symbols::SymbolDef> = symbols
+        .iter()
+        .filter(|s| s.start_line <= chunk_start && s.end_line >= chunk_end)
+        .collect();
+
+    if enclosing.is_empty() {
+        return String::new();
+    }
+
+    // Sort by span width descending (widest/outermost first).
+    enclosing.sort_by_key(|s| std::cmp::Reverse(s.end_line.saturating_sub(s.start_line)));
+
+    enclosing
+        .iter()
+        .map(|s| format!("{} {}", short_kind(&s.kind), &s.name))
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
+/// Map tree-sitter tag kinds to short display forms.
+fn short_kind(kind: &str) -> &str {
+    match kind {
+        "function" => "fn",
+        "method" => "method",
+        "struct" => "struct",
+        "class" => "class",
+        "impl" => "impl",
+        "trait" => "trait",
+        "enum" => "enum",
+        "type" => "type",
+        "interface" => "interface",
+        "module" => "mod",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod scope_chain_tests {
+    use super::build_scope_chain;
+    use crate::symbols::SymbolDef;
+
+    fn sym(name: &str, kind: &str, start: usize, end: usize) -> SymbolDef {
+        SymbolDef {
+            file_path: "test.rs".to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            start_line: start,
+            end_line: end,
+        }
+    }
+
+    #[test]
+    fn empty_symbols() {
+        assert_eq!(build_scope_chain(&[], 5, 10), "");
+    }
+
+    #[test]
+    fn no_enclosing_symbol() {
+        let symbols = vec![sym("search", "function", 20, 50)];
+        assert_eq!(build_scope_chain(&symbols, 5, 10), "");
+    }
+
+    #[test]
+    fn single_enclosing_function() {
+        let symbols = vec![sym("search", "function", 3, 15)];
+        assert_eq!(build_scope_chain(&symbols, 5, 10), "fn search");
+    }
+
+    #[test]
+    fn nested_impl_and_method() {
+        let symbols = vec![
+            sym("Searcher", "impl", 1, 50),
+            sym("do_search", "function", 8, 20),
+        ];
+        assert_eq!(
+            build_scope_chain(&symbols, 10, 15),
+            "impl Searcher > fn do_search"
+        );
+    }
+
+    #[test]
+    fn three_levels_deep() {
+        let symbols = vec![
+            sym("Router", "class", 1, 100),
+            sym("get", "method", 10, 50),
+            sym("helper", "function", 12, 25),
+        ];
+        assert_eq!(
+            build_scope_chain(&symbols, 15, 20),
+            "class Router > method get > fn helper"
+        );
+    }
+
+    #[test]
+    fn partial_overlap_not_enclosing() {
+        // Symbol only partially contains the chunk — should not match.
+        let symbols = vec![sym("search", "function", 10, 20)];
+        assert_eq!(build_scope_chain(&symbols, 5, 15), "");
+    }
+
+    #[test]
+    fn sibling_symbols_only_enclosing_matches() {
+        let symbols = vec![
+            sym("a", "function", 1, 20),
+            sym("b", "function", 25, 40),
+        ];
+        assert_eq!(build_scope_chain(&symbols, 5, 10), "fn a");
+    }
 }

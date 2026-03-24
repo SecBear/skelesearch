@@ -13,7 +13,8 @@
          "env": {
             "SKELESEARCH_RERANKER": "local",
             "SKELESEARCH_RERANKER_MODEL_DIR": "~/.cache/skelesearch/reranker/gte-modernbert-base",
-            "RUST_LOG": "skelesearch=info"
+            "RUST_LOG": "skelesearch=info",
+            "VOYAGE_API_KEY": "pa-TWz-QyAGMNmYNtjQuI6rSKYekynyjl9wiPqO4lIp24V"
          }
       }
    }

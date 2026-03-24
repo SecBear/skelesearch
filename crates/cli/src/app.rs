@@ -275,7 +275,8 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     let indexer = Indexer::new(backend, manifest, provider)
         .with_excludes(config.index.exclude.clone())
         .with_include_extensions(config.index.include_extensions.clone())
-        .with_symbol_enrichment(config.index.symbol_enrichment);
+        .with_symbol_enrichment(config.index.symbol_enrichment)
+        .with_scope_prefix(config.index.scope_prefix);
     let indexer = if config.index.summarize {
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
@@ -568,7 +569,8 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                 let indexer = Indexer::new(backend, manifest, provider)
                     .with_excludes(config.index.exclude.clone())
                     .with_include_extensions(config.index.include_extensions.clone())
-                    .with_symbol_enrichment(config.index.symbol_enrichment);
+                    .with_symbol_enrichment(config.index.symbol_enrichment)
+                    .with_scope_prefix(config.index.scope_prefix);
                 let indexer = if config.index.summarize {
                     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
                         indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))

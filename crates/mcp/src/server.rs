@@ -798,7 +798,8 @@ impl SkeleSearchServer {
                     let config = Config::load(&path2).context("load .skelesearch.toml")?;
                     let indexer = Indexer::new(backend2, manifest, provider.clone())
                         .with_excludes(config.index.exclude.clone())
-                        .with_include_extensions(config.index.include_extensions.clone());
+                        .with_include_extensions(config.index.include_extensions.clone())
+                        .with_scope_prefix(config.index.scope_prefix);
                     let result = indexer.index_path(&path2).await;
                     result.map(|r| (r, provider))
                 })
@@ -890,7 +891,8 @@ impl SkeleSearchServer {
                 let config = Config::load(&path).context("load .skelesearch.toml")?;
                 let indexer = Indexer::new(backend, manifest, provider_for_closure)
                     .with_excludes(config.index.exclude.clone())
-                    .with_include_extensions(config.index.include_extensions.clone());
+                    .with_include_extensions(config.index.include_extensions.clone())
+                    .with_scope_prefix(config.index.scope_prefix);
                 indexer.index_path(&path).await
             })
         })

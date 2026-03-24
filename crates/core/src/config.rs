@@ -27,6 +27,10 @@ pub struct IndexConfig {
     /// vocabulary gap between natural-language queries and source code.
     /// Requires `OPENAI_API_KEY` to be set. Default: `false`.
     pub summarize: bool,
+    /// Prepend AST scope chain (e.g. `impl Foo > fn bar`) to embedding text.
+    /// Gives the embedding model spatial context about where a chunk lives.
+    /// Default: `false`. Set via config or `SKELESEARCH_SCOPE_PREFIX=true`.
+    pub scope_prefix: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +145,7 @@ impl Default for IndexConfig {
             symbol_enrichment: true,
             include_extensions: None,
             summarize: false,
+            scope_prefix: false,
         }
     }
 }
