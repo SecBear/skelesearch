@@ -556,14 +556,40 @@ impl SkeleSearchServer {
                 result.ok().map(|r| -> Box<dyn Reranker> { Box::new(r) })
             });
 
+        // SKELESEARCH_RERANKER=qwen3 enables the Qwen3-Reranker-0.6B.
+        // Requires the `qwen3` cargo feature; emits a warning when the env
+        // var is set but the feature is absent so operators get clear feedback.
+        let reranker = reranker.or_else(|| {
+            if std::env::var("SKELESEARCH_RERANKER").ok().as_deref() != Some("qwen3") {
+                return None;
+            }
+            #[cfg(feature = "qwen3")]
+            {
+                let result = if let Ok(dir) = std::env::var("SKELESEARCH_RERANKER_MODEL_DIR") {
+                    skelesearch_rerank_qwen3::Qwen3Reranker::from_path(std::path::Path::new(&dir))
+                } else {
+                    skelesearch_rerank_qwen3::Qwen3Reranker::from_hf()
+                };
+                return result.ok().map(|r| -> Box<dyn Reranker> { Box::new(r) });
+            }
+            #[cfg(not(feature = "qwen3"))]
+            {
+                tracing::warn!(
+                    "SKELESEARCH_RERANKER=qwen3 set but the `qwen3` feature is not enabled; \
+                     rebuild with --features qwen3"
+                );
+                None
+            }
+        });
+
         if expander.is_some() {
             tracing::info!("query expansion enabled (OPENAI_API_KEY detected)");
         }
         if reranker.is_some() {
-            let source = if std::env::var("SKELESEARCH_RERANKER").ok().filter(|v| v == "local").is_some() {
-                "local ONNX model"
-            } else {
-                "cloud API key"
+            let source = match std::env::var("SKELESEARCH_RERANKER").ok().as_deref() {
+                Some("local") => "local ONNX model",
+                Some("qwen3") => "Qwen3-Reranker-0.6B (ONNX)",
+                _             => "cloud API key",
             };
             tracing::info!(source, "reranking enabled");
         }

@@ -1,0 +1,24 @@
+[package]
+name = "skelesearch-rerank-qwen3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3-Reranker-0.6B (seq-cls ONNX) cross-encoder reranker for skelesearch"
+
+[features]
+default = []
+
+[dependencies]
+skelesearch-core = { path = "../core" }
+ort = { version = "=2.0.0-rc.11", features = ["ndarray"] }
+ndarray = "0.17"              # must match ort's ndarray; workspace uses 0.15 for CozoDB compat
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+hf-hub = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

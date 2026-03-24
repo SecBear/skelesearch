@@ -9,6 +9,7 @@ members = [
    "crates/rerank-api",
    "crates/telemetry",
    "crates/rerank-local",
+   "crates/rerank-qwen3",
 ]
 resolver = "2"
 

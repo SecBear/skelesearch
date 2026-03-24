@@ -210,6 +210,35 @@ where
                     searcher
                 }
             }
+        } else if provider_name == "qwen3" {
+            // Explicit Qwen3-Reranker-0.6B via config.
+            // Requires the `qwen3` cargo feature.
+            #[cfg(feature = "qwen3")]
+            {
+                let result = if let Some(ref dir) = config.search.reranker.model_dir {
+                    skelesearch_rerank_qwen3::Qwen3Reranker::from_path(std::path::Path::new(dir))
+                } else {
+                    skelesearch_rerank_qwen3::Qwen3Reranker::from_hf()
+                };
+                match result {
+                    Ok(r) => {
+                        tracing::info!("Qwen3 reranker enabled");
+                        return searcher.with_reranker(Box::new(r));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Qwen3 reranker failed to load: {e}");
+                        return searcher;
+                    }
+                }
+            }
+            #[cfg(not(feature = "qwen3"))]
+            {
+                tracing::warn!(
+                    "reranker = 'qwen3' in config but the `qwen3` feature is not enabled; \
+                     rebuild with --features qwen3"
+                );
+                searcher
+            }
         } else {
             let key_env = config.search.reranker.api_key_env.as_deref().unwrap_or(
                 match provider_name.as_str() {
@@ -231,6 +260,27 @@ where
             }
         }
     } else {
+        // No explicit config — check SKELESEARCH_RERANKER env var first,
+        // then fall back to API key auto-detect.
+        if std::env::var("SKELESEARCH_RERANKER").ok().as_deref() == Some("qwen3") {
+            #[cfg(feature = "qwen3")]
+            {
+                let result = if let Ok(dir) = std::env::var("SKELESEARCH_RERANKER_MODEL_DIR") {
+                    skelesearch_rerank_qwen3::Qwen3Reranker::from_path(std::path::Path::new(&dir))
+                } else {
+                    skelesearch_rerank_qwen3::Qwen3Reranker::from_hf()
+                };
+                return match result {
+                    Ok(r)  => { tracing::info!("Qwen3 reranker enabled"); searcher.with_reranker(Box::new(r)) }
+                    Err(e) => { tracing::warn!("Qwen3 reranker failed: {e}"); searcher }
+                };
+            }
+            #[cfg(not(feature = "qwen3"))]
+            tracing::warn!(
+                "SKELESEARCH_RERANKER=qwen3 set but the `qwen3` feature is not enabled; \
+                 rebuild with --features qwen3"
+            );
+        }
         // No explicit config — auto-detect from env vars.
         let auto = std::env::var("JINA_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("jina", k))
             .or_else(|| std::env::var("COHERE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("cohere", k)))

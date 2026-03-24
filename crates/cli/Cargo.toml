@@ -13,6 +13,7 @@ path = "src/main.rs"
 watch = ["skelesearch-core/watch"]
 coreml = ["skelesearch-rerank-local/coreml"]
 cuda = ["skelesearch-rerank-local/cuda"]
+qwen3 = ["dep:skelesearch-rerank-qwen3"]
 
 [dependencies]
 skelesearch-core = { path = "../core" }
@@ -20,6 +21,7 @@ skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 skelesearch-embed-openai = { path = "../embed-openai" }
 skelesearch-rerank-api = { path = "../rerank-api" }
 skelesearch-rerank-local = { path = "../rerank-local" }
+skelesearch-rerank-qwen3 = { path = "../rerank-qwen3", optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
