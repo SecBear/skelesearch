@@ -177,8 +177,8 @@ The `hooks/post-edit-reindex` script keeps the index current automatically.
 
 **Wire it into your editor or CI:**
 
-- **Claude Code plugin:** Already configured in `.omp/claude-plugin/plugin.json`
-  via `post_file_edit`. No additional setup needed when using the plugin.
+- **Claude Code plugin:** configure your plugin manifest to run `hooks/post-edit-reindex`
+  via a post-file-edit hook if you want automatic background reindexing.
 - **Other editors:** Point your editor's on-save hook at
   `hooks/post-edit-reindex` in the project root. The script spawns
   `skelesearch index .` in the background and exits immediately; it will not

@@ -86,7 +86,8 @@ Version 1 is intentionally narrow:
 - competitor adapters second
 - starter corpus first, larger eval corpus later
 
-See `.omp/superpowers/plans/2026-03-19-benchmarks-and-eval-infrastructure.md` for the implementation plan.
+Implementation notes for the benchmark framework live in the repository history;
+the public benchmark surface is this directory plus the generated run artifacts.
 
 
 ## Quick eval (development feedback loop)

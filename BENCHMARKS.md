@@ -38,14 +38,11 @@ retrieval-only baselines exist — skelesearch is the first tool measured here.
 |---|---|---|---|---|---|---|---|---|
 | 2026-03-23 | `987c1ec` | voyage-code-3 | 30 (django+astropy cached subset) | 77.8% | 63.3% | 0.794 | 23.6% | quick-bench cached-only sample; avg search 2354ms/query |
 | 2026-03-24 | `c792da8` | voyage-code-3 | 30 (django+astropy cached subset) | 77.8% | 63.3% | 0.800 | 23.6% | overnight run (bearbrick); avg search 2659ms/query |
-**Reference scores (published, full agentic systems):**
-
-| Agent | Context F1 | Efficiency | Source |
-|---|---|---|---|
-| Claude Sonnet 4.5 | 0.344 | 0.658 | ContextBench leaderboard |
-| Devstral 2 | 0.332 | 0.616 | ContextBench leaderboard |
-| GPT-5 | 0.312 | 0.591 | ContextBench leaderboard |
-
+**Important:** ContextBench `File R@5`, `Acc@5`, and `MRR` here are retrieval-only metrics.
+They are **not comparable** to published ContextBench `Context F1` scores for full
+agentic systems, which measure end-to-end generated output quality rather than retrieval.
+Use this section only for skelesearch-vs-skelesearch comparisons unless another tool
+publishes retrieval-only ContextBench numbers.
 ### Internal Eval (240 cases, 6 repos)
 
 Custom benchmark: 40 cases per repo across mini-redis, hyperfine, hono, zod,

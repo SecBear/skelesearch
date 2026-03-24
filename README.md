@@ -4,7 +4,7 @@ Local semantic code search and memory layer for agentic systems.
 
 skelesearch indexes a codebase into chunked embeddings and a full-text index,
 then exposes hybrid (BM25 + vector) search over both CLI and MCP. Designed for
-Claude Code, Codex, OMP/OpenClaw, and any MCP-compatible agent.
+Claude Code, Codex, and any MCP-compatible agent.
 
 ## Why
 
@@ -39,7 +39,7 @@ The index lives in `.skelesearch/` at the project root. Add it to `.gitignore`.
    - **fastembed** (default) — [jina-embeddings-v2-base-code](https://huggingface.co/jinaai/jina-embeddings-v2-base-code)
      (768-dim, code-specialized ONNX model, runs locally via fastembed-rs)
    - **openai** — `text-embedding-3-small` via the OpenAI API (`--provider openai`);
-     requires `OPENAI_API_KEY` env var or `~/.pi/agent/auth.json`
+     requires `OPENAI_API_KEY` in the environment
 
    An **embedding cache** (SQLite-backed, keyed by content hash) skips
    re-embedding unchanged chunks on subsequent runs. The **provider manifest**
