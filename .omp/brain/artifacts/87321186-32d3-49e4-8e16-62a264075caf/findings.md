@@ -1,0 +1,6 @@
+# Findings
+
+Job `87321186-32d3-49e4-8e16-62a264075caf` completed.
+
+- Intent: `Map the complete feature surface of production-grade code search tools for AI coding agents. Focus on: (1) retrieval strategies beyond hybrid BM25+vector — regex/literal search, agentic iterative search, reranking pipelines; (2) scalability patterns — streaming indexing, batched upserts, memory-bounded pipelines, concurrent access; (3) code intelligence features — symbol search, find-definition, find-references, cross-file type resolution, call graphs; (4) operational features — config files, index GC/cleanup, telemetry, crash recovery, debounce/lock-file patterns; (5) agent-specific features — result pagination for token budgets, context window optimization, confidence scoring, search strategy selection (semantic vs exact). Synthesize best practices from Sourcegraph Cody, Cursor, Bloop (archived), Code-Index-MCP, and claude-context.`
+- Artifacts: 1

@@ -30,7 +30,7 @@ crates/
 
 ## Design spec
 
-Full design: `docs/superpowers/specs/2026-03-17-skelesearch-design.md`
+Full design: `.omp/superpowers/specs/2026-03-17-skelesearch-design.md`
 
 Future improvements and deferred research: `docs/future-improvements.md`
 

@@ -177,7 +177,7 @@ The `hooks/post-edit-reindex` script keeps the index current automatically.
 
 **Wire it into your editor or CI:**
 
-- **Claude Code plugin:** Already configured in `.claude-plugin/plugin.json`
+- **Claude Code plugin:** Already configured in `.omp/claude-plugin/plugin.json`
   via `post_file_edit`. No additional setup needed when using the plugin.
 - **Other editors:** Point your editor's on-save hook at
   `hooks/post-edit-reindex` in the project root. The script spawns

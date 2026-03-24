@@ -86,7 +86,7 @@ Version 1 is intentionally narrow:
 - competitor adapters second
 - starter corpus first, larger eval corpus later
 
-See `docs/superpowers/plans/2026-03-19-benchmarks-and-eval-infrastructure.md` for the implementation plan.
+See `.omp/superpowers/plans/2026-03-19-benchmarks-and-eval-infrastructure.md` for the implementation plan.
 
 
 ## Quick eval (development feedback loop)

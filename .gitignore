@@ -14,3 +14,13 @@ benchmarks/tmp/.worktrees
 __pycache__/
 .direnv/
 swebench-repos/
+
+
+# Keep agent-harness artifacts under .omp/ rather than at the repo root.
+/AGENTS.md
+/CLAUDE.md
+/CLAUDE.md.template
+/.claude-plugin/
+/agents/
+/skills/
+/docs/superpowers/
