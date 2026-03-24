@@ -57,6 +57,18 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 | 2026-03-24 | `c792da8` | voyage-code-3 | overnight (bearbrick) | 84.7% | 73.8% | 0.842 | 240 | search quality fixes (barrel/doc penalties). Pre-PER-157 baseline. |
 | 2026-03-23 | `9359eea` | voyage-code-3 | latest main | 84.5% | 73.8% | 0.837 | 240 | after chunk merge, schema migration, intent routing, MCP/server fixes |
 | 2026-03-15 | `e931f51` | voyage-code-3 | voyage-full | 83.3% | — | 0.851 | 240 | pre-Acc@5 baseline |
+
+**PER-157 scope-chain prefix A/B test (fastembed, local, 4 repos):**
+
+| Config | R@5 | MRR | Cases | Notes |
+|---|---|---|---|---|
+| `scope_prefix: false` (default) | 78.4% | 0.719 | 160 | hono/httpx/hyperfine/zod, fastembed |
+| `scope_prefix: true` | 77.1% | 0.719 | 160 | Same repos. R@5 -1.3%, MRR unchanged |
+
+> **Conclusion:** Scope prefixes are neutral-to-slightly-negative with jina-v2-base-code
+> (code-specific model trained on raw code). Feature is gated behind `scope_prefix = true`
+> in config, default off. Needs Voyage eval before enabling by default.
+
 **2026-03-22 per-repo breakdown — true local (no reranker) vs Voyage reranker:**
 
 | Repo | Language | R@5 (local) | R@5 (Voyage) | Δ R@5 | MRR (local) | MRR (Voyage) | ms/40q (local) |
@@ -151,6 +163,9 @@ bun benchmarks/scripts/run-eval.ts \
 
 ## Changelog
 
+- **2026-03-24** — PER-157 scope-chain prefix A/B test (bdfb0ca). fastembed: R@5 78.4%→77.1%
+  (-1.3%), MRR unchanged. Feature gated behind `scope_prefix = true`, default off.
+  Code-specific models (jina-v2-base-code) don't benefit; needs Voyage eval.
 - **2026-03-24** — Overnight run on bearbrick (c792da8). Internal eval: R@5=84.7% (+1.4%),
   MRR=0.842. ContextBench: R@5=77.8%, MRR=0.800. SWE-bench: Acc@5=91.7% (36/50
   completed, 14 timed out during indexing — PER-111). Search quality fixes (barrel/doc
