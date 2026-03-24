@@ -114,7 +114,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             default_top_k: 5,
-            pagerank_boost: None,
+            pagerank_boost: Some(false),
             unified_search: None,
             fts_weight: None,
             graph_score_factor: None,

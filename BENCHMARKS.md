@@ -69,6 +69,13 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 > (code-specific model trained on raw code). Feature is gated behind `scope_prefix = true`
 > in config, default off. Needs Voyage eval before enabling by default.
 
+**PER-120 PageRank ablation (fastembed, 240 cases, 6 repos):**
+
+| Config | R@5 | MRR | Notes |
+|---|---|---|---|
+| pagerank_boost: true (old default) | 81.0% | 0.766 | Hub files promoted above relevant results |
+| pagerank_boost: false (new default) | 81.0% | 0.799 | +3.4pp MRR. No change to R@5. |
+
 **2026-03-22 per-repo breakdown — true local (no reranker) vs Voyage reranker:**
 
 | Repo | Language | R@5 (local) | R@5 (Voyage) | Δ R@5 | MRR (local) | MRR (Voyage) | ms/40q (local) |
@@ -163,6 +170,9 @@ bun benchmarks/scripts/run-eval.ts \
 
 ## Changelog
 
+- **2026-03-24** — PER-120 PageRank ablation (fastembed, 240 cases). R@5 unchanged (81.0%),
+  MRR +3.4pp without PageRank (0.766→0.799). PageRank boost promotes hub files above
+  relevant results. Disabled by default.
 - **2026-03-24** — PER-157 scope-chain prefix A/B test (bdfb0ca). fastembed: R@5 78.4%→77.1%
   (-1.3%), MRR unchanged. Feature gated behind `scope_prefix = true`, default off.
   Code-specific models (jina-v2-base-code) don't benefit; needs Voyage eval.

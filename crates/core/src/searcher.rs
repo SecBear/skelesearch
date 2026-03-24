@@ -306,7 +306,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             provider,
             reranker: None,
             expander: None,
-            pagerank_boost: true,
+            pagerank_boost: false,
             use_unified_search: false,
             fts_weight: 0.55,
             graph_score_factor: 0.3,
