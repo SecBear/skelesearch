@@ -3810,6 +3810,7 @@ dependencies = [
  "skelesearch-embed-openai",
  "skelesearch-rerank-api",
  "skelesearch-rerank-local",
+ "skelesearch-rerank-qwen3",
  "skelesearch-telemetry",
  "tempfile",
  "tokio",
@@ -3924,6 +3925,7 @@ dependencies = [
  "skelesearch-embed-openai",
  "skelesearch-rerank-api",
  "skelesearch-rerank-local",
+ "skelesearch-rerank-qwen3",
  "skelesearch-telemetry",
  "tempfile",
  "tokio",
@@ -3951,6 +3953,22 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dirs 5.0.1",
+ "ndarray 0.17.2",
+ "ort",
+ "skelesearch-core",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "skelesearch-rerank-qwen3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hf-hub",
  "ndarray 0.17.2",
  "ort",
  "skelesearch-core",
