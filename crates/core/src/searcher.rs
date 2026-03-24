@@ -74,6 +74,15 @@ const BOILERPLATE_PREFIXES: &[&str] = &[
     "node version",
     "browser version",
     "package version",
+    "describe the bug",
+    "to reproduce",
+    "actual behavior",
+    "reproduction",
+    "minimal reproduction",
+    "version information",
+    "system information",
+    "what version",
+    "affected version",
 ];
 
 /// Preprocess a verbose query (e.g. GitHub issue description) into a compact
@@ -137,6 +146,20 @@ pub fn preprocess_query(query: &str) -> String {
             }
         }
 
+        // Extract file paths (e.g. src/auth.rs, foo/bar.py:42) as high-signal anchors.
+        // Compiled per call — preprocess_query is not a hot path (once per search).
+        {
+            let path_re = regex::Regex::new(r"[a-zA-Z_][a-zA-Z0-9_/.-]*\.[a-z]{1,4}(?::\d+)?").unwrap();
+            for cap in path_re.find_iter(trimmed) {
+                let path = cap.as_str();
+                if path.contains('/') || path.contains('.') {
+                    let owned = path.to_string();
+                    if !symbols.contains(&owned) {
+                        symbols.push(owned);
+                    }
+                }
+            }
+        }
         lines.push(trimmed);
     }
     // If the query is already short (<40 words), return it with symbols appended.
@@ -160,7 +183,7 @@ pub fn preprocess_query(query: &str) -> String {
     let mut total_words = 0usize;
     for line in &lines {
         let words = line.split_whitespace().count();
-        if total_words + words > 150 { break; }
+        if total_words + words > 100 { break; }
         result.push(line.to_string());
         total_words += words;
     }
@@ -460,7 +483,23 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let expanded_keywords_raw = if let Some(ref expander) = self.expander {
             use crate::router::{classify_query, QueryStrategy};
             if classify_query(&preprocessed) == QueryStrategy::Semantic {
-                expander.expand(&preprocessed).await.unwrap_or_default()
+                // Skip expansion when the query already has 3+ strong anchors
+                // (file paths, snake_case, or camelCase identifiers) — it's already
+                // specific enough that LLM expansion risks semantic drift, not gain.
+                let strong_anchors = preprocessed
+                    .split_whitespace()
+                    .filter(|w| {
+                        w.contains('/') || w.contains('.')
+                            || w.contains('_')
+                            || (w.chars().any(|c| c.is_uppercase())
+                                && w.chars().any(|c| c.is_lowercase()))
+                    })
+                    .count();
+                if strong_anchors < 3 {
+                    expander.expand(&preprocessed).await.unwrap_or_default()
+                } else {
+                    vec![]
+                }
             } else {
                 vec![]
             }
@@ -2009,4 +2048,47 @@ mod tests {
 
         assert_eq!(backend.hybrid_calls(), 2, "expected different retrieval knobs to miss the candidate cache");
     }
+
+    // --- preprocess_query extended tests ---
+
+    #[test]
+    fn preprocess_extracts_file_paths() {
+        let query = "Getting an error in src/auth.rs:42 when handling token refresh";
+        let result = preprocess_query(query);
+        // The file path should be extracted as a BM25 anchor even if truncated from prose.
+        assert!(
+            result.contains("src/auth.rs"),
+            "expected src/auth.rs in result, got: {result}"
+        );
+    }
+
+    #[test]
+    fn preprocess_strips_extended_boilerplate() {
+        let query = "Describe the bug\n\nThe system crashes on login.\n\nTo reproduce\n\n1. Open app\n2. Click login";
+        let result = preprocess_query(query);
+        assert!(
+            !result.to_lowercase().contains("describe the bug"),
+            "boilerplate header must be stripped"
+        );
+        assert!(
+            !result.to_lowercase().contains("to reproduce"),
+            "boilerplate section must be stripped"
+        );
+        // The meaningful prose should survive.
+        assert!(result.contains("system crashes"), "meaningful prose must be kept");
+    }
+
+    #[test]
+    fn preprocess_prioritizes_symbols_over_prose() {
+        // Build a query longer than 100 words so prose gets truncated.
+        let long_prose: String = (0..120_u32)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let query = format!("`MySymbol` and `AnotherSymbol` are critical. {long_prose}");
+        let result = preprocess_query(&query);
+        assert!(result.contains("MySymbol"), "backtick symbol must survive prose truncation");
+        assert!(result.contains("AnotherSymbol"), "backtick symbol must survive prose truncation");
+    }
+
 }

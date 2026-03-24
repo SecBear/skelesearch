@@ -47,6 +47,15 @@ pub fn classify_query(query: &str) -> QueryStrategy {
         return QueryStrategy::Grep;
     }
 
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+
+    // Long query with an embedded file path → route Semantic: the natural-language
+    // context matters for embedding and the path provides BM25 anchor signal.
+    // Must check before the short-query file-path→Grep rule below.
+    if words.len() >= 3 && trimmed.contains('/') && trimmed.contains('.') {
+        return QueryStrategy::Semantic;
+    }
+
     // File path pattern: slash-separated or common code extensions.
     if trimmed.contains('/')
         || trimmed.ends_with(".rs")
@@ -58,8 +67,6 @@ pub fn classify_query(query: &str) -> QueryStrategy {
     {
         return QueryStrategy::Grep;
     }
-
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
 
     // Single-token identifier: camelCase, snake_case, or SCREAMING_CASE.
     if words.len() == 1 {
@@ -78,6 +85,20 @@ pub fn classify_query(query: &str) -> QueryStrategy {
         }
     }
 
+    // Two-word identifier queries (e.g. "ConnectionPool retry", "AuthMiddleware validate") —
+    // conceptual keyword searches best served by embedding, not exact match.
+    if words.len() == 2 {
+        // Route Semantic when at least one word is a named identifier (camelCase or
+        // snake_case). Two plain lowercase words ("hello world") stay as Grep.
+        let has_identifier = words.iter().any(|w| {
+            w.contains('_')
+                || (w.chars().any(|c| c.is_uppercase()) && w.chars().any(|c| c.is_lowercase()))
+        });
+        if has_identifier {
+            return QueryStrategy::Semantic;
+        }
+    }
+
     // Natural-language indicators: 3+ words where at least one is a stop word.
     let nl = [
         "how", "what", "where", "why", "when", "does", "is", "are", "the", "this", "that",
@@ -93,4 +114,44 @@ pub fn classify_query(query: &str) -> QueryStrategy {
 
     // 1-2 plain words → treat as identifier/keyword → exact match.
     QueryStrategy::Grep
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_query, QueryStrategy};
+
+    #[test]
+    fn two_identifier_words_route_semantic() {
+        // Both words carry identifier markers — conceptual keyword search, not grep.
+        assert_eq!(classify_query("ConnectionPool retry"), QueryStrategy::Semantic);
+        assert_eq!(classify_query("AuthMiddleware validate"), QueryStrategy::Semantic);
+    }
+
+    #[test]
+    fn two_plain_words_route_grep() {
+        // Two plain lowercase words with no identifier markers → exact match.
+        assert_eq!(classify_query("hello world"), QueryStrategy::Grep);
+    }
+
+    #[test]
+    fn long_query_with_filepath_routes_semantic() {
+        // Natural-language query embedding a file path → Semantic.
+        assert_eq!(
+            classify_query("error in src/auth.rs when handling tokens"),
+            QueryStrategy::Semantic,
+        );
+    }
+
+    #[test]
+    fn single_camel_case_still_routes_grep() {
+        // Existing invariant: single identifier token → Grep.
+        assert_eq!(classify_query("EmbedProvider"), QueryStrategy::Grep);
+    }
+
+    #[test]
+    fn single_filepath_routes_grep() {
+        // A bare file path (no surrounding prose) → Grep.
+        assert_eq!(classify_query("src/auth.rs"), QueryStrategy::Grep);
+    }
 }
