@@ -276,6 +276,17 @@ pub struct SymbolRow {
     pub end_line: usize,
 }
 
+/// A caller or callee edge from the function-level call graph.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CallEdgeInfo {
+    /// File containing the caller/callee.
+    pub file_path: String,
+    /// Function/method name.
+    pub symbol: String,
+    /// Resolution confidence (1.0 = import-resolved, 0.3 = name-only).
+    pub confidence: f64,
+}
+
 /// Input for the `find_impact_set` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindImpactSetInput {
@@ -306,8 +317,12 @@ pub struct ImpactSetOutput {
     pub transitive_importers: Vec<ImpactEntry>,
     /// Test files that (transitively) import this file.
     pub affected_tests: Vec<String>,
+    /// Function-level callers from the call graph (higher precision than file-level importers).
+    /// Currently always empty; populated per-symbol via get_symbol_context.
+    // TODO(PER-144): wire get_callers for a specific file's exported symbols once
+    // a "get all callers for file" query exists in StorageBackend.
+    pub function_callers: Vec<CallEdgeInfo>,
 }
-
 /// Input for the `find_test_context` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindTestContextInput {
@@ -371,6 +386,10 @@ pub struct SymbolContextOutput {
     pub test_files: Vec<String>,
     /// Symbol role classification.
     pub role: Option<String>,
+    /// Functions that call this symbol (from function-level call graph, capped at 20).
+    pub callers: Vec<CallEdgeInfo>,
+    /// Functions this symbol calls (capped at 20, resolved callees only).
+    pub callees: Vec<CallEdgeInfo>,
 }
 
 // ---------------------------------------------------------------------------

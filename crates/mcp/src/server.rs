@@ -28,7 +28,7 @@ use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, Embed
 use skelesearch_embed_fastembed::provider_from_name;
 
 use crate::tools::{
-    ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
+    CallEdgeInfo, ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
     GetFileContextInput, GetRepoMapInput, GetSymbolContextInput, GrepSearchRow, ImpactEntry,
     ImpactSetOutput, IndexCodebaseInput, IndexCodebaseOutput, IndexingProgress, IndexStatusInput,
     IndexStatusOutput, SearchCodeInput, SearchCodeResponse, SearchCodeRow, SmartSearchInput,
@@ -1223,7 +1223,63 @@ impl SkeleSearchServer {
                 })
             }
             "trace" => {
-                Err(anyhow::anyhow!("trace intent not yet implemented"))
+                if input.symbols.len() < 2 {
+                    return Err(anyhow::anyhow!(
+                        "trace intent requires exactly 2 symbols: [start, end]"
+                    ));
+                }
+                let start_name = input.symbols[0].clone();
+                let end_name = input.symbols[1].clone();
+
+                let (trace_backend, _) = self.resolve_backend(input.project.as_deref()).await?;
+                let start_syms = trace_backend.find_symbols(&start_name, None).await.unwrap_or_default();
+                let end_syms = trace_backend.find_symbols(&end_name, None).await.unwrap_or_default();
+
+                let trace_info = if let (Some(s), Some(e)) = (start_syms.first(), end_syms.first()) {
+                    let start_callees = trace_backend.get_callees(&s.file_path, &s.name).await.unwrap_or_default();
+                    let end_callers = trace_backend.get_callers(&e.file_path, &e.name).await.unwrap_or_default();
+
+                    // Direct connection: does start directly call end?
+                    let direct = start_callees.iter().any(|c| {
+                        c.callee_file.as_deref() == Some(e.file_path.as_str())
+                            && c.callee_symbol.as_deref() == Some(e.name.as_str())
+                    });
+                    if direct {
+                        format!("{} directly calls {}", start_name, end_name)
+                    } else {
+                        // One-hop: start calls X, X calls end?
+                        let start_callee_keys: std::collections::HashSet<(String, String)> = start_callees
+                            .iter()
+                            .filter_map(|c| Some((c.callee_file.clone()?, c.callee_symbol.clone()?)))
+                            .collect();
+                        let intermediaries: Vec<String> = end_callers
+                            .iter()
+                            .filter(|c| start_callee_keys.contains(&(c.caller_file.clone(), c.caller_symbol.clone())))
+                            .take(5)
+                            .map(|c| format!("{}::{}", c.caller_file, c.caller_symbol))
+                            .collect();
+                        if !intermediaries.is_empty() {
+                            format!("{} -> [{}] -> {}", start_name, intermediaries.join(", "), end_name)
+                        } else {
+                            format!("No direct or 1-hop call path found between {} and {}", start_name, end_name)
+                        }
+                    }
+                } else {
+                    format!("Could not resolve symbols: '{}' and/or '{}'", start_name, end_name)
+                };
+
+                Ok(SmartSearchOutput {
+                    strategy: "trace".to_string(),
+                    results: SmartSearchResults::Semantic(vec![SearchCodeRow {
+                        file_path: String::new(),
+                        start_line: 0,
+                        end_line: 0,
+                        content: trace_info,
+                        score: 1.0,
+                        match_quality: "high".to_string(),
+                        why: "trace".to_string(),
+                    }]),
+                })
             }
             other => {
                 Err(anyhow::anyhow!(
@@ -1284,6 +1340,8 @@ impl SkeleSearchServer {
                     imports_truncated: false,
                     test_files: vec![],
                     role: None,
+                    callers: vec![],
+                    callees: vec![],
                 });
             }
             Err(e) => return Err(e),
@@ -1304,6 +1362,8 @@ impl SkeleSearchServer {
                     imports_truncated: false,
                     test_files: vec![],
                     role: None,
+                    callers: vec![],
+                    callees: vec![],
                 });
             }
         };
@@ -1336,6 +1396,22 @@ impl SkeleSearchServer {
             .get_importers(&sym.file_path)
             .await
             .unwrap_or_default();
+
+        // Step 3b: function-level call graph edges.
+        let callers_raw = backend.get_callers(&sym.file_path, &sym.name).await.unwrap_or_default();
+        let callees_raw = backend.get_callees(&sym.file_path, &sym.name).await.unwrap_or_default();
+        let callers: Vec<CallEdgeInfo> = callers_raw.iter().take(20).map(|e| CallEdgeInfo {
+            file_path: e.caller_file.clone(),
+            symbol: e.caller_symbol.clone(),
+            confidence: e.confidence,
+        }).collect();
+        let callees: Vec<CallEdgeInfo> = callees_raw.iter().take(20).filter_map(|e| {
+            // Only include resolved callees (callee_file + callee_symbol must be present).
+            let file_path = e.callee_file.clone()?;
+            let symbol = e.callee_symbol.clone()?;
+            if file_path.is_empty() { return None; }
+            Some(CallEdgeInfo { file_path, symbol, confidence: e.confidence })
+        }).collect();
 
         // Step 4: filter importers to test files when requested and cap lists for token efficiency.
         let test_files_raw: Vec<String> = if input.include_tests {
@@ -1377,6 +1453,8 @@ impl SkeleSearchServer {
             imports_truncated,
             test_files,
             role,
+            callers,
+            callees,
         })
     }
 
@@ -1413,6 +1491,7 @@ impl SkeleSearchServer {
             direct_importers: direct,
             transitive_importers: transitive,
             affected_tests: tests,
+            function_callers: vec![],
         })
     }
 
