@@ -20,15 +20,10 @@ comparable to published Voyage/OpenAI/Jina scores on the MTEB leaderboard.
 |---|---|---|---|---|---|---|
 | 2026-03-18 | `6b53d61` | fastembed (jina-v2-base-code, 768d) | CoSQA | 0.442 | 0.742 | First run on bearbrick (NixOS, 7800X3D) |
 
-**Reference scores (published, same CoSQA task):**
-
-| Model | nDCG@10 | Source |
-|---|---|---|
-| SFR-Embedding-Code-2B (Salesforce) | 0.363 | CoIR paper (ACL 2025) |
-| Voyage-Code-002 | ~0.298 | MTEB leaderboard |
-| OpenAI Ada-002 | ~0.289 | MTEB leaderboard |
-| BGE-Base-en-v1.5 | ~0.253 | MTEB leaderboard |
-
+**Note:** This section records skelesearch's measured CoSQA score for its current
+embedding setup. Published leaderboard comparisons age quickly as providers ship new
+models, so treat the absolute score as the durable signal unless the compared models
+and evaluation setup are explicitly refreshed in the same commit.
 ### ContextBench — retrieval-only mode
 
 Measures file/line retrieval quality on real GitHub issues. No published

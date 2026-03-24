@@ -12,7 +12,7 @@
 **Do not report security vulnerabilities through public GitHub issues.**
 
 Instead, please report via
-[GitHub Security Advisories](https://github.com/golden-neuron/skelesearch/security/advisories/new)
+[GitHub Security Advisories](https://github.com/SecBear/skelesearch/security/advisories/new)
 with:
 
 - Description of the vulnerability

@@ -45,7 +45,7 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported via [GitHub Issues](https://github.com/golden-neuron/skelesearch/issues) or by
+reported via [GitHub Issues](https://github.com/SecBear/skelesearch/issues) or by
 contacting the project maintainers directly.
 
 All complaints will be reviewed and investigated promptly and fairly.

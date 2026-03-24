@@ -5,10 +5,9 @@ process for contributing and the standards we maintain.
 
 ## Project overview
 
-skelesearch is a local-first, zero-dependency, graph-aware semantic code search
-tool. It ships as a Rust workspace with four crates: `skelesearch-core` (engine),
-`skelesearch-embed-fastembed` (default embedding provider), `skelesearch-cli`
-(command-line interface), and `skelesearch-mcp` (MCP server for AI coding agents).
+skelesearch is a local-first, graph-aware semantic code search tool with no
+required hosted service by default. It ships as a Rust workspace with core,
+embedding provider, reranker, telemetry, CLI, and MCP server crates.
 
 ## Getting started
 
@@ -70,7 +69,7 @@ rustup component add clippy rustfmt
 | `skelesearch-core` | Storage, indexing, search, chunking, manifest |
 | `skelesearch-embed-fastembed` | Default embedding provider (jina-v2-base-code) |
 | `skelesearch-cli` | CLI binary with clap subcommands |
-| `skelesearch-mcp` | MCP server with rmcp 0.16 |
+| `skelesearch-mcp` | MCP server with rmcp 1.2 |
 
 ### Documentation
 

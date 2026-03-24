@@ -74,50 +74,86 @@ Recommended workflow:
 > versions. If the above doesn't work, check the [Codex documentation](https://platform.openai.com/docs/guides/codex)
 > for the current MCP configuration schema.
 
----
+## 3. Custom MCP host (stdio)
 
-## 3. OpenClaw / OMP
 
-Use the global MCP config at `~/.omp/agent/mcp.json` when you want skelesearch
-available to all OMP sessions across directories.
 
-Recommended install:
+For any MCP host that launches tools as local subprocesses, configure
+`skelesearch-mcp` as a stdio server and pass environment variables through the
+host's normal MCP config mechanism.
+
+
+
+Example install:
+
 ```bash
+
 cargo install --path crates/mcp --root ~/.local --force --features storage-rocksdb
+
 # or use the helper script
+
 ./scripts/install-mcp.sh
+
 ```
 
-Recommended global config:
+
+
+Example MCP entry:
+
 ```json
+
 {
+
   "mcpServers": {
+
     "skelesearch": {
+
       "command": "skelesearch-mcp",
+
       "env": {
+
         "VOYAGE_API_KEY": "<set-me>",
-        "SKELESEARCH_RERANKER": "local",
-        "SKELESEARCH_RERANKER_MODEL_DIR": "~/.cache/skelesearch/reranker/gte-modernbert-base",
+
         "RUST_LOG": "skelesearch=info"
+
       }
+
     }
+
   }
+
 }
+
 ```
+
+
 
 Workflow:
+
 1. Install or rebuild the MCP binary
-2. Update `~/.omp/agent/mcp.json`
-3. Restart OMP
+
+2. Update your host's MCP config
+
+3. Restart the host
+
 4. skelesearch will auto-index on startup when needed (unless `SKELESEARCH_NO_AUTO_INDEX` is set)
 
+
+
 Tool recommendations:
+
 - **`search_code`** — primary default for semantic code retrieval.
+
 - **`find_symbol`** — precise definition lookup. Pass `kind` to narrow
   to a specific symbol type (e.g. `"struct"`, `"function"`, `"trait"`).
+
 - **`get_symbol_info`** — best one-call context bundle for a known symbol.
+
 - **`get_repo_map`** — fastest structural overview when you need repo shape before querying.
 
+
+
+---
 ---
 
 ## 4. HTTP transport (generic)
