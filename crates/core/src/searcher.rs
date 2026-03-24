@@ -378,6 +378,8 @@ pub struct Searcher<B, P> {
     /// RRF weight for the sparse leg when sparse is active. Default: 0.20.
     /// Hybrid (FTS + vector) leg receives `1.0 - sparse_weight`.
     sparse_weight: f64,
+    /// Co-change boost coefficient.  `None` disables the boost (default).
+    cochange_boost: Option<f64>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
@@ -401,6 +403,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             ),
             sparse_provider: None,
             sparse_weight: 0.20,
+            cochange_boost: None,
         }
     }
 
@@ -428,6 +431,15 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         if config.search.sparse.enabled {
             self.sparse_weight = config.search.sparse.weight();
         }
+        self.cochange_boost = config.search.cochange_boost;
+        self
+    }
+
+    /// Apply a co-change ranking boost: files that frequently co-change with
+    /// top-ranked results receive a score uplift of `boost * jaccard_score`.
+    /// Pass `0.0` to disable (same as `None` default).
+    pub fn with_cochange_boost(mut self, boost: f64) -> Self {
+        self.cochange_boost = if boost > 0.0 { Some(boost) } else { None };
         self
     }
 
@@ -749,6 +761,16 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 }
             }
 
+            // -- Co-change boost -------------------------------------------
+            // Files that frequently co-change with top-3 results get a mild
+            // score uplift before the candidate set is cached.  Skip when
+            // disabled (None) or when there are no results to examine.
+            if let Some(boost) = self.cochange_boost {
+                if boost > 0.0 && !hits.is_empty() {
+                    hits = apply_cochange_boost(&*self.backend, hits, boost).await;
+                }
+            }
+
             self.candidate_cache
                 .lock()
                 .expect("candidate_cache mutex poisoned")
@@ -989,7 +1011,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         max_depth: usize,
     ) -> String {
         format!(
-            "q={normalized_query}\nfts={bm25_query}\ntop_k={top_k}\ngraph={include_graph}\ndepth={max_depth}\nunified={}\npagerank_boost={}\nfts_weight={:016x}\ngraph_score_factor={:016x}\ngraph_min_score={:016x}\npagerank_factor={:016x}\nsparse_weight={:016x}",
+            "q={normalized_query}\nfts={bm25_query}\ntop_k={top_k}\ngraph={include_graph}\ndepth={max_depth}\nunified={}\npagerank_boost={}\nfts_weight={:016x}\ngraph_score_factor={:016x}\ngraph_min_score={:016x}\npagerank_factor={:016x}\nsparse_weight={:016x}\ncochange_boost={:?}",
             self.use_unified_search,
             self.pagerank_boost,
             self.fts_weight.to_bits(),
@@ -997,6 +1019,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             self.graph_min_score.to_bits(),
             self.pagerank_factor.to_bits(),
             self.sparse_weight.to_bits(),
+            self.cochange_boost,
         )
     }
 
@@ -1173,6 +1196,64 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         Ok(hits)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Co-change ranking boost
+// ---------------------------------------------------------------------------
+
+/// Boost scores of results that co-change with the top-3 files in `hits`.
+///
+/// For each of the top-3 distinct file paths, we query co-change neighbors.
+/// Any result whose file appears as a neighbor receives a score uplift of
+/// `boost_factor * jaccard_score`; when a file is a neighbor of multiple top-3
+/// files the maximum uplift wins.  Results are re-sorted by the boosted score.
+///
+/// Backend errors (e.g. missing `cochange_edges` relation) degrade gracefully:
+/// the original hits are returned unchanged.
+pub(crate) async fn apply_cochange_boost<B: StorageBackend>(
+    backend: &B,
+    mut hits: Vec<SearchResult>,
+    boost_factor: f64,
+) -> Vec<SearchResult> {
+    // Collect top-3 unique file paths in ranked order.
+    let top_files: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        hits.iter()
+            .map(|h| h.file_path.clone())
+            .filter(|fp| seen.insert(fp.clone()))
+            .take(3)
+            .collect()
+    };
+
+    // Accumulate the best (max) boost per candidate file across all top-3 seeds.
+    let mut file_boost: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for top_file in &top_files {
+        let neighbors = backend
+            .get_cochange_neighbors(top_file, 0.0)
+            .await
+            .unwrap_or_default();
+        for (neighbor, jaccard) in neighbors {
+            let entry = file_boost.entry(neighbor).or_insert(0.0);
+            let candidate = boost_factor * jaccard;
+            if candidate > *entry {
+                *entry = candidate;
+            }
+        }
+    }
+
+    if file_boost.is_empty() {
+        return hits;
+    }
+
+    for hit in &mut hits {
+        if let Some(&b) = file_boost.get(&hit.file_path) {
+            hit.score += b;
+        }
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits
+}
+
 
 // ---------------------------------------------------------------------------
 // MMR re-ranking
@@ -2197,6 +2278,110 @@ mod tests {
         let result = preprocess_query(&query);
         assert!(result.contains("MySymbol"), "backtick symbol must survive prose truncation");
         assert!(result.contains("AnotherSymbol"), "backtick symbol must survive prose truncation");
+    }
+
+
+    // -----------------------------------------------------------------------
+    // co-change boost tests
+    // -----------------------------------------------------------------------
+
+    use crate::schema::{FileRecord, EdgeRecord, RepoMapData, CallEdge};
+
+    /// Minimal backend with a fixed co-change neighbour table for testing.
+    /// All other methods are no-ops; only `get_cochange_neighbors` is overridden.
+    struct MockCochangeBackend;
+
+    #[async_trait]
+    impl StorageBackend for MockCochangeBackend {
+        async fn initialize(&self, _d: usize) -> anyhow::Result<()> { Ok(()) }
+        async fn upsert_file(&self, _r: &FileRecord) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_chunks_for_file(&self, _p: &str) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
+        async fn get_chunks_for_files(&self, _ps: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
+        async fn upsert_edges(&self, _e: &[EdgeRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn traverse_imports(&self, _p: &str, _d: usize, _t: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
+        async fn traverse_importers(&self, _p: &str, _d: usize, _t: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
+        async fn hybrid_search(&self, _v: &[f32], _q: &str, _k: usize) -> anyhow::Result<Vec<SearchResult>> { Ok(vec![]) }
+        async fn stats(&self) -> anyhow::Result<IndexStats> { Ok(IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None, watching: false, estimated_stale: 0 }) }
+        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn find_symbols(&self, _n: &str, _k: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> { Ok(vec![]) }
+        async fn get_chunk_embeddings(&self, _ks: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
+        async fn compute_pagerank(&self, _t: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
+        async fn get_file_ranks(&self, _fps: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
+        async fn compute_symbol_roles(&self) -> anyhow::Result<()> { Ok(()) }
+        async fn get_symbol_roles(&self, _fps: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> { Ok(Default::default()) }
+        async fn upsert_cochange_edges(&self, _pairs: &[crate::cochange::CoChangePair]) -> anyhow::Result<()> { Ok(()) }
+        async fn hnsw_neighbors(&self, _s: &[(String, usize)], _d: f64, _l: usize) -> anyhow::Result<Vec<(String, usize, f64)>> { Ok(vec![]) }
+        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
+        async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData> { Ok(RepoMapData { files: vec![], import_edges: vec![] }) }
+        async fn upsert_call_edges(&self, _e: &[CallEdge]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_call_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_callers(&self, _fp: &str, _sn: &str) -> anyhow::Result<Vec<CallEdge>> { Ok(vec![]) }
+        async fn get_callees(&self, _fp: &str, _sn: &str) -> anyhow::Result<Vec<CallEdge>> { Ok(vec![]) }
+
+        /// "a.rs" co-changes with "b.rs" at Jaccard 0.8.
+        async fn get_cochange_neighbors(&self, file_path: &str, _min_score: f64) -> anyhow::Result<Vec<(String, f64)>> {
+            if file_path == "a.rs" {
+                Ok(vec![("b.rs".to_string(), 0.8)])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    fn make_sr(file_path: &str, score: f64) -> SearchResult {
+        SearchResult {
+            file_path: file_path.to_string(),
+            chunk_idx: 0,
+            content: String::new(),
+            start_line: 1,
+            end_line: 1,
+            chunk_type: "function".to_string(),
+            score,
+            match_quality: String::new(),
+            why: "hybrid".to_string(),
+        }
+    }
+
+    /// The boost is: `boost_factor * jaccard` added to the matching file's score.
+    /// With a.rs at the top, b.rs should gain `0.1 * 0.8 = 0.08`.
+    #[tokio::test]
+    async fn cochange_boost_applies_jaccard_uplift() {
+        let hits = vec![make_sr("a.rs", 0.5), make_sr("b.rs", 0.3), make_sr("c.rs", 0.1)];
+        let backend = MockCochangeBackend;
+        let result = super::apply_cochange_boost(&backend, hits, 0.1).await;
+
+        let b = result.iter().find(|h| h.file_path == "b.rs").unwrap();
+        let expected = 0.3 + 0.1 * 0.8;
+        assert!(
+            (b.score - expected).abs() < 1e-12,
+            "b.rs score should be {expected} but got {}", b.score
+        );
+        // c.rs has no co-change relation and must be unchanged.
+        let c = result.iter().find(|h| h.file_path == "c.rs").unwrap();
+        assert!((c.score - 0.1).abs() < 1e-12, "c.rs score must be unchanged");
+        // a.rs is the seed; it should NOT be boosted by its own co-change data.
+        let a = result.iter().find(|h| h.file_path == "a.rs").unwrap();
+        assert!((a.score - 0.5).abs() < 1e-12, "a.rs (seed) score must be unchanged");
+    }
+
+    /// When cochange_boost is None the Searcher field is None, so apply_cochange_boost
+    /// is never called.  We verify this property at the field level.
+    #[test]
+    fn cochange_boost_none_by_default() {
+        let backend = Arc::new(MockCochangeBackend);
+        let searcher = Searcher::new(backend, MockProvider);
+        assert!(
+            searcher.cochange_boost.is_none(),
+            "cochange_boost must default to None (disabled)"
+        );
     }
 
 }

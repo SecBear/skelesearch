@@ -192,6 +192,13 @@ pub trait StorageBackend: Send + Sync {
     async fn get_symbol_roles(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>>;
     /// Upsert co-change pairs derived from git history.
     async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()>;
+    /// Return co-change neighbors of `file_path` with Jaccard similarity >= `min_score`.
+    /// Returns `(neighbor_file_path, jaccard)` pairs sorted by jaccard descending.
+    /// No-op on backends that have not indexed co-change data.
+    async fn get_cochange_neighbors(&self, _file_path: &str, _min_score: f64) -> anyhow::Result<Vec<(String, f64)>> {
+        Ok(vec![])
+    }
+
     /// Walk the HNSW proximity graph at layer 0 to find vector-similar chunks
     /// without re-embedding. Returns `(file_path, chunk_idx, distance)` tuples
     /// for neighbors of any seed chunk within `max_dist` (cosine distance;
@@ -1644,6 +1651,37 @@ impl StorageBackend for CozoBackend {
         Ok(())
     }
 
+    async fn get_cochange_neighbors(&self, file_path: &str, min_score: f64) -> anyhow::Result<Vec<(String, f64)>> {
+        let mut p = BTreeMap::new();
+        p.insert("path".into(), Self::dv_str(file_path));
+        // Pairs are stored with file_a < file_b (alphabetical normalisation in cochange.rs),
+        // so we probe both column positions to retrieve all co-changing partners.
+        let rows = match self.run_imm(
+            "q[partner, jaccard] := *cochange_edges[path, partner, _, jaccard], path = $path\n\
+             q[partner, jaccard] := *cochange_edges[partner, path, _, jaccard], path = $path\n\
+             ?[partner, max(jaccard)] := q[partner, jaccard]",
+            p,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // cochange_edges may be absent on older indexes that predate co-change indexing.
+                tracing::debug!(error = %e, "get_cochange_neighbors: query failed (relation may not exist)");
+                return Ok(vec![]);
+            }
+        };
+        let mut result: Vec<(String, f64)> = rows
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let partner = Self::str_col(&r[0]).ok()?;
+                let jaccard = Self::float_col(&r[1]).ok()?;
+                if jaccard >= min_score { Some((partner, jaccard)) } else { None }
+            })
+            .collect();
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(result)
+    }
+
     async fn upsert_call_edges(&self, edges: &[CallEdge]) -> anyhow::Result<()> {
         if edges.is_empty() {
             return Ok(());
@@ -2510,6 +2548,10 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
 
     async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()> {
         (**self).upsert_cochange_edges(pairs).await
+    }
+
+    async fn get_cochange_neighbors(&self, file_path: &str, min_score: f64) -> anyhow::Result<Vec<(String, f64)>> {
+        (**self).get_cochange_neighbors(file_path, min_score).await
     }
 
     async fn hnsw_neighbors(

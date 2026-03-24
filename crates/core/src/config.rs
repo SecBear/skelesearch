@@ -56,6 +56,12 @@ pub struct SearchConfig {
     /// PageRank linear boost coefficient: 1.0 + factor * pr. Default: 0.1.
     pub pagerank_factor: Option<f64>,
 
+    /// Co-change ranking boost coefficient.  When set and > 0, files that frequently
+    /// co-change with top-ranked results receive a score uplift of
+    /// `cochange_boost * jaccard_score`. Default: `None` (disabled).
+    #[serde(default)]
+    pub cochange_boost: Option<f64>,
+
     // -- Sub-configs -------------------------------------------------------
 
     /// Reranker configuration.
@@ -155,6 +161,7 @@ impl Default for SearchConfig {
             expansion: ExpansionConfig::default(),
             graph: GraphConfig::default(),
             sparse: SparseConfig::default(),
+            cochange_boost: None,
         }
     }
 }
