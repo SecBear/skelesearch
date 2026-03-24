@@ -49,6 +49,22 @@ pub struct EdgeRecord {
     pub edge_type: String,
 }
 
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallEdge {
+    pub caller_file: String,
+    pub caller_symbol: String,
+    pub callee_name: String,
+    pub start_line: usize,
+    /// `None` when the callee could not be resolved to a specific file.
+    pub callee_file: Option<String>,
+    /// `None` when the callee could not be resolved to a specific symbol.
+    pub callee_symbol: Option<String>,
+    /// Extraction confidence in [0.0, 1.0].
+    pub confidence: f64,
+    /// `true` for computed/dynamic dispatch (virtual, trait-object, etc.).
+    pub dynamic: bool,
+}
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub file_path: String,
@@ -219,6 +235,11 @@ pub trait StorageBackend: Send + Sync {
     /// Fetch all data needed for a compact repo map in minimal round-trips.
     /// Returns files with their symbols and roles, plus file-level import edges.
     async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData>;
+
+    async fn upsert_call_edges(&self, edges: &[CallEdge]) -> anyhow::Result<()>;
+    async fn delete_call_edges_for_file(&self, file_path: &str) -> anyhow::Result<()>;
+    async fn get_callers(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>>;
+    async fn get_callees(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +429,14 @@ impl CozoBackend {
             other => anyhow::bail!("expected Int, got {:?}", other),
         }
     }
+
+    fn float_col(dv: &DataValue) -> anyhow::Result<f64> {
+        match dv {
+            DataValue::Num(cozo::Num::Float(f)) => Ok(*f),
+            DataValue::Num(cozo::Num::Int(n)) => Ok(*n as f64),
+            other => anyhow::bail!("expected Float, got {:?}", other),
+        }
+    }
     /// Run FTS only and return raw tuples:
     /// `(file_path, chunk_idx, bm25_score, content, chunk_type, start_line, end_line)`.
     /// Results are ordered by bm25 score descending.
@@ -533,6 +562,24 @@ impl CozoBackend {
             .collect()
     }
 
+
+    /// Parse a row from `call_edges` into a `CallEdge`.
+    /// Columns: caller_file(0), caller_symbol(1), callee_name(2), start_line(3),
+    ///          callee_file(4), callee_symbol(5), confidence(6), dynamic(7).
+    fn parse_call_edge(row: &[DataValue]) -> anyhow::Result<CallEdge> {
+        let callee_file_raw = Self::str_col(&row[4])?;
+        let callee_symbol_raw = Self::str_col(&row[5])?;
+        Ok(CallEdge {
+            caller_file: Self::str_col(&row[0])?,
+            caller_symbol: Self::str_col(&row[1])?,
+            callee_name: Self::str_col(&row[2])?,
+            start_line: Self::int_col(&row[3])? as usize,
+            callee_file: if callee_file_raw.is_empty() { None } else { Some(callee_file_raw) },
+            callee_symbol: if callee_symbol_raw.is_empty() { None } else { Some(callee_symbol_raw) },
+            confidence: Self::float_col(&row[6])?,
+            dynamic: Self::int_col(&row[7])? != 0,
+        })
+    }
 }
 
 #[async_trait]
@@ -687,6 +734,12 @@ impl StorageBackend for CozoBackend {
             ":create symbol_roles { file_path: String, name: String => role: String, in_degree: Int, out_degree: Int }",
         )?;
 
+        // Create call_edges relation for function-level call graph — idempotent.
+        // CozoDB has no Bool type; dynamic dispatch is stored as Int (0/1).
+        // callee_file/callee_symbol use empty string to represent unresolved (no NULL in stored relations).
+        self.run_mut_ignore(
+            ":create call_edges { caller_file: String, caller_symbol: String, callee_name: String, start_line: Int => callee_file: String, callee_symbol: String, confidence: Float, dynamic: Int }",
+        )?;
         Ok(())
     }
 
@@ -1507,6 +1560,84 @@ impl StorageBackend for CozoBackend {
         Ok(())
     }
 
+    async fn upsert_call_edges(&self, edges: &[CallEdge]) -> anyhow::Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        const BATCH_SIZE: usize = 500;
+        for batch in edges.chunks(BATCH_SIZE) {
+            let rows: Vec<Vec<DataValue>> = batch
+                .iter()
+                .map(|e| {
+                    vec![
+                        Self::dv_str(&e.caller_file),
+                        Self::dv_str(&e.caller_symbol),
+                        Self::dv_str(&e.callee_name),
+                        Self::dv_int(e.start_line as i64),
+                        // Store empty string for unresolved callee_file/callee_symbol;
+                        // CozoDB stored relations have no NULL.
+                        Self::dv_str(e.callee_file.as_deref().unwrap_or("")),
+                        Self::dv_str(e.callee_symbol.as_deref().unwrap_or("")),
+                        Self::dv_float(e.confidence),
+                        Self::dv_int(if e.dynamic { 1 } else { 0 }),
+                    ]
+                })
+                .collect();
+            let data = DataValue::List(
+                rows.into_iter().map(|r| DataValue::List(r)).collect(),
+            );
+            let mut p = BTreeMap::new();
+            p.insert("rows".into(), data);
+            self.run_mut(
+                "?[caller_file, caller_symbol, callee_name, start_line, callee_file, callee_symbol, confidence, dynamic] <- $rows \
+                 :put call_edges { caller_file, caller_symbol, callee_name, start_line => callee_file, callee_symbol, confidence, dynamic }",
+                p,
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn delete_call_edges_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        let mut p = BTreeMap::new();
+        p.insert("fp".into(), Self::dv_str(file_path));
+        self.run_mut(
+            "?[caller_file, caller_symbol, callee_name, start_line] := \
+               *call_edges{caller_file, caller_symbol, callee_name, start_line}, caller_file = $fp \
+             :rm call_edges {caller_file, caller_symbol, callee_name, start_line}",
+            p,
+        )?;
+        Ok(())
+    }
+
+
+    async fn get_callers(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>> {
+        let mut p = BTreeMap::new();
+        p.insert("fp".into(), Self::dv_str(file_path));
+        p.insert("sym".into(), Self::dv_str(symbol_name));
+        let rows = self.run_imm(
+            "?[caller_file, caller_symbol, callee_name, start_line, callee_file, callee_symbol, confidence, dynamic] := \
+               *call_edges{caller_file, caller_symbol, callee_name, start_line, callee_file, callee_symbol, confidence, dynamic}, \
+               callee_file = $fp, callee_symbol = $sym \
+             :order -confidence",
+            p,
+        )?;
+        rows.rows.iter().map(|r| Self::parse_call_edge(r)).collect()
+    }
+
+    async fn get_callees(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>> {
+        let mut p = BTreeMap::new();
+        p.insert("fp".into(), Self::dv_str(file_path));
+        p.insert("sym".into(), Self::dv_str(symbol_name));
+        let rows = self.run_imm(
+            "?[caller_file, caller_symbol, callee_name, start_line, callee_file, callee_symbol, confidence, dynamic] := \
+               *call_edges{caller_file, caller_symbol, callee_name, start_line, callee_file, callee_symbol, confidence, dynamic}, \
+               caller_file = $fp, caller_symbol = $sym \
+             :order -confidence",
+            p,
+        )?;
+        rows.rows.iter().map(|r| Self::parse_call_edge(r)).collect()
+    }
+
     async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> {
         let dim = self.dim.load(Ordering::Relaxed);
         let zero = vec![0.0f32; dim];
@@ -2215,6 +2346,18 @@ impl<B: StorageBackend> StorageBackend for Arc<B> {
     }
     async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData> {
         (**self).get_repo_map_data().await
+    }
+    async fn upsert_call_edges(&self, edges: &[CallEdge]) -> anyhow::Result<()> {
+        (**self).upsert_call_edges(edges).await
+    }
+    async fn delete_call_edges_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        (**self).delete_call_edges_for_file(file_path).await
+    }
+    async fn get_callers(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>> {
+        (**self).get_callers(file_path, symbol_name).await
+    }
+    async fn get_callees(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>> {
+        (**self).get_callees(file_path, symbol_name).await
     }
 }
 

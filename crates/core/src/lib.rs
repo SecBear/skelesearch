@@ -23,7 +23,7 @@ pub use indexer::{IndexResult, Indexer};
 pub use manifest::{content_hash, IncompleteBatch, ManifestStore};
 pub use provider::EmbedProvider;
 pub use schema::{
-    ChunkRecord, CozoBackend, EdgeRecord, FileRecord, IndexStats, RepoMapData, RepoMapFile,
+    CallEdge, ChunkRecord, CozoBackend, EdgeRecord, FileRecord, IndexStats, RepoMapData, RepoMapFile,
     RepoMapSymbol, SearchResult, StorageBackend,
 };
 pub use searcher::{FileContext, Searcher, SearchTimings};

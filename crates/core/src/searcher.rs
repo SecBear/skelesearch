@@ -1770,6 +1770,13 @@ mod tests {
         }
 
         async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
+        async fn get_repo_map_data(&self) -> anyhow::Result<crate::schema::RepoMapData> {
+            Ok(crate::schema::RepoMapData { files: vec![], import_edges: vec![] })
+        }
+        async fn upsert_call_edges(&self, _edges: &[crate::schema::CallEdge]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_call_edges_for_file(&self, _file_path: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_callers(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
+        async fn get_callees(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
     }
 
     fn seed_hit(file_path: &str) -> SearchResult {

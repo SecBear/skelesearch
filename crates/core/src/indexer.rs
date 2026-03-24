@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context as _;
 
 use crate::{
-    content_hash, ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore,
+    content_hash, CallEdge, ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore,
     StorageBackend,
 };
 use crate::symbols::{extract_references, extract_symbols};
@@ -344,6 +344,9 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 /// Call-site references extracted from source during Phase 2a.
                 /// Used in Phase 2c to emit "calls" edges.
                 references: Vec<crate::symbols::ReferenceCapture>,
+                /// Import-first resolution map built in Phase 2d.
+                /// Maps callee name / file stem → resolved project-relative path.
+                resolved_import_targets: HashMap<String, String>,
             }
 
             let mut batch_files: Vec<BatchFile<'_>> = Vec::with_capacity(batch.len());
@@ -380,7 +383,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 let references = extract_references(&fc.rel_path, &source).unwrap_or_default();
                 // `source` is dropped here — only structured data retained for the batch.
 
-                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols, references });
+                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols, references, resolved_import_targets: HashMap::new() });
             }
 
             if batch_files.is_empty() {
@@ -521,7 +524,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             }
 
             // 2d. Upsert file, chunks, edges, symbols, and manifest for each file.
-            for (fi, bf) in batch_files.iter().enumerate() {
+            for (fi, bf) in batch_files.iter_mut().enumerate() {
                 let fc = bf.candidate;
                 // Enrich each chunk's normalized text with the names of symbols
                 // that overlap its line range, so BM25 queries using symbol names
@@ -598,49 +601,23 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                     self.backend.upsert_edges(&edge_records).await?;
                 }
 
-                // Extract call-site references and join with resolved import edges
-                // to emit "calls" edges. The heuristic: if a @reference.call name
-                // matches the file stem of a resolved import target, emit a calls
-                // edge. This is a v1 approximation — it catches namespace-style
-                // imports (e.g. `import utils; utils.foo()`) and misses named
-                // imports (e.g. `from utils import foo; foo()`), but is cheap
-                // and produces directionally correct signal.
-                if !edge_records.is_empty() {
-                    let references = &bf.references;
-                    if !references.is_empty() {
-                        let ref_names: std::collections::HashSet<&str> =
-                            references.iter().map(|r| r.name.as_str()).collect();
-                        // One calls edge per unique target file; dedup by to_file.
-                        let mut seen_targets = std::collections::HashSet::new();
-                        let call_edges: Vec<EdgeRecord> = edge_records.iter()
-                            .filter_map(|e| {
-                                // Match by file stem: "utils" from "src/utils.rs".
-                                let stem = Path::new(&e.to_file)
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())?;
-                                if ref_names.contains(stem)
-                                    && seen_targets.insert(e.to_file.clone())
-                                {
-                                    Some(EdgeRecord {
-                                        from_file: e.from_file.clone(),
-                                        from_chunk: 0,
-                                        to_file: e.to_file.clone(),
-                                        edge_type: "calls".into(),
-                                    })
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        if !call_edges.is_empty() {
-                            tracing::info!(
-                                file = %fc.rel_path,
-                                count = call_edges.len(),
-                                "call edges"
-                            );
-                            self.backend.upsert_edges(&call_edges).await?;
+                // Build import targets map for Phase 2e call-edge resolution.
+                // Maps callee name or file stem → resolved project-relative path.
+                // We use two keys per resolved edge: the file stem (e.g. "schema"
+                // from "crates/core/src/schema.rs") and the full file name with
+                // extension (e.g. "schema.rs"), so both namespace-style and
+                // direct-import patterns resolve correctly.
+                {
+                    let mut import_targets: HashMap<String, String> = HashMap::new();
+                    for e in &edge_records {
+                        if let Some(stem) = Path::new(&e.to_file).file_stem().and_then(|s| s.to_str()) {
+                            import_targets.entry(stem.to_string()).or_insert_with(|| e.to_file.clone());
+                        }
+                        if let Some(name) = Path::new(&e.to_file).file_name().and_then(|s| s.to_str()) {
+                            import_targets.entry(name.to_string()).or_insert_with(|| e.to_file.clone());
                         }
                     }
+                    bf.resolved_import_targets = import_targets;
                 }
                 tracing::info!(
                     file = %fc.rel_path,
@@ -656,6 +633,61 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 self.manifest.upsert(&fc.rel_path, fc.mtime, fc.size, &bf.hash)?;
                 result.indexed_files += 1;
             }
+            // Phase 2e: Resolve call edges now that all symbols for this batch
+            // are committed.  By deferring to here, find_symbols() sees the
+            // complete symbol table for all files indexed so far.
+            {
+                let mut all_call_edges: Vec<CallEdge> = Vec::new();
+                for bf in &batch_files {
+                    let fc = bf.candidate;
+                    self.backend.delete_call_edges_for_file(&fc.rel_path).await?;
+                    if bf.references.is_empty() { continue; }
+
+                    // Collect unique callee names for bulk lookup — one DB call
+                    // per name, not per reference (avoids N+1).
+                    let unique_names: HashSet<&str> =
+                        bf.references.iter().map(|r| r.name.as_str()).collect();
+
+                    let mut symbol_map: HashMap<String, Vec<crate::symbols::SymbolDef>> =
+                        HashMap::new();
+                    for name in &unique_names {
+                        match self.backend.find_symbols(name, None).await {
+                            Ok(syms) if !syms.is_empty() => {
+                                symbol_map.insert(name.to_string(), syms);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    for reference in &bf.references {
+                        let caller_symbol =
+                            find_enclosing_symbol(&bf.symbols, reference.start_line)
+                            .unwrap_or_else(|| "<module>".to_string());
+                        let (callee_file, callee_symbol, confidence) = resolve_call(
+                            &reference.name,
+                            &fc.rel_path,
+                            &bf.symbols,
+                            &bf.resolved_import_targets,
+                            &symbol_map,
+                        );
+                        all_call_edges.push(CallEdge {
+                            caller_file: fc.rel_path.clone(),
+                            caller_symbol,
+                            callee_name: reference.name.clone(),
+                            start_line: reference.start_line,
+                            callee_file,
+                            callee_symbol,
+                            confidence,
+                            dynamic: false,
+                        });
+                    }
+                }
+                if !all_call_edges.is_empty() {
+                    self.backend.upsert_call_edges(&all_call_edges).await?;
+                    tracing::info!(count = all_call_edges.len(), "call edges resolved");
+                }
+            }
+
             // batch_files and chunk_records_per_file drop here.
 
             self.manifest.complete_batch(&run_id, batch_idx)?;
@@ -684,6 +716,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             self.backend.delete_chunks_for_file(path).await?;
             self.backend.delete_edges_for_file(path).await?;
             self.backend.delete_symbols_for_file(path).await?;
+            self.backend.delete_call_edges_for_file(path).await?;
             self.backend.delete_file(path).await?;
             self.manifest.remove(path)?;
         }
@@ -857,4 +890,74 @@ fn is_known_extensionless(filename: &str) -> bool {
             | "Justfile" | "Taskfile" | "Containerfile"
             | "Vagrantfile" | "Brewfile" | "Procfile"
     )
+}
+
+/// Find the innermost function/method/class symbol whose line range contains `line`.
+/// Returns the symbol name, or `None` if no enclosing scope exists.
+/// "Innermost" is the symbol with the smallest enclosing span.
+fn find_enclosing_symbol(symbols: &[crate::symbols::SymbolDef], line: usize) -> Option<String> {
+    symbols.iter()
+        .filter(|s| matches!(s.kind.as_str(), "function" | "method" | "class"))
+        .filter(|s| s.start_line <= line && line <= s.end_line)
+        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
+        .map(|s| s.name.clone())
+}
+
+/// Resolve a call reference to a (callee_file, callee_symbol, confidence) triple.
+///
+/// Resolution priority:
+/// 1. Same-file symbol match — confidence 1.0.
+/// 2. Import-resolved match — confidence 1.0 if symbol found in target, 0.8 if
+///    only the target file is known.
+/// 3. Cross-file name match scored by path proximity — 0.7 / 0.5 / 0.3.
+/// 4. Unresolved — confidence 0.0.
+fn resolve_call(
+    callee_name: &str,
+    caller_file: &str,
+    local_symbols: &[crate::symbols::SymbolDef],
+    import_targets: &HashMap<String, String>,
+    global_symbols: &HashMap<String, Vec<crate::symbols::SymbolDef>>,
+) -> (Option<String>, Option<String>, f64) {
+    // 1. Same-file match: the callee is defined in the same file.
+    if let Some(sym) = local_symbols.iter().find(|s| s.name == callee_name) {
+        return (Some(sym.file_path.clone()), Some(sym.name.clone()), 1.0);
+    }
+
+    // 2. Import-resolved match: the callee name maps to a known imported file.
+    if let Some(target_file) = import_targets.get(callee_name) {
+        if let Some(syms) = global_symbols.get(callee_name) {
+            if let Some(sym) = syms.iter().find(|s| &s.file_path == target_file) {
+                return (Some(sym.file_path.clone()), Some(sym.name.clone()), 1.0);
+            }
+        }
+        // Target file known via import, but no matching symbol name in the DB.
+        return (Some(target_file.clone()), None, 0.8);
+    }
+
+    // 3. Cross-file match scored by path proximity.
+    if let Some(syms) = global_symbols.get(callee_name) {
+        if let Some(best) = syms.first() {
+            let confidence = path_proximity(caller_file, &best.file_path);
+            return (Some(best.file_path.clone()), Some(best.name.clone()), confidence);
+        }
+    }
+
+    // 4. Unresolved.
+    (None, None, 0.0)
+}
+
+/// Score path proximity between two project-relative file paths.
+/// Same directory → 0.7, same parent directory → 0.5, otherwise → 0.3.
+fn path_proximity(a: &str, b: &str) -> f64 {
+    let a_dir = Path::new(a).parent().unwrap_or(Path::new(""));
+    let b_dir = Path::new(b).parent().unwrap_or(Path::new(""));
+    if a_dir == b_dir {
+        return 0.7;
+    }
+    let a_parent = a_dir.parent().unwrap_or(Path::new(""));
+    let b_parent = b_dir.parent().unwrap_or(Path::new(""));
+    if a_parent == b_parent {
+        return 0.5;
+    }
+    0.3
 }
