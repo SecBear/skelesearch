@@ -9,7 +9,7 @@ use crate::{
     content_hash, CallEdge, ChunkRecord, Chunker, EdgeRecord, EmbedProvider, FileRecord, ManifestStore,
     StorageBackend,
 };
-use crate::symbols::{extract_references, extract_symbols};
+use crate::symbols::{extract_import_aliases, extract_references, extract_symbols};
 use crate::cochange;
 
 
@@ -354,6 +354,9 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 /// Call-site references extracted from source during Phase 2a.
                 /// Used in Phase 2c to emit "calls" edges.
                 references: Vec<crate::symbols::ReferenceCapture>,
+                /// Import aliases extracted during Phase 2a (e.g. `use foo as bar`).
+                /// Merged into `resolved_import_targets` during Phase 2d.
+                aliases: Vec<crate::symbols::ImportAlias>,
                 /// Import-first resolution map built in Phase 2d.
                 /// Maps callee name / file stem → resolved project-relative path.
                 resolved_import_targets: HashMap<String, String>,
@@ -391,9 +394,10 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                 let edges = chunker.extract_edges(&fc.rel_path, &source).unwrap_or_default();
                 let symbols = extract_symbols(&fc.rel_path, &source).unwrap_or_default();
                 let references = extract_references(&fc.rel_path, &source).unwrap_or_default();
+                let aliases = extract_import_aliases(&fc.rel_path, &source);
                 // `source` is dropped here — only structured data retained for the batch.
 
-                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols, references, resolved_import_targets: HashMap::new() });
+                batch_files.push(BatchFile { candidate: fc, hash, chunks, edges, symbols, references, aliases, resolved_import_targets: HashMap::new() });
             }
 
             if batch_files.is_empty() {
@@ -644,6 +648,14 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                         }
                         if let Some(name) = Path::new(&e.to_file).file_name().and_then(|s| s.to_str()) {
                             import_targets.entry(name.to_string()).or_insert_with(|| e.to_file.clone());
+                        }
+                    }
+                    // Merge import aliases into the resolution map.
+                    // If `bar` is an alias for `foo`, and `foo` maps to a resolved
+                    // file path, then `bar` should also map to that same file.
+                    for alias in &bf.aliases {
+                        if let Some(resolved) = import_targets.get(&alias.original).cloned() {
+                            import_targets.entry(alias.alias.clone()).or_insert(resolved);
                         }
                     }
                     bf.resolved_import_targets = import_targets;

@@ -83,6 +83,21 @@ pub struct ReferenceCapture {
     pub end_line: usize,
 }
 
+/// An alias introduced by an import statement.
+///
+/// For `use crate::schema as s`, `alias = "s"`, `original = "schema"`.
+/// For `from os import path as p`, `alias = "p"`, `original = "path"`,
+/// `source_path = Some("os")`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportAlias {
+    /// The alias name used in code (e.g. `s` from `use crate::schema as s`).
+    pub alias: String,
+    /// The original name being aliased (last path segment, e.g. `schema`).
+    pub original: String,
+    /// The source module/path, if available (e.g. `os` from `from os import path as p`).
+    pub source_path: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Extraction
 // ---------------------------------------------------------------------------
@@ -411,4 +426,392 @@ fn normalize_kind(kind: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+
+// ---------------------------------------------------------------------------
+// Import alias extraction
+// ---------------------------------------------------------------------------
+
+/// Extract import aliases from `source` for the language inferred from `filename`.
+///
+/// Covers `use … as` (Rust), `import … as` / `from … import … as` (Python),
+/// `import { x as y }` and `import * as ns` (TypeScript/JavaScript).
+///
+/// Returns an empty `Vec` for unknown extensions, unparseable source, or files
+/// with no aliases — never an error.
+pub fn extract_import_aliases(filename: &str, source: &str) -> Vec<ImportAlias> {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let cfg = match config_for_extension(ext) {
+        Some(c) => c,
+        None => return vec![],
+    };
+
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&cfg.language()).is_err() {
+        return vec![];
+    }
+
+    let tree = match parser.parse(source.as_bytes(), None) {
+        Some(t) => t,
+        None => return vec![],
+    };
+
+    let mut aliases = Vec::new();
+    let src = source.as_bytes();
+
+    match ext {
+        "rs" => collect_rust_aliases(&tree.root_node(), src, &mut aliases),
+        "py" => collect_python_aliases(&tree.root_node(), src, None, &mut aliases),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+            collect_ts_aliases(&tree.root_node(), src, None, &mut aliases);
+        }
+        _ => {}
+    }
+
+    aliases
+}
+
+// --- Rust alias helpers ---
+
+fn collect_rust_aliases(node: &tree_sitter::Node, source: &[u8], out: &mut Vec<ImportAlias>) {
+    if node.kind() == "use_as_clause" {
+        if let Some(path_node) = node.child_by_field_name("path") {
+            if let Some(alias_node) = node.child_by_field_name("alias") {
+                let original = rust_path_last_segment(&path_node, source);
+                if let Ok(alias_str) = alias_node.utf8_text(source) {
+                    let alias_str = alias_str.trim();
+                    // `_` is a non-binding discard — skip it.
+                    if !alias_str.is_empty() && alias_str != "_" {
+                        if let Some(orig) = original {
+                            out.push(ImportAlias {
+                                alias: alias_str.to_string(),
+                                original: orig,
+                                source_path: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            collect_rust_aliases(&child, source, out);
+        }
+    }
+}
+
+/// Extract the last segment from a Rust path node.
+///
+/// `identifier` → its text; `scoped_identifier` → its `name` field (last segment).
+fn rust_path_last_segment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(source).ok().map(|s| s.trim().to_string()),
+        "scoped_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.trim().to_string()),
+        _ => {
+            // Unknown shape: use last named child as fallback.
+            let count = node.named_child_count();
+            if count > 0 {
+                node.named_child((count - 1) as u32)
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.trim().to_string())
+            } else {
+                node.utf8_text(source).ok().map(|s| s.trim().to_string())
+            }
+        }
+    }
+}
+
+// --- Python alias helpers ---
+
+fn collect_python_aliases(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    from_module: Option<&str>,
+    out: &mut Vec<ImportAlias>,
+) {
+    match node.kind() {
+        "import_from_statement" => {
+            // Extract the module name so aliased children know their source.
+            let module: Option<String> = node
+                .child_by_field_name("module_name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.trim().to_string());
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_python_aliases(&child, source, module.as_deref(), out);
+                }
+            }
+        }
+        "aliased_import" => {
+            if let (Some(name_node), Some(alias_node)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("alias"),
+            ) {
+                if let (Ok(original_text), Ok(alias_str)) = (
+                    name_node.utf8_text(source),
+                    alias_node.utf8_text(source),
+                ) {
+                    let alias_str = alias_str.trim();
+                    if !alias_str.is_empty() && alias_str != "_" {
+                        // dotted_name like `os.path` → take last segment `path`.
+                        let original_stem = original_text
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(original_text.trim())
+                            .to_string();
+                        out.push(ImportAlias {
+                            alias: alias_str.to_string(),
+                            original: original_stem,
+                            source_path: from_module.map(|s| s.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+        _ => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_python_aliases(&child, source, from_module, out);
+                }
+            }
+        }
+    }
+}
+
+// --- TypeScript / JavaScript alias helpers ---
+
+fn collect_ts_aliases(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    from_source: Option<&str>,
+    out: &mut Vec<ImportAlias>,
+) {
+    match node.kind() {
+        "import_statement" => {
+            // Locate the module string for context attachment.
+            let src_path: Option<String> = find_ts_import_source(node, source);
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_ts_aliases(&child, source, src_path.as_deref(), out);
+                }
+            }
+        }
+        "import_specifier" => {
+            // `import { foo as bar }` — only emit when the alias field is present.
+            if let (Some(name_node), Some(alias_node)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("alias"),
+            ) {
+                if let (Ok(original), Ok(alias_str)) = (
+                    name_node.utf8_text(source),
+                    alias_node.utf8_text(source),
+                ) {
+                    let alias_str = alias_str.trim();
+                    if !alias_str.is_empty() && alias_str != "_" {
+                        out.push(ImportAlias {
+                            alias: alias_str.to_string(),
+                            original: original.trim().to_string(),
+                            source_path: from_source.map(|s| s.to_string()),
+                        });
+                    }
+                }
+            }
+            // import_specifier has no nested alias nodes worth recursing into.
+        }
+        "namespace_import" => {
+            // `import * as ns from "./utils"` — the identifier has no dedicated
+            // field in the grammar; it is the first (only) named child.
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i as u32) {
+                    if child.kind() == "identifier" {
+                        if let Ok(alias_str) = child.utf8_text(source) {
+                            let alias_str = alias_str.trim();
+                            if !alias_str.is_empty() && alias_str != "_" {
+                                // Use the stem of the import path as `original` so
+                                // the alias can resolve via the stem-keyed import_targets.
+                                let original = from_source
+                                    .and_then(|p| {
+                                        std::path::Path::new(p)
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .unwrap_or_else(|| "*".to_string());
+                                out.push(ImportAlias {
+                                    alias: alias_str.to_string(),
+                                    original,
+                                    source_path: from_source.map(|s| s.to_string()),
+                                });
+                            }
+                        }
+                        break; // Only one identifier in namespace_import.
+                    }
+                }
+            }
+        }
+        _ => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_ts_aliases(&child, source, from_source, out);
+                }
+            }
+        }
+    }
+}
+
+/// Walk an `import_statement` node to find the string literal naming the module.
+/// Returns the path with surrounding quote characters stripped.
+fn find_ts_import_source(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            match child.kind() {
+                "string" => {
+                    if let Ok(s) = child.utf8_text(source) {
+                        return Some(strip_import_quotes(s));
+                    }
+                }
+                "from_clause" => {
+                    for j in 0..child.child_count() {
+                        if let Some(gc) = child.child(j as u32) {
+                            if gc.kind() == "string" {
+                                if let Ok(s) = gc.utf8_text(source) {
+                                    return Some(strip_import_quotes(s));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Strip surrounding quote characters (`"`, `'`, `` ` ``) from an import path.
+fn strip_import_quotes(s: &str) -> String {
+    s.trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod import_alias_tests {
+    use super::{extract_import_aliases, ImportAlias};
+
+    fn alias(alias: &str, original: &str) -> ImportAlias {
+        ImportAlias { alias: alias.to_string(), original: original.to_string(), source_path: None }
+    }
+
+    fn alias_with_src(alias: &str, original: &str, src: &str) -> ImportAlias {
+        ImportAlias {
+            alias: alias.to_string(),
+            original: original.to_string(),
+            source_path: Some(src.to_string()),
+        }
+    }
+
+    #[test]
+    fn rust_simple_alias() {
+        let src = "use crate::schema as s;\n";
+        let result = extract_import_aliases("foo.rs", src);
+        assert_eq!(result, vec![alias("s", "schema")]);
+    }
+
+    #[test]
+    fn rust_grouped_aliases() {
+        let src = "use crate::foo::{bar as b, baz as z};\n";
+        let result = extract_import_aliases("foo.rs", src);
+        // Both aliases must be present; order is traversal order.
+        assert!(result.contains(&alias("b", "bar")), "missing b→bar in {result:?}");
+        assert!(result.contains(&alias("z", "baz")), "missing z→baz in {result:?}");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn rust_discard_alias_skipped() {
+        // `use std::io::Write as _` is a non-binding import suppression.
+        let src = "use std::io::Write as _;\n";
+        let result = extract_import_aliases("foo.rs", src);
+        assert!(result.is_empty(), "expected empty, got {result:?}");
+    }
+
+    #[test]
+    fn rust_no_alias() {
+        let src = "use std::collections::HashMap;\n";
+        let result = extract_import_aliases("foo.rs", src);
+        assert!(result.is_empty(), "expected empty, got {result:?}");
+    }
+
+    #[test]
+    fn python_from_import_alias() {
+        let src = "from os import path as p\n";
+        let result = extract_import_aliases("foo.py", src);
+        assert_eq!(result, vec![alias_with_src("p", "path", "os")]);
+    }
+
+    #[test]
+    fn python_top_level_import_alias() {
+        let src = "import json as j\n";
+        let result = extract_import_aliases("foo.py", src);
+        assert_eq!(result, vec![alias("j", "json")]);
+    }
+
+    #[test]
+    fn python_relative_import_alias() {
+        let src = "from . import foo as bar\n";
+        let result = extract_import_aliases("pkg/mod.py", src);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "bar");
+        assert_eq!(result[0].original, "foo");
+    }
+
+    #[test]
+    fn python_no_alias() {
+        let src = "from os import path\nimport sys\n";
+        let result = extract_import_aliases("foo.py", src);
+        assert!(result.is_empty(), "expected empty, got {result:?}");
+    }
+
+    #[test]
+    fn typescript_named_import_alias() {
+        let src = "import { useState as uS } from 'react';\n";
+        let result = extract_import_aliases("foo.ts", src);
+        assert_eq!(result, vec![alias_with_src("uS", "useState", "react")]);
+    }
+
+    #[test]
+    fn typescript_namespace_import() {
+        let src = "import * as utils from './utils';\n";
+        let result = extract_import_aliases("foo.ts", src);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "utils");
+        // original should be the stem of the import path
+        assert_eq!(result[0].original, "utils");
+    }
+
+    #[test]
+    fn typescript_no_alias() {
+        let src = "import { useState } from 'react';\n";
+        let result = extract_import_aliases("foo.ts", src);
+        assert!(result.is_empty(), "expected empty, got {result:?}");
+    }
+
+    #[test]
+    fn unknown_extension_returns_empty() {
+        let result = extract_import_aliases("file.xyz", "anything");
+        assert!(result.is_empty());
+    }
 }
