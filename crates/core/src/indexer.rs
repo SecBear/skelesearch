@@ -896,10 +896,28 @@ fn is_known_extensionless(filename: &str) -> bool {
 /// Returns the symbol name, or `None` if no enclosing scope exists.
 /// "Innermost" is the symbol with the smallest enclosing span.
 fn find_enclosing_symbol(symbols: &[crate::symbols::SymbolDef], line: usize) -> Option<String> {
-    symbols.iter()
+    // tree-sitter tags often capture only the declaration line (start == end),
+    // not the full function body. Two strategies:
+    // 1. If any symbol's range actually spans the line, use smallest enclosing.
+    // 2. Otherwise, find the nearest preceding function/method definition —
+    //    the last one whose start_line <= call_line and before the next symbol starts.
+    let fn_symbols: Vec<&crate::symbols::SymbolDef> = symbols.iter()
         .filter(|s| matches!(s.kind.as_str(), "function" | "method" | "class"))
-        .filter(|s| s.start_line <= line && line <= s.end_line)
-        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
+        .collect();
+
+    // Strategy 1: true enclosing range (when end_line > start_line)
+    if let Some(enclosing) = fn_symbols.iter()
+        .filter(|s| s.end_line > s.start_line && s.start_line <= line && line <= s.end_line)
+        .min_by_key(|s| s.end_line - s.start_line)
+    {
+        return Some(enclosing.name.clone());
+    }
+
+    // Strategy 2: nearest preceding definition (for single-line captures)
+    // Sort by start_line, find last one before the call site.
+    fn_symbols.iter()
+        .filter(|s| s.start_line <= line)
+        .max_by_key(|s| s.start_line)
         .map(|s| s.name.clone())
 }
 
