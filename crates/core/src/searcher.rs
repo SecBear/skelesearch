@@ -678,16 +678,20 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     hit.score *= 0.15;
                 }
             } else if is_readme_or_meta(&hit.file_path) {
-                hit.score *= 0.15; // README-like meta files — heavily penalized but recoverable
+                let penalty = if query_asks_about_docs(query) { 0.7 } else { 0.1 };
+                hit.score *= penalty;
             } else if is_doc_file(&hit.file_path) {
-                if is_docs_directory(&hit.file_path) {
-                    hit.score *= 0.1; // Docs-directory files are almost never the right answer
+                let penalty = if query_asks_about_docs(query) {
+                    0.7 // Doc queries: mild suppression so docs can surface
+                } else if is_docs_directory(&hit.file_path) {
+                    0.05 // Docs-directory files are almost never the right answer
                 } else {
-                    hit.score *= 0.2; // Inline docs (README.md in root) — still penalized but less
-                }
+                    0.15 // Inline docs (e.g. root README.md) — still penalized but less
+                };
+                hit.score *= penalty;
             } else if is_barrel_file(&hit.file_path) {
                 let barrel_penalty = if query_asks_about_entry_point(query) {
-                    0.85 // Mild penalty — barrel files are likely the answer
+                    1.0 // No penalty — barrel files ARE the answer
                 } else {
                     0.4 // Strong penalty — barrel files are structural noise
                 };
@@ -1204,12 +1208,18 @@ fn query_asks_about_entry_point(query: &str) -> bool {
         "reexport",
         "initializ", // matches initialize, initialization (US)
         "initialis", // matches initialise, initialisation (UK)
+        "bootstrap",
+        "startup",
         "public api",
         "api surface",
         "imported from",
         "barrel",
         "module entry",
+        "module structure",
         "package entry",
+        "index.ts",
+        "mod.rs",
+        "__init__",
     ]
     .iter()
     .any(|term| lower.contains(term))
@@ -1229,9 +1239,35 @@ fn query_asks_about_testing(query: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+/// Returns true when the query signals the user is asking about documentation,
+/// changelogs, or other prose content — so doc files should receive only a mild
+/// penalty rather than the aggressive suppression applied to code queries.
+fn query_asks_about_docs(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    [
+        "documentation",
+        "readme",
+        "changelog",
+        "release notes",
+        "getting started",
+        "how to use",
+        "installation guide",
+        "usage example",
+        "api docs",
+        "docs",
+        "guide",
+        "tutorial",
+        "setup",
+        "reference",
+        "walkthrough",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, query_asks_about_testing};
+    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, query_asks_about_testing, query_asks_about_docs, query_asks_about_entry_point};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
