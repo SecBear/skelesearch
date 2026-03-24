@@ -27,12 +27,14 @@ Once connected, Claude Code can call these tools:
 
 | Tool | Purpose |
 |------|---------|
-| `smart_search` | Best default — classifies the query and picks retrieval strategy |
-| `search_code` | Hybrid BM25 + dense search with optional import-graph expansion |
+| `search_code` | Primary hybrid code search with graph expansion, diversity, and token budget controls |
 | `find_symbol` | Look up definitions by name (and optional `kind`) |
-| `get_file_context` | Chunks and import edges for a specific file |
-| `index_codebase` | Trigger re-indexing from within a session |
-| `index_status` | Check whether the index is current |
+| `get_symbol_info` | One-call symbol context bundle for a known symbol |
+| `find_dependents` | Find files that import or depend on a file |
+| `find_tests` | Discover tests covering a file |
+| `get_repo_map` | Fast structural overview of the indexed repo |
+| `index` | Trigger background indexing from within a session |
+| `get_index_status` | Check whether indexing is current or still running |
 
 **Tip:** The `diversity` parameter defaults to `0.3` for MCP calls, which
 re-ranks results with Maximal Marginal Relevance to reduce redundancy. Lower
@@ -65,8 +67,8 @@ Recommended workflow:
 
 1. Run `skelesearch index .` once before starting a Codex session.
 2. Codex will pick up all six tools via `list_tools` on connect.
-3. Use `search_code` or `smart_search` throughout the session; call
-   `index_codebase` to re-index after large edits.
+3. Use `search_code` throughout the session; call
+   `index` to re-index after large edits.
 
 > **Note:** Codex config format and MCP support details have changed across
 > versions. If the above doesn't work, check the [Codex documentation](https://platform.openai.com/docs/guides/codex)
@@ -81,7 +83,7 @@ available to all OMP sessions across directories.
 
 Recommended install:
 ```bash
-cargo install --path crates/mcp --root ~/.local --force
+cargo install --path crates/mcp --root ~/.local --force --features storage-rocksdb
 # or use the helper script
 ./scripts/install-mcp.sh
 ```
@@ -91,7 +93,7 @@ Recommended global config:
 {
   "mcpServers": {
     "skelesearch": {
-      "command": "/Users/bear/.local/bin/skelesearch-mcp",
+      "command": "skelesearch-mcp",
       "env": {
         "VOYAGE_API_KEY": "<set-me>",
         "SKELESEARCH_RERANKER": "local",
@@ -110,11 +112,11 @@ Workflow:
 4. skelesearch will auto-index on startup when needed (unless `SKELESEARCH_NO_AUTO_INDEX` is set)
 
 Tool recommendations:
-- **`smart_search`** — recommended default. It auto-classifies the query
-  and routes between grep-style and semantic retrieval.
-- **`find_symbol`** — for precise definition lookup. Pass `kind` to narrow
+- **`search_code`** — primary default for semantic code retrieval.
+- **`find_symbol`** — precise definition lookup. Pass `kind` to narrow
   to a specific symbol type (e.g. `"struct"`, `"function"`, `"trait"`).
-- **`get_symbol_context`** — best one-call context bundle for dogfooding today.
+- **`get_symbol_info`** — best one-call context bundle for a known symbol.
+- **`get_repo_map`** — fastest structural overview when you need repo shape before querying.
 
 ---
 
@@ -132,8 +134,8 @@ skelesearch-mcp --http 127.0.0.1:3000
 - Streaming responses (where applicable) use SSE.
 - Compatible with any MCP client that supports the Streamable HTTP transport.
 
-This transport is currently in progress for v1.2. If `--http` is not yet
-available in your build, use stdio transport with a stdio-to-HTTP bridge in
+This transport is available in current builds. Use stdio transport only if your
+client lacks Streamable HTTP support.
 the interim.
 
 ---
@@ -209,7 +211,7 @@ and rebuilds quickly. Add it to `.gitignore`:
 ```
 
 **Exclude noise in large monorepos.** Add patterns to
-`.skelesearch/config.toml` to skip generated code, vendored dependencies, or
+`.skelesearch.toml` to skip generated code, vendored dependencies, or
 large binary directories:
 
 ```toml
@@ -227,8 +229,10 @@ exclude = ["vendor/", "node_modules/", "target/", "dist/"]
 
 **Choosing a tool:**
 
-- Unknown query type → `smart_search` (auto-classifies)
-- Known semantic query → `search_code`
+- Semantic code search / unknown intent → `search_code`
 - Definition lookup → `find_symbol`
-- File structure / imports → `get_file_context`
-- Pattern matching → `grep` (CLI) or the `search_code` BM25 mode via MCP
+- One-shot symbol context → `get_symbol_info`
+- Repo structure / import overview → `get_repo_map`
+- Dependency impact → `find_dependents`
+- Test discovery → `find_tests`
+- Pattern matching → `grep` (CLI)

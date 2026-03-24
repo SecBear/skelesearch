@@ -75,20 +75,22 @@ Once connected, Claude Code can call these tools:
 
 | Tool | Purpose |
 |------|---------|
-| `smart_search` | Best default — classifies query and picks retrieval strategy |
-| `search_code` | Hybrid BM25+dense search with optional import-graph expansion |
-| `find_symbol` | Look up definitions by name |
-| `get_file_context` | Chunks and import edges for a specific file |
-| `index_codebase` | Trigger indexing from within a session |
-| `index_status` | Check whether the index is current |
+| `search_code` | Primary hybrid code search with optional graph expansion |
+| `find_symbol` | Look up definitions by exact symbol name |
+| `get_symbol_info` | One-call context bundle for a known symbol |
+| `find_dependents` | Find files that import or otherwise depend on a target file |
+| `find_tests` | Find tests covering a source file |
+| `get_repo_map` | Fast structural overview of the indexed repo |
+| `index` | Trigger background indexing from within a session |
+| `get_index_status` | Check indexing progress and freshness |
 
 ## 5. Re-indexing
 
-Re-run `skelesearch index .` (or call `index_codebase` via MCP) after:
+Re-run `skelesearch index .` (or call `index` via MCP) after:
 
 - A fresh clone on a new machine
 - Large merges or rebases
-- Any time `index_status` shows a high `estimated_stale` count
+- Any time `get_index_status` shows stale files or indexing errors
 
 The `hooks/post-edit-reindex` hook re-indexes automatically in the background after
 each file edit when skelesearch is wired via the Claude Code plugin manifest.

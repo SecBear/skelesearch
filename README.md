@@ -98,7 +98,7 @@ skelesearch-mcp --http 127.0.0.1:3000
 > Recommended when you want skelesearch available to all OMP sessions across directories.
 
 ```bash
-cargo install --path crates/mcp --root ~/.local --force
+cargo install --path crates/mcp --root ~/.local --force --features storage-rocksdb
 # or use the helper script
 ./scripts/install-mcp.sh
 ```
@@ -111,12 +111,14 @@ This installs `skelesearch-mcp` to `~/.local/bin/skelesearch-mcp`. Add that bina
 
 | Tool | Description |
 |------|-------------|
-| `smart_search` | Auto-classifies query → grep or semantic search. **Recommended default.** Accepts `max_tokens`, `branch_scope`. |
-| `search_code` | Hybrid BM25 + vector search with MMR diversity control. Accepts `max_tokens`, `branch_scope`. |
-| `find_symbol` | Look up definitions by name, optionally filtered by kind |
-| `get_file_context` | All chunks + import edges for a specific file |
-| `index_codebase` | Trigger indexing from within a session. Accepts `provider`. |
-| `index_status` | Check whether the index is current |
+| `search_code` | Primary hybrid code search tool. Supports `top_k`, graph expansion, diversity, token budget, branch scope, and session dedup. |
+| `find_symbol` | Look up definitions by exact symbol name, optionally filtered by kind. |
+| `get_symbol_info` | One-call symbol context bundle: source, imports, dependents, and tests. |
+| `find_dependents` | Discover files that import or otherwise depend on a target file. |
+| `find_tests` | Find test files that cover a source file. |
+| `get_repo_map` | Return a fast structural map of the indexed repo (tree, roles, symbols, edges). |
+| `index` | Start background indexing for a project. |
+| `get_index_status` | Check indexing progress and freshness. |
 
 ### Claude Code config
 
@@ -166,7 +168,7 @@ RUST_LOG=skelesearch_core=debug skelesearch search "error handling"
 ```
 
 CLI output includes elapsed time and embedding cache statistics. MCP
-`index_codebase` returns `cache_hits` in the response. All hot-path functions
+`get_index_status` reports indexing progress and freshness. All hot-path functions
 carry `#[tracing::instrument]` spans — wire up `tracing-opentelemetry` for
 Jaeger/OTLP export when needed.
 
@@ -203,4 +205,5 @@ comparison, and normalized run artifacts for reporting. Start with
 
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under **MIT OR Apache-2.0**. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).
