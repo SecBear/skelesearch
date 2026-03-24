@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Prerequisites: cmake (required by some native deps — install via 'brew install cmake' or your OS package manager)
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -10,7 +12,7 @@ GLOBAL_MCP_JSON="$HOME/.omp/agent/mcp.json"
 mkdir -p "$BIN_DIR"
 
 echo "Installing skelesearch-mcp to $BIN_PATH"
-cargo install --path "$ROOT/crates/mcp" --root "$INSTALL_ROOT" --force --features storage-rocksdb
+cargo install --path "$ROOT/crates/mcp" --root "$INSTALL_ROOT" --force --features skelesearch-core/storage-rocksdb
 
 echo
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
@@ -31,8 +33,6 @@ Recommended ~/.omp/agent/mcp.json entry:
       "command": "$BIN_PATH",
       "env": {
         "VOYAGE_API_KEY": "<set-me>",
-        "SKELESEARCH_RERANKER": "local",
-        "SKELESEARCH_RERANKER_MODEL_DIR": "$HOME/.cache/skelesearch/reranker/gte-modernbert-base",
         "RUST_LOG": "skelesearch=info"
       }
     }

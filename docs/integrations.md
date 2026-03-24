@@ -17,7 +17,10 @@ config):
     "skelesearch": {
       "command": "skelesearch-mcp",
       "args": [],
-      "env": {}
+      "env": {
+        "OPENAI_API_KEY": "<set-me-if-using-openai-provider>",
+        "VOYAGE_API_KEY": "<set-me-if-using-voyage-provider>"
+      }
     }
   }
 }
@@ -47,7 +50,7 @@ See [quickstart.md § 4](quickstart.md) for the full Claude Code setup walkthrou
 
 ## 2. Codex (OpenAI)
 
-Codex discovers MCP tools automatically via the `list_tools` protocol message.
+Codex discovers MCP tools automatically via the `tools/list` protocol message.
 Add skelesearch to the Codex MCP config — typically `~/.codex/config.json`
 for user-level or a project-level equivalent (check your Codex version docs,
 as the config path has varied across releases):
@@ -57,7 +60,11 @@ as the config path has varied across releases):
   "mcpServers": {
     "skelesearch": {
       "command": "skelesearch-mcp",
-      "args": []
+      "args": [],
+      "env": {
+        "OPENAI_API_KEY": "<set-me-if-using-openai-provider>",
+        "VOYAGE_API_KEY": "<set-me-if-using-voyage-provider>"
+      }
     }
   }
 }
@@ -66,7 +73,7 @@ as the config path has varied across releases):
 Recommended workflow:
 
 1. Run `skelesearch index .` once before starting a Codex session.
-2. Codex will pick up all six tools via `list_tools` on connect.
+2. Codex will pick up all eight tools via `tools/list` on connect.
 3. Use `search_code` throughout the session; call
    `index` to re-index after large edits.
 
@@ -83,7 +90,7 @@ host's normal MCP config mechanism.
 Example install:
 
 ```bash
-cargo install --path crates/mcp --root ~/.local --force --features storage-rocksdb
+cargo install --path crates/mcp --root ~/.local --force --features skelesearch-core/storage-rocksdb
 # or use the helper script
 ./scripts/install-mcp.sh
 ```
@@ -131,12 +138,15 @@ Tool recommendations:
 skelesearch-mcp --http 127.0.0.1:3000
 ```
 
-- JSON-RPC requests arrive via HTTP POST.
+- JSON-RPC requests arrive via HTTP POST to `http://127.0.0.1:3000/mcp`.
 - Streaming responses (where applicable) use SSE.
 - Compatible with any MCP client that supports the Streamable HTTP transport.
 
 This transport is available in current builds. Use stdio transport only if your
 client lacks Streamable HTTP support.
+> **Auto-indexing:** After connecting, call `get_index_status` before searching.
+> Auto-indexing runs in the background but may not be complete on first connect.
+
 
 ---
 

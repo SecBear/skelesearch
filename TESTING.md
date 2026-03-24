@@ -2,6 +2,22 @@
 
 ## Prerequisites
 
+### Unit tests — no API key required
+
+```bash
+cargo build --features storage-sqlite
+```
+
+### Fastembed eval — no API key required
+
+FastEmbed downloads models locally on first run. No credentials needed.
+
+```bash
+cargo build --release --features storage-sqlite
+```
+
+### Voyage eval — requires API key
+
 ```bash
 export VOYAGE_API_KEY=<your-key>
 cargo build --release --features storage-sqlite

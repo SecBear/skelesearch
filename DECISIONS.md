@@ -5,16 +5,16 @@ Read this before modifying core abstractions or switching dependencies.
 
 ---
 
-## ADR-001: Use CozoDB directly (not skg-state-cozo)
+## ADR-001: Use CozoDB directly (not the CozoDB state management crate)
 
-**Decision:** Depend on `cozo` crate directly; do not use the `skg-state-cozo` StateStore abstraction from extras.
+**Decision:** Depend on `cozo` crate directly; do not use the CozoDB state management crate's StateStore abstraction from the extension crate.
 
-**Why:** `skg-state-cozo` hardcodes 1536-dim embeddings in its schema. skelesearch needs
+**Why:** The CozoDB state management crate hardcodes 1536-dim embeddings in its schema. skelesearch needs
 configurable dimensionality to support fastembed models (768-dim jina-v2-base-code) alongside
 OpenAI (1536-dim) and others. A code-search-specific schema (`chunks`, `files`, `code_edges`)
 is also cleaner than the generic KV model in StateStore.
 
-**Trade-off:** Some duplication with skg-state-cozo's RRF implementation. Acceptable — our
+**Trade-off:** Some duplication with the CozoDB state management crate's RRF implementation. Acceptable — our
 schema and retrieval logic is small and tailored to code search.
 
 ---
@@ -134,17 +134,17 @@ makes the "I'm now running a daemon" distinction explicit. Watch mode uses `noti
 
 ---
 
-## ADR-009: Standalone repo (not a crate in extras)
+## ADR-009: Standalone repo (not a crate in the extension crate)
 
-**Decision:** skelesearch is a new repository in `golden/projects/`, not a crate added to extras.
+**Decision:** skelesearch is a standalone repository, not a crate added to the extension crate.
 
 **Why:** skelesearch is a product with its own versioning, packaging, and release lifecycle.
-As a crate in extras it would be coupled to the extras workspace version and harder to install
+As a crate in the extension crate it would be coupled to that workspace version and harder to install
 independently. Being standalone means `nix run github:you/skelesearch` works cleanly.
 
-**Relationship to skelegent/extras:** skelesearch imports specific crates from skelegent/extras
-as git dependencies (provider crates, optionally skg-mcp). It is not a fork — it reuses
-skelegent's provider infrastructure without owning it.
+**Relationship to companion services:** skelesearch imports specific crates from the companion agent
+service's extension crate as git dependencies (provider crates). It is not a fork — it reuses
+the companion agent service's provider infrastructure without owning it.
 
 ---
 

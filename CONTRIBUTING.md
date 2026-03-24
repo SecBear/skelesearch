@@ -73,7 +73,7 @@ rustup component add clippy rustfmt
 | `skelesearch-cli` | CLI binary with clap subcommands |
 | `skelesearch-mcp` | MCP server with rmcp 1.2 |
 | `skelesearch-rerank-api` | Cloud cross-encoder reranker (API-based) |
-| `skelesearch-rerank-local` | Local ONNX cross-encoder reranker |
+| `skelesearch-rerank-local` | Local ONNX cross-encoder reranker (experimental, disabled by default) |
 | `skelesearch-telemetry` | Shared tracing setup (fmt + optional OTLP) |
 ### Documentation
 
@@ -129,3 +129,8 @@ By contributing to skelesearch, you agree that your contributions will be dual
 licensed under the [MIT License](./LICENSE-MIT) and the
 [Apache License 2.0](./LICENSE-APACHE), at the user's option. This is the same
 license used by the project itself.
+
+
+## Changelog
+
+We track changes in git commit history. A formal CHANGELOG will be added before the first tagged release.

@@ -2,7 +2,7 @@
 
 **Status:** Active design document. All architecture decisions must pass these criteria.
 **Date:** 2026-03-22
-**Evidence:** Agent trace analysis (14 real queries from OMP sessions) + competitive analysis.
+**Evidence:** Agent trace analysis (14 real queries from agent sessions) + competitive analysis.
 
 ---
 
@@ -16,7 +16,7 @@ is agent-facing. Design for the agent's strengths, not the human's weaknesses.
 
 ## How Agents Query Code Search
 
-From trace analysis (OMP sessions, 2026-03-22):
+From trace analysis (agent sessions, 2026-03-22):
 
 | Pattern | % | Example | What works |
 |---|---|---|---|

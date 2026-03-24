@@ -45,8 +45,8 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported via [GitHub Issues](https://github.com/SecBear/skelesearch/issues) or by
-contacting the project maintainers directly.
+reported via [GitHub Security Advisories](https://github.com/SecBear/skelesearch/security/advisories/new).
+Do not use public GitHub Issues for harassment or conduct reports.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

@@ -316,11 +316,11 @@ async fn run_search(
     // Short-circuit: no index at all.
     if !dir.join("index.db").exists() {
         if json_output {
-            println!("[]");
+            eprintln!("{}", serde_json::json!({"error": "No index found. Run `skelesearch index <path>` first."}));
+            std::process::exit(1);
         } else {
-            println!("No index found. Run `skelesearch index <path>` first.");
+            anyhow::bail!("No index found. Run `skelesearch index <path>` first.");
         }
-        return Ok(());
     }
 
     let provider = provider_from_name(&provider_name)?;
@@ -515,10 +515,15 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
+        let stale = open_manifest(&dir).map(|m| m.count_stale(&root).unwrap_or(0)).unwrap_or(0);
         println!("indexed_files:  {}", stats.indexed_files);
         println!("total_chunks:   {}", stats.total_chunks);
         println!("last_indexed:   {last_indexed_str}");
+        println!("estimated_stale: {stale}");
         println!("watching:       {watching}");
+        if stale > 0 {
+            println!("hint: {} file(s) may be out of date; run `skelesearch index <path>` to refresh.", stale);
+        }
     }
     Ok(())
 }

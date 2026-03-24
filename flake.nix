@@ -68,6 +68,8 @@
           buildInputs = [
             pkgs.rustc
             pkgs.cargo
+            pkgs.clippy
+            pkgs.rustfmt
             pkgs.clang
             # Native TLS (reqwest -> openssl-sys)
             pkgs.openssl

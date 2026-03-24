@@ -188,7 +188,7 @@ fn friendly_index_error_inner(err: &anyhow::Error, indexing_active: bool) -> Str
         if indexing_active {
             "Index is being built. Poll index_status to check progress; search will work once indexing completes.".to_string()
         } else {
-            "Index not initialized. Run index_codebase or set VOYAGE_API_KEY for auto-indexing.".to_string()
+            "Index not initialized. Run index or set VOYAGE_API_KEY for auto-indexing.".to_string()
         }
     } else if msg.contains("arity mismatch") || msg.contains("Arity mismatch") {
         "Index schema is outdated. Delete .skelesearch/ directory and re-index.".to_string()
@@ -300,7 +300,7 @@ impl SkeleSearchServer {
                 state.path
             )
         } else {
-            anyhow::anyhow!("index is empty; run index_codebase first")
+            anyhow::anyhow!("index is empty; run index first")
         }
     }
 
@@ -385,7 +385,7 @@ impl SkeleSearchServer {
         if !is_project {
             tracing::info!(
                 path = %cwd.display(),
-                "auto_index_if_needed: no project markers found — skipping (run index_codebase explicitly, ",
+                "auto_index_if_needed: no project markers found — skipping (run index explicitly, ",
             );
             tracing::info!(
                 "auto_index_if_needed: or set SKELESEARCH_NO_AUTO_INDEX to silence this message)"
@@ -1617,7 +1617,7 @@ fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
     use std::collections::BTreeMap;
 
     if data.files.is_empty() {
-        return "No files indexed. Run index_codebase first.".to_string();
+        return "No files indexed. Run index first.".to_string();
     }
 
     struct DirNode {

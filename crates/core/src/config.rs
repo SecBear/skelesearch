@@ -14,7 +14,6 @@ pub struct IndexConfig {
     pub provider: String,
     pub batch_size: usize,
     pub exclude: Vec<String>,
-    pub index_dir: Option<String>,
     /// Append extracted symbol names to each chunk's normalised text for BM25.
     /// Disable to measure the contribution of symbol enrichment in benchmarks.
     pub symbol_enrichment: bool,
@@ -36,6 +35,7 @@ pub struct IndexConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
+    #[serde(alias = "top_k")]
     pub default_top_k: usize,
     /// Enable PageRank boost on search results. Default: `true` (absent = enabled).
     #[serde(default)]
@@ -141,7 +141,6 @@ impl Default for IndexConfig {
             provider: "fastembed".into(),
             batch_size: 64,
             exclude: vec![],
-            index_dir: None,
             symbol_enrichment: true,
             include_extensions: None,
             summarize: false,

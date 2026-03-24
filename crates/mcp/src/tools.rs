@@ -56,7 +56,7 @@ fn default_diversity() -> f32 {
 pub struct IndexCodebaseInput {
     /// Absolute or relative path to the root directory to index.
     pub path: String,
-    /// Embedding provider to use. Supported: `"fastembed"` (default).
+    /// Embedding provider to use. Supported: `"fastembed"` (default), `"openai"`, `"voyage"`.
     pub provider: Option<String>,
 }
 

@@ -16,8 +16,9 @@ with the result.
 ## Quick start
 
 ```bash
-# Build
-cargo install --path crates/cli --features storage-sqlite
+# Clone and build
+git clone https://github.com/SecBear/skelesearch && cd skelesearch
+cargo install --path crates/cli
 
 # Index your project
 cd /path/to/project
@@ -85,7 +86,7 @@ skelesearch watch <path>              Re-index on file changes (2s debounce)
 
 ## MCP server
 
-For agent integration (Claude Code, Codex, OMP):
+For agent integration (Claude Code, Codex, and any MCP-compatible host):
 
 ```bash
 # stdio transport (default)
@@ -95,18 +96,22 @@ skelesearch-mcp
 skelesearch-mcp --http 127.0.0.1:3000
 ```
 
-### Install for global OMP use
+### Install globally
 
-> Recommended when you want skelesearch available to all OMP sessions across directories.
+> Recommended when you want skelesearch available across projects.
 
 ```bash
-cargo install --path crates/mcp --root ~/.local --force --features storage-rocksdb
+# Minimal install (fastembed backend, default)
+cargo install --path crates/mcp
+
+# With RocksDB backend (higher write throughput at scale)
+cargo install --path crates/mcp --root ~/.local --force --features skelesearch-core/storage-rocksdb
 # or use the helper script
 ./scripts/install-mcp.sh
 ```
 
-This installs `skelesearch-mcp` to `~/.local/bin/skelesearch-mcp`. Add that binary to
-`~/.omp/agent/mcp.json` for system-wide use. After rebuilding or reinstalling, restart OMP.
+This installs `skelesearch-mcp` into PATH (or `~/.local/bin` when using `--root`).
+Add the binary to your MCP config. See [docs/integrations.md](docs/integrations.md) for config examples.
 
 
 ### MCP tools

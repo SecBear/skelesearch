@@ -3,11 +3,11 @@
 ## 1. Build
 
 ```bash
-# Development build (SQLite backend, fast compile)
-cargo build --features storage-sqlite
+# Development build (fast compile)
+cargo build
 
 # Install into PATH
-cargo install --path crates/cli --features storage-sqlite
+cargo install --path crates/cli
 ```
 
 For a release build with the RocksDB backend (slower first compile, better write
@@ -15,7 +15,7 @@ throughput at scale):
 
 ```bash
 # macOS may need: export CXXFLAGS="-std=c++20"
-cargo install --path crates/cli --features storage-rocksdb
+cargo install --path crates/cli --features skelesearch-core/storage-rocksdb
 ```
 
 ## 2. First-run indexing
@@ -41,7 +41,7 @@ The response includes `indexed_files`, `total_chunks`, `last_indexed`, and
 ## 3. CLI search
 
 ```bash
-skelesearch search "retry logic with exponential backoff" --limit 10 --json
+skelesearch search "retry logic with exponential backoff" --top-k 10 --json
 ```
 
 Results are **candidates** — they are ranked by semantic similarity, not proven matches.

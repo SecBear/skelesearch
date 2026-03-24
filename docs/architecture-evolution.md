@@ -50,8 +50,7 @@ Runs after Tier 2 completes for the whole repo:
 - Common query pattern bundles (pre-materialized retrieval sets)
 
 Tier 3 results are cached keyed by content hashes. Persist across sessions
-for pro users. Free tier gets Tier 1 only; pro tier gets background
-materialization and persistent caching.
+in default mode (Tier 1 only); future: persistent caching for long-running sessions.
 
 ### Change Detection
 
@@ -154,7 +153,7 @@ because nobody else has the structural metadata to identify the clusters.
 3. **Single Datalog retrieval query** — replace the current
    hybrid_search → augment_with_graph → rerank pipeline with one query.
 4. **Change detection** — content-hash-based invalidation on re-index.
-5. **Tier 3 caching** — persist across sessions for pro users.
+5. **Tier 3 caching** — persist across sessions.
 6. **Query bundle detection** — log retrieval patterns, identify clusters,
    pre-materialize.
 
