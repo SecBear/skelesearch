@@ -37,6 +37,7 @@ retrieval-only baselines exist — skelesearch is the first tool measured here.
 | Date | Commit | Provider | Instances | File R@5 | Acc@5 | MRR | Region overlap | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 2026-03-23 | `987c1ec` | voyage-code-3 | 30 (django+astropy cached subset) | 77.8% | 63.3% | 0.794 | 23.6% | quick-bench cached-only sample; avg search 2354ms/query |
+| 2026-03-24 | `c792da8` | voyage-code-3 | 30 (django+astropy cached subset) | 77.8% | 63.3% | 0.800 | 23.6% | overnight run (bearbrick); avg search 2659ms/query |
 **Reference scores (published, full agentic systems):**
 
 | Agent | Context F1 | Efficiency | Source |
@@ -53,6 +54,7 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 
 | Date | Commit | Provider | Profile | R@5 | Acc@5 | MRR | Cases | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-03-24 | `c792da8` | voyage-code-3 | overnight (bearbrick) | 84.7% | 73.8% | 0.842 | 240 | search quality fixes (barrel/doc penalties). Pre-PER-157 baseline. |
 | 2026-03-23 | `9359eea` | voyage-code-3 | latest main | 84.5% | 73.8% | 0.837 | 240 | after chunk merge, schema migration, intent routing, MCP/server fixes |
 | 2026-03-15 | `e931f51` | voyage-code-3 | voyage-full | 83.3% | — | 0.851 | 240 | pre-Acc@5 baseline |
 **2026-03-22 per-repo breakdown — true local (no reranker) vs Voyage reranker:**
@@ -100,6 +102,7 @@ error_handling, architecture, utility_helper, config_init, vocabulary_gap.
 | Date | Commit | Provider | Instances | Acc@1 | Acc@5 | R@5 | MRR | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 2026-03-23 | `987c1ec` | voyage-code-3 | 44/50 completed | 61.4% | 79.5% | 79.5% | 0.688 | 6 skipped due per-instance indexing timeout on large astropy/django commits |
+| 2026-03-24 | `c792da8` | voyage-code-3 | 36/50 completed | 66.7% | 91.7% | 91.7% | 0.746 | overnight run (bearbrick); 14 skipped (indexing timeout PER-111) |
 
 ---
 
@@ -132,8 +135,26 @@ bun benchmarks/scripts/run-eval.ts \
   --provider voyage
 ```
 
+## Per-repo breakdown (2026-03-24 overnight, voyage-code-3, bearbrick)
+
+| Repo | Language | R@5 | Acc@5 | MRR | Cases |
+|---|---|---|---|---|---|
+| mini-redis | Rust | 97.5% | 95.0% | 0.923 | 40 |
+| httpx | Python | 88.8% | 80.0% | 0.846 | 40 |
+| hyperfine | Rust | 87.5% | 75.0% | 0.855 | 40 |
+| cobra | Go | 82.1% | 70.0% | 0.880 | 40 |
+| hono | TypeScript | 80.0% | 67.5% | 0.823 | 40 |
+| zod | TypeScript | 72.5% | 55.0% | 0.726 | 40 |
+
+> **Weakest:** zod (72.5% R@5) and hono (80.0% R@5) — both TypeScript.
+> TypeScript repos remain the primary improvement target.
+
 ## Changelog
 
+- **2026-03-24** — Overnight run on bearbrick (c792da8). Internal eval: R@5=84.7% (+1.4%),
+  MRR=0.842. ContextBench: R@5=77.8%, MRR=0.800. SWE-bench: Acc@5=91.7% (36/50
+  completed, 14 timed out during indexing — PER-111). Search quality fixes (barrel/doc
+  penalties from PER-126/127) improved R@5 slightly but MRR stayed flat.
 - **2026-03-22** — True local-only run (d509642). R@5=77.3%, MRR=0.698 (240 cases,
   all 6 repos including zod). Previous "local" run was contaminated by Voyage reranker
   auto-detected from VOYAGE_API_KEY in environment. Adapter now strips cloud keys.
