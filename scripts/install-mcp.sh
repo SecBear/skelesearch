@@ -10,7 +10,7 @@ GLOBAL_MCP_JSON="$HOME/.omp/agent/mcp.json"
 mkdir -p "$BIN_DIR"
 
 echo "Installing skelesearch-mcp to $BIN_PATH"
-cargo install --path "$ROOT/crates/mcp" --root "$INSTALL_ROOT" --force
+cargo install --path "$ROOT/crates/mcp" --root "$INSTALL_ROOT" --force --features storage-rocksdb
 
 echo
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
