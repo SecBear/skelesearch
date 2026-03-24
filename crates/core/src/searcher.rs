@@ -297,6 +297,10 @@ pub struct Searcher<B, P> {
     pagerank_factor: f64,
     /// LRU cache for query embeddings.  Bounded at 256 entries.
     query_embed_cache: std::sync::Mutex<lru::LruCache<String, Vec<f32>>>,
+    /// LRU cache for post-retrieval candidate sets, before MMR/reranking.
+    /// Keyed by normalized query + retrieval knobs so repeated searches skip
+    /// redundant backend retrieval work. Bounded at 128 entries.
+    candidate_cache: std::sync::Mutex<lru::LruCache<String, Vec<SearchResult>>>,
 }
 
 impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
@@ -314,6 +318,9 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             pagerank_factor: 0.1,
             query_embed_cache: std::sync::Mutex::new(
                 lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
+            ),
+            candidate_cache: std::sync::Mutex::new(
+                lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()),
             ),
         }
     }
@@ -440,7 +447,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 self.query_embed_cache
                     .lock()
                     .expect("query_embed_cache mutex poisoned")
-                    .put(normalized_query, vec.clone());
+                    .put(normalized_query.clone(), vec.clone());
                 vec
             }
         };
@@ -524,50 +531,85 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let bm25_query = sanitize_fts_query(&bm25_query);
 
         // -- Hybrid retrieval --------------------------------------------------
-        // When `use_unified_search` is true, a single Datalog round-trip handles
-        // FTS + HNSW + PageRank boost + optional graph walk together.  The separate
-        // pagerank_boost and graph augmentation steps are skipped in that case.
+        // Cache the candidate set after retrieval / graph augmentation but before
+        // MMR and reranking. This skips redundant backend work for repeated queries
+        // while still allowing different diversity and reranker settings to apply
+        // on top of the same candidates.
         let retrieve_start = std::time::Instant::now();
-        let mut hits = if self.use_unified_search {
-            let gd = if include_graph { max_depth } else { 0 };
-            self.backend
-                .unified_search(
-                    &query_vec, &bm25_query, top_k, gd,
-                    self.fts_weight, self.graph_score_factor,
-                    self.graph_min_score, self.pagerank_factor,
-                )
-                .await?
-        } else {
-            self.backend
-                .hybrid_search(&query_vec, &bm25_query, top_k)
-                .await?
+        let candidate_cache_key = self.retrieval_cache_key(
+            &normalized_query,
+            &bm25_query,
+            top_k,
+            include_graph,
+            max_depth,
+        );
+        let cached_hits = {
+            self.candidate_cache
+                .lock()
+                .expect("candidate_cache mutex poisoned")
+                .get(&candidate_cache_key)
+                .cloned()
         };
-        timings.retrieve_ms = retrieve_start.elapsed().as_millis() as u64;
+        let mut hits = if let Some(cached) = cached_hits {
+            tracing::debug!("candidate cache hit");
+            cached
+        } else {
+            tracing::debug!("candidate cache miss");
+            // When `use_unified_search` is true, a single Datalog round-trip handles
+            // FTS + HNSW + PageRank boost + optional graph walk together. The separate
+            // pagerank_boost and graph augmentation steps are skipped in that case.
+            let mut hits = if self.use_unified_search {
+                let gd = if include_graph { max_depth } else { 0 };
+                self.backend
+                    .unified_search(
+                        &query_vec, &bm25_query, top_k, gd,
+                        self.fts_weight, self.graph_score_factor,
+                        self.graph_min_score, self.pagerank_factor,
+                    )
+                    .await?
+            } else {
+                self.backend
+                    .hybrid_search(&query_vec, &bm25_query, top_k)
+                    .await?
+            };
 
-        // PageRank boost: structurally important files get a mild score uplift.
-        // Log-dampened to prevent hub files from dominating all queries.
-        // Applied before graph augmentation so expanded hits inherit consistent scaling.
-        // Gated on `self.pagerank_boost` so benchmarks can ablate this signal.
-        if !self.use_unified_search && self.pagerank_boost {
-            let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
-            let ranks = self.backend.get_file_ranks(&file_paths).await.unwrap_or_default();
-            if !ranks.is_empty() {
-                let median = {
-                    let mut vals: Vec<f64> =
-                        ranks.values().copied().filter(|v| *v > 0.0).collect();
-                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    if vals.is_empty() { 1.0 } else { vals[vals.len() / 2] }
-                };
-                for hit in &mut hits {
-                    if let Some(&pr) = ranks.get(&hit.file_path) {
-                        if pr > 0.0 {
-                            let boost = 1.0 + 0.3 * (1.0 + pr / median).ln();
-                            hit.score *= boost;
+            // PageRank boost: structurally important files get a mild score uplift.
+            // Log-dampened to prevent hub files from dominating all queries.
+            if !self.use_unified_search && self.pagerank_boost {
+                let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
+                let ranks = self.backend.get_file_ranks(&file_paths).await.unwrap_or_default();
+                if !ranks.is_empty() {
+                    let median = {
+                        let mut vals: Vec<f64> =
+                            ranks.values().copied().filter(|v| *v > 0.0).collect();
+                        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        if vals.is_empty() { 1.0 } else { vals[vals.len() / 2] }
+                    };
+                    for hit in &mut hits {
+                        if let Some(&pr) = ranks.get(&hit.file_path) {
+                            if pr > 0.0 {
+                                let boost = 1.0 + 0.3 * (1.0 + pr / median).ln();
+                                hit.score *= boost;
+                            }
                         }
                     }
                 }
             }
-        }
+
+            if !hits.is_empty() && !self.use_unified_search && include_graph && max_depth > 0 {
+                let graph_start = std::time::Instant::now();
+                let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
+                hits = self.augment_with_graph(hits, max_depth, best_score, &query_vec).await?;
+                timings.graph_ms = graph_start.elapsed().as_millis() as u64;
+            }
+
+            self.candidate_cache
+                .lock()
+                .expect("candidate_cache mutex poisoned")
+                .put(candidate_cache_key, hits.clone());
+            hits
+        };
+        timings.retrieve_ms = retrieve_start.elapsed().as_millis() as u64;
 
         if hits.is_empty() {
             timings.total_ms = total_start.elapsed().as_millis() as u64;
@@ -581,17 +623,6 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 "search pipeline timings"
             );
             return Ok((vec![], timings));
-        }
-
-        // -- Graph augmentation ------------------------------------------------
-        // Pull in chunks from files reachable via resolved import edges.
-        // Runs after hybrid search (so we have seed hits) but before MMR +
-        // reranker (so expanded results participate in filtering).
-        if !self.use_unified_search && include_graph && max_depth > 0 {
-            let graph_start = std::time::Instant::now();
-            let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
-            hits = self.augment_with_graph(hits, max_depth, best_score, &query_vec).await?;
-            timings.graph_ms = graph_start.elapsed().as_millis() as u64;
         }
 
         // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
@@ -801,6 +832,25 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             })
             .map(str::to_string)
             .collect()
+    }
+
+    fn retrieval_cache_key(
+        &self,
+        normalized_query: &str,
+        bm25_query: &str,
+        top_k: usize,
+        include_graph: bool,
+        max_depth: usize,
+    ) -> String {
+        format!(
+            "q={normalized_query}\nfts={bm25_query}\ntop_k={top_k}\ngraph={include_graph}\ndepth={max_depth}\nunified={}\npagerank_boost={}\nfts_weight={:016x}\ngraph_score_factor={:016x}\ngraph_min_score={:016x}\npagerank_factor={:016x}",
+            self.use_unified_search,
+            self.pagerank_boost,
+            self.fts_weight.to_bits(),
+            self.graph_score_factor.to_bits(),
+            self.graph_min_score.to_bits(),
+            self.pagerank_factor.to_bits(),
+        )
     }
 
     // -- Private helpers -----------------------------------------------------
@@ -1267,7 +1317,7 @@ fn query_asks_about_docs(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, query_asks_about_testing, query_asks_about_docs, query_asks_about_entry_point};
+    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, query_asks_about_testing};
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -1870,5 +1920,93 @@ mod tests {
             "hop-1 (b.rs, score={}) should score higher than hop-2 (c.rs, score={})",
             score_b_d2, score_c_d2
         );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockCachingBackend {
+        hybrid_calls: AtomicUsize,
+    }
+
+    impl MockCachingBackend {
+        fn new() -> Self {
+            Self { hybrid_calls: AtomicUsize::new(0) }
+        }
+
+        fn hybrid_calls(&self) -> usize {
+            self.hybrid_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for MockCachingBackend {
+        async fn initialize(&self, _dim: usize) -> anyhow::Result<()> { Ok(()) }
+        async fn upsert_file(&self, _r: &crate::schema::FileRecord) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_chunks_for_file(&self, _file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
+        async fn get_chunks_for_files(&self, _file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
+        async fn upsert_edges(&self, _e: &[crate::schema::EdgeRecord]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn traverse_imports(&self, _file_path: &str, _max_depth: usize, _edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
+        async fn traverse_importers(&self, _file_path: &str, _max_depth: usize, _edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
+        async fn hybrid_search(&self, _query_vec: &[f32], _query_str: &str, _top_k: usize) -> anyhow::Result<Vec<SearchResult>> {
+            self.hybrid_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![SearchResult {
+                file_path: "src/lib.rs".to_string(),
+                chunk_idx: 0,
+                content: "fn cached() {}".to_string(),
+                start_line: 1,
+                end_line: 1,
+                chunk_type: "function".to_string(),
+                score: 1.0,
+                match_quality: "".to_string(),
+                why: "hybrid".to_string(),
+            }])
+        }
+        async fn stats(&self) -> anyhow::Result<IndexStats> { Ok(IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None, watching: false, estimated_stale: 0 }) }
+        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn find_symbols(&self, _name: &str, _kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> { Ok(vec![]) }
+        async fn get_chunk_embeddings(&self, _keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![vec![1.0, 0.0, 0.0, 0.0]]) }
+        async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
+        async fn get_file_ranks(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
+        async fn upsert_cochange_edges(&self, _pairs: &[crate::cochange::CoChangePair]) -> anyhow::Result<()> { Ok(()) }
+        async fn compute_symbol_roles(&self) -> anyhow::Result<()> { Ok(()) }
+        async fn get_symbol_roles(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> { Ok(Default::default()) }
+        async fn hnsw_neighbors(&self, _seeds: &[(String, usize)], _max_dist: f64, _limit: usize) -> anyhow::Result<Vec<(String, usize, f64)>> { Ok(vec![]) }
+        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
+        async fn get_repo_map_data(&self) -> anyhow::Result<crate::schema::RepoMapData> { Ok(crate::schema::RepoMapData { files: vec![], import_edges: vec![] }) }
+        async fn upsert_call_edges(&self, _edges: &[crate::schema::CallEdge]) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_call_edges_for_file(&self, _file_path: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn get_callers(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
+        async fn get_callees(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
+        async fn unified_search(&self, _query_vec: &[f32], _query_str: &str, _top_k: usize, _graph_depth: usize, _fts_weight: f64, _graph_score_factor: f64, _graph_min_score: f64, _pagerank_factor: f64) -> anyhow::Result<Vec<SearchResult>> { Ok(vec![]) }
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_search_uses_cached_candidate_set() {
+        let backend = Arc::new(MockCachingBackend::new());
+        let searcher = Searcher::new(backend.clone(), MockProvider);
+
+        let _ = searcher.search_with_timings("cached query", 5, false, 0, 0.0, None).await.unwrap();
+        let _ = searcher.search_with_timings("cached query", 5, false, 0, 0.0, None).await.unwrap();
+
+        assert_eq!(backend.hybrid_calls(), 1, "expected retrieval backend to run once for identical repeated query");
+    }
+
+    #[tokio::test]
+    async fn changing_graph_depth_busts_candidate_cache() {
+        let backend = Arc::new(MockCachingBackend::new());
+        let searcher = Searcher::new(backend.clone(), MockProvider);
+
+        let _ = searcher.search_with_timings("cached query", 5, false, 0, 0.0, None).await.unwrap();
+        let _ = searcher.search_with_timings("cached query", 5, true, 2, 0.0, None).await.unwrap();
+
+        assert_eq!(backend.hybrid_calls(), 2, "expected different retrieval knobs to miss the candidate cache");
     }
 }
