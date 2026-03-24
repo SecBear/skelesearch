@@ -769,9 +769,10 @@ impl SkeleSearchServer {
             state.started_at = std::time::Instant::now();
         }
 
-        // Clone Arcs that the background task needs.
-        let backend = Arc::clone(&self.backend);
-        let manifest_path = Arc::clone(&self.manifest_path);
+        // Resolve the correct backend for the target path. For cross-project
+        // indexing, this opens/caches a backend in the target's .skelesearch/.
+        let (backend, manifest_path) = self.resolve_backend(Some(&input.path)).await?;
+        let manifest_path = Arc::new(manifest_path);
         let provider_arc = Arc::clone(&self.provider);
         let cached_searcher_arc = Arc::clone(&self.cached_searcher);
         let index_state = Arc::clone(&self.index_state);
