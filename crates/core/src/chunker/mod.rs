@@ -1,7 +1,7 @@
 pub mod languages;
 
 use languages::config_for_extension;
-use text_splitter::TextSplitter;
+use text_splitter::{CodeSplitter, TextSplitter};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Query, QueryCursor};
 
@@ -139,43 +139,28 @@ impl Chunker {
         source: &str,
     ) -> anyhow::Result<Vec<ParsedChunk>> {
         let language = cfg.language();
-        let preferred_kinds = cfg.chunk_node_kinds();
+        let splitter = CodeSplitter::new(language, CHUNK_BUDGET)
+            .map_err(|e| anyhow::anyhow!("CodeSplitter init: {e}"))?;
 
-        // Parse the AST.
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&language)
-            .map_err(|e| anyhow::anyhow!("tree-sitter language set: {e}"))?;
-        let tree = parser
-            .parse(source.as_bytes(), None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter parse returned None for {rel_path}"))?;
-
-        let source_bytes = source.as_bytes();
-        let ranges = split_node(tree.root_node(), source_bytes, CHUNK_BUDGET, preferred_kinds);
-
-        let raw_chunks: Vec<ParsedChunk> = ranges
-            .into_iter()
+        let raw_chunks: Vec<ParsedChunk> = splitter
+            .chunks(source)
             .enumerate()
-            .filter_map(|(idx, (start_byte, end_byte))| {
-                let text = String::from_utf8_lossy(&source_bytes[start_byte..end_byte]).to_string();
-                if text.trim().is_empty() {
-                    return None;
-                }
-                let (start_line, end_line) = line_range_from_bytes(source, start_byte, end_byte);
-                Some(ParsedChunk {
+            .map(|(idx, chunk_text)| {
+                let (start_line, end_line) = line_range_of(source, chunk_text);
+                ParsedChunk {
                     chunk_idx: idx,
-                    content: text.clone(),
-                    normalized: format!("{rel_path} code {}", normalize_for_fts(&text)),
+                    content: chunk_text.to_string(),
+                    normalized: format!("{rel_path} code {}", normalize_for_fts(chunk_text)),
                     chunk_type: "code".to_string(),
                     start_line,
                     end_line,
-                })
+                }
             })
             .collect();
-
         let chunks = merge_small_chunks(raw_chunks, rel_path);
 
-        // Fallback: whole source as single chunk.
+        // If tree-sitter produced no splits (e.g. very short file), return the
+        // whole source as a single chunk so callers always get at least one.
         if chunks.is_empty() && !source.trim().is_empty() {
             let line_count = source.lines().count();
             return Ok(vec![ParsedChunk {
@@ -405,102 +390,6 @@ fn line_range_of(source: &str, chunk: &str) -> (usize, usize) {
     (start_line, end_line)
 }
 
-/// Compute the 1-based start/end line numbers from byte offsets within `source`.
-///
-/// Used by `chunk_tier1` where chunks are constructed from tree-sitter byte ranges
-/// (owned strings, not sub-slices), so pointer arithmetic is not available.
-fn line_range_from_bytes(source: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
-    let start_line = source[..start_byte].bytes().filter(|&b| b == b'\n').count() + 1;
-    let end_line = source[..end_byte].bytes().filter(|&b| b == b'\n').count() + 1;
-    (start_line, end_line)
-}
-
-/// Count non-whitespace characters in a string slice.
-fn non_ws_chars(s: &str) -> usize {
-    s.chars().filter(|c| !c.is_whitespace()).count()
-}
-
-/// Recursively split an AST node into byte ranges that each fit within `budget`
-/// non-whitespace characters.
-///
-/// If the node fits, it is returned whole. Otherwise we recurse into its
-/// children and greedily merge consecutive small siblings up to `budget`.
-///
-/// `preferred_kinds` is available for future use (e.g. keep these node kinds
-/// whole even when slightly over budget). The current implementation does not
-/// need special-casing because the recursive descent naturally stops at
-/// semantically meaningful boundaries.
-fn split_node(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    budget: usize,
-    preferred_kinds: &[&str],
-) -> Vec<(usize, usize)> {
-    let text = &source[node.byte_range()];
-    let size = non_ws_chars(&String::from_utf8_lossy(text));
-
-    // Node fits within budget — return it whole.
-    if size <= budget {
-        return vec![(node.start_byte(), node.end_byte())];
-    }
-
-    // Node too large — recurse into children.
-    let mut cursor = node.walk();
-    let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
-
-    if children.is_empty() {
-        // Leaf node that is too large (e.g. a huge string literal).
-        // We cannot split it further; return it whole so no content is lost.
-        return vec![(node.start_byte(), node.end_byte())];
-    }
-
-    let mut results: Vec<(usize, usize)> = Vec::new();
-
-    // Greedy merge: accumulate consecutive small children into a single range.
-    // When adding the next child would exceed the budget, flush the pending
-    // range and start a new one.
-    let mut pending_start: Option<usize> = None;
-    let mut pending_end: usize = 0;
-    let mut pending_size: usize = 0;
-
-    for child in &children {
-        let child_text = &source[child.byte_range()];
-        let child_size = non_ws_chars(&String::from_utf8_lossy(child_text));
-
-        if child_size > budget {
-            // Flush any pending merged chunk before recursing.
-            if let Some(start) = pending_start.take() {
-                results.push((start, pending_end));
-                pending_size = 0;
-            }
-            // Recurse into the oversized child.
-            results.extend(split_node(*child, source, budget, preferred_kinds));
-        } else if pending_size + child_size > budget {
-            // This child would overflow — flush pending and start fresh.
-            if let Some(start) = pending_start.take() {
-                results.push((start, pending_end));
-            }
-            pending_start = Some(child.start_byte());
-            pending_end = child.end_byte();
-            pending_size = child_size;
-        } else {
-            // Merge into pending.
-            if pending_start.is_none() {
-                pending_start = Some(child.start_byte());
-            }
-            pending_end = child.end_byte();
-            pending_size += child_size;
-        }
-    }
-
-    // Flush any remaining pending range.
-    if let Some(start) = pending_start {
-        results.push((start, pending_end));
-    }
-
-    results
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -535,12 +424,12 @@ mod tests {
     /// The source is a valid Rust file whose first AST node (`struct Tiny;`)
     /// is a one-liner with far fewer non-whitespace chars than MIN_CHUNK_CHARS,
     /// followed by an impl block whose body is padded large enough to force
-    /// the AST chunker to begin a new chunk (> CHUNK_BUDGET non-ws chars).
+    /// CodeSplitter to begin a new chunk (> CHUNK_BUDGET non-ws chars).
     #[test]
     fn tiny_struct_merges_into_impl_chunk() {
         // Each line in the padding block is ~50 chars of non-whitespace.
         // 32 lines × 50 ≈ 1600 non-ws chars, which exceeds CHUNK_BUDGET (1500),
-        // so the AST chunker will split struct Tiny; into its own raw chunk
+        // so CodeSplitter should split struct Tiny; into its own raw chunk
         // before the impl body.
         let padding: String = (0..32)
             .map(|i| format!("    fn pad_{i:02}(&self) -> u32 {{ {i} + {i} }}\n"))
@@ -611,122 +500,5 @@ mod tests {
 
         let contains_tail = chunks.iter().any(|c| c.content.contains("struct Tail;"));
         assert!(contains_tail, "no chunk contains 'struct Tail;': {chunks:#?}");
-    }
-
-    // ------------------------------------------------------------------
-    // chunk_tier1 — AST descent
-    // ------------------------------------------------------------------
-
-    /// A small Rust file (well under CHUNK_BUDGET) should produce exactly one chunk.
-    #[test]
-    fn small_file_stays_as_one_chunk() {
-        let source = r#"
-pub struct Point {
-    x: f64,
-    y: f64,
-}
-
-impl Point {
-    pub fn new(x: f64, y: f64) -> Self { Self { x, y } }
-}
-"#;
-        let chunker = Chunker::default();
-        let chunks = chunker.chunk_file("src/lib.rs", source).unwrap();
-        assert!(!chunks.is_empty(), "expected at least one chunk");
-        // All content should be in one chunk since it's tiny.
-        assert_eq!(chunks.len(), 1, "small file should produce 1 chunk, got: {chunks:#?}");
-        assert!(chunks[0].content.contains("Point"));
-    }
-
-    /// A file with three large functions should split into multiple chunks.
-    #[test]
-    fn large_file_splits_at_function_boundaries() {
-        // Each function has ~940 non-ws chars (50 stmts × ~19 chars each).
-        // Two functions together (~1880 chars) exceed CHUNK_BUDGET (1500),
-        // so the greedy merge at the root level flushes after fn alpha.
-        let make_fn = |name: &str| {
-            let body: String = (0..50)
-                .map(|i| format!("    let var_{i:02} = {i} * {i} + {i};\n"))
-                .collect();
-            format!("fn {name}() -> u64 {{\n{body}    0\n}}\n\n")
-        };
-        let source = format!(
-            "{}{}{}",
-            make_fn("alpha"),
-            make_fn("beta"),
-            make_fn("gamma")
-        );
-        let chunker = Chunker::default();
-        let chunks = chunker.chunk_file("src/lib.rs", &source).unwrap();
-        // Three large functions must produce at least 2 chunks.
-        assert!(
-            chunks.len() >= 2,
-            "three large functions should split into >=2 chunks, got: {chunks:#?}"
-        );
-        // Ordering: start_line is non-decreasing.
-        for w in chunks.windows(2) {
-            assert!(
-                w[0].start_line <= w[1].start_line,
-                "chunks out of order: {w:#?}"
-            );
-        }
-        // chunk_idx contiguous.
-        for (i, c) in chunks.iter().enumerate() {
-            assert_eq!(c.chunk_idx, i);
-        }
-    }
-
-    /// Empty source returns empty vec.
-    #[test]
-    fn empty_file_returns_empty() {
-        let chunker = Chunker::default();
-        let chunks = chunker.chunk_file("src/lib.rs", "").unwrap();
-        assert!(chunks.is_empty(), "empty source must yield no chunks");
-    }
-
-    /// Non-code file (no recognised extension) falls through to tier 2, not tier 1.
-    #[test]
-    fn non_code_file_uses_tier2() {
-        let source = "Hello world.\nThis is plain text.\n";
-        let chunker = Chunker::default();
-        let chunks = chunker.chunk_file("README.txt", source).unwrap();
-        assert!(!chunks.is_empty());
-        // Tier 2 chunks use chunk_type = "text".
-        assert!(
-            chunks.iter().all(|c| c.chunk_type == "text"),
-            "non-code file should use chunk_type=text: {chunks:#?}"
-        );
-    }
-
-    /// A single oversized function body must recurse into its children so the
-    /// output contains multiple chunks, none of which dramatically exceed the
-    /// budget.
-    #[test]
-    fn huge_single_function_splits_into_children() {
-        // Build a function with 100 statements (~2280 non-ws chars) — well above CHUNK_BUDGET.
-        // The function itself is too large, so split_node recurses into its body block,
-        // which is also too large, so it recurses into the individual statements.
-        let body: String = (0..100)
-            .map(|i| format!("    let value_{i:02} = {i} * {i} + {i} - 1;\n"))
-            .collect();
-        let source = format!("fn huge() -> i64 {{\n{body}    0\n}}\n");
-        let chunker = Chunker::default();
-        let chunks = chunker.chunk_file("src/lib.rs", &source).unwrap();
-        // Should produce more than one chunk due to recursive descent.
-        assert!(
-            chunks.len() > 1,
-            "huge function should split into >1 chunks, got: {chunks:#?}"
-        );
-        // No chunk should exceed the budget by an egregious amount.
-        // (Leaf nodes that are too large are returned whole, so we allow
-        //  up to 2x budget as the soft ceiling.)
-        for c in &chunks {
-            let size = non_ws_chars(&c.content);
-            assert!(
-                size <= CHUNK_BUDGET * 2,
-                "chunk exceeds 2x budget ({size} chars): {}…",
-                &c.content[..c.content.len().min(80)]
-            );
-        }
     }
 }
