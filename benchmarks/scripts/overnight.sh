@@ -25,7 +25,7 @@ fi
 # 1. Build
 echo ""
 echo "=== Step 1: Build ==="
-cargo build --release --features storage-sqlite
+cargo build --release --features storage-rocksdb
 echo "Binary: $BIN ($(date))"
 
 # 2. Unit tests
