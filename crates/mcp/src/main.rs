@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use skelesearch_core::EmbedProvider;
 use skelesearch_mcp::server::SkeleSearchServer;
+use skelesearch_telemetry::TracingOptions;
 
 // ---------------------------------------------------------------------------
 // Startup provider
@@ -49,11 +50,11 @@ struct Args {
 }
 
 fn main() {
-    // Initialise tracing to stderr. When OTEL_EXPORTER_OTLP_ENDPOINT is set
-    // and the `otlp` feature is enabled on skelesearch-telemetry, spans are
-    // also exported to the configured OTLP collector.
-    let _telemetry = skelesearch_telemetry::init_tracing("skelesearch-mcp", "info");
-
+    let mut tracing = TracingOptions::new("skelesearch-mcp", "info");
+    if env_flag("SKELESEARCH_LOG_FILE").unwrap_or(true) {
+        tracing = tracing.with_file_log_path(default_mcp_log_path());
+    }
+    let _telemetry = skelesearch_telemetry::init_tracing_with_options(tracing);
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     if let Err(e) = rt.block_on(async_main()) {
         eprintln!("skelesearch-mcp: fatal: {e:#}");
@@ -63,6 +64,8 @@ fn main() {
 
 async fn async_main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let pid = std::process::id();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let project_root = find_project_root();
     let skelesearch_dir = resolve_storage_dir(&project_root);
@@ -79,14 +82,25 @@ async fn async_main() -> anyhow::Result<()> {
         let addr: std::net::SocketAddr = addr_str.parse()
             .context("invalid --http address")?;
         tracing::info!(
-            "skelesearch-mcp starting on HTTP (storage: {})",
-            skelesearch_dir.display()
+            pid,
+            cwd = %cwd.display(),
+            project_root = %project_root.display(),
+            storage_dir = %skelesearch_dir.display(),
+            transport = "http",
+            bind_addr = %addr,
+            version = env!("CARGO_PKG_VERSION"),
+            "skelesearch-mcp startup"
         );
         server.serve_http(addr).await
     } else {
         tracing::info!(
-            "skelesearch-mcp starting on stdio (storage: {})",
-            skelesearch_dir.display()
+            pid,
+            cwd = %cwd.display(),
+            project_root = %project_root.display(),
+            storage_dir = %skelesearch_dir.display(),
+            transport = "stdio",
+            version = env!("CARGO_PKG_VERSION"),
+            "skelesearch-mcp startup"
         );
         server.serve_stdio().await
     }
@@ -142,4 +156,17 @@ fn resolve_storage_dir(project_root: &std::path::Path) -> PathBuf {
     let _ = std::fs::create_dir_all(&tmp);
     tracing::warn!(path = %tmp.display(), "using temp storage dir — index will not persist");
     tmp
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn default_mcp_log_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".cache")
+        .join("skelesearch")
+        .join("skelesearch-mcp.log")
 }

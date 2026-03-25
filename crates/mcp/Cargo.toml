@@ -45,6 +45,7 @@ notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 tracing-subscriber = { workspace = true }
 skelesearch-telemetry = { path = "../telemetry" }
+sysinfo = "0.30"
 
 [dev-dependencies]
 tempfile = { workspace = true }

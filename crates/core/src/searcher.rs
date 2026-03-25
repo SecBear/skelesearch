@@ -426,6 +426,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         self
     }
 
+    pub fn provider_name(&self) -> &str {
+        self.provider.name()
+    }
+
     /// Apply tuning parameters from a `SearchConfig`.
     pub fn with_search_tuning(mut self, config: &crate::Config) -> Self {
         self.fts_weight = config.search.fts_weight();
@@ -534,6 +538,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // repeated or near-identical queries.  Empty queries are not cached.
         let embed_start = std::time::Instant::now();
         let normalized_query = preprocessed.trim().to_string();
+        let mut query_cache_hit = false;
         let query_vec: Vec<f32> = if normalized_query.is_empty() {
             // Empty query: skip cache, return zero vector.
             vec![0.0; self.provider.dim()]
@@ -547,7 +552,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     .cloned()
             };
             if let Some(vec) = cached {
-                tracing::debug!("query embedding cache hit");
+                query_cache_hit = true;
+                tracing::debug!(provider = self.provider.name(), "query embedding cache hit");
                 vec
             } else {
                 // Apply model-specific query prefix (e.g. CodeRankEmbed instruction prefix).
@@ -574,12 +580,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Only runs when an expander is configured and the query looks conceptual.
         // Failures degrade gracefully: expansion is skipped, search proceeds.
         let expand_start = std::time::Instant::now();
+        let mut expansion_reason = "disabled";
         let expanded_keywords_raw = if let Some(ref expander) = self.expander {
             use crate::router::{classify_query, QueryStrategy};
             if classify_query(&preprocessed) == QueryStrategy::Semantic {
-                // Skip expansion when the query already has 3+ strong anchors
-                // (file paths, snake_case, or camelCase identifiers) — it's already
-                // specific enough that LLM expansion risks semantic drift, not gain.
                 let strong_anchors = preprocessed
                     .split_whitespace()
                     .filter(|w| {
@@ -590,18 +594,19 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     })
                     .count();
                 if strong_anchors < 3 {
+                    expansion_reason = "ran";
                     expander.expand(&preprocessed).await.unwrap_or_default()
                 } else {
+                    expansion_reason = "anchor_rich_skip";
                     vec![]
                 }
             } else {
+                expansion_reason = "non_semantic_skip";
                 vec![]
             }
         } else {
             vec![]
         };
-        // Only charge expand_ms when the expander is configured (i.e. it ran
-        // or was at least considered); 0 when no expander is attached.
         if self.expander.is_some() {
             timings.expand_ms = expand_start.elapsed().as_millis() as u64;
         }
@@ -683,6 +688,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 .get(&candidate_cache_key)
                 .cloned()
         };
+        let candidate_cache_hit = cached_hits.is_some();
         let hits = if let Some(cached) = cached_hits {
             tracing::debug!("candidate cache hit");
             cached
@@ -864,12 +870,20 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         if hits.is_empty() {
             timings.total_ms = total_start.elapsed().as_millis() as u64;
             tracing::info!(
+                provider = self.provider.name(),
+                query_cache_hit,
+                candidate_cache_hit,
+                expansion_reason,
+                sparse_enabled = self.sparse_provider.is_some(),
+                reranker_enabled = self.reranker.is_some(),
+                graph_enabled = include_graph,
                 embed_ms = timings.embed_ms,
                 retrieve_ms = timings.retrieve_ms,
                 expand_ms = timings.expand_ms,
                 rerank_ms = timings.rerank_ms,
                 graph_ms = timings.graph_ms,
                 total_ms = timings.total_ms,
+                results = 0,
                 "search pipeline timings"
             );
             return Ok((vec![], timings));
@@ -1036,12 +1050,20 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
         timings.total_ms = total_start.elapsed().as_millis() as u64;
         tracing::info!(
+            provider = self.provider.name(),
+            query_cache_hit,
+            candidate_cache_hit,
+            expansion_reason,
+            sparse_enabled = self.sparse_provider.is_some(),
+            reranker_enabled = self.reranker.is_some(),
+            graph_enabled = include_graph,
             embed_ms = timings.embed_ms,
             retrieve_ms = timings.retrieve_ms,
             expand_ms = timings.expand_ms,
             rerank_ms = timings.rerank_ms,
             graph_ms = timings.graph_ms,
             total_ms = timings.total_ms,
+            results = hits.len(),
             "search pipeline timings"
         );
         Ok((hits, timings))

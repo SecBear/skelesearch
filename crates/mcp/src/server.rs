@@ -13,10 +13,11 @@
 //     public method that tests can call directly.
 //   - Provider selection is explicit: unknown names return a clear error.
 
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock}};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock}, time::Duration};
 
 use notify::Watcher as _;
 
+use sysinfo::{Pid, System};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use rmcp::{
@@ -166,6 +167,8 @@ pub struct SkeleSearchServer {
     /// `on_initialized` is called on every client reconnect; this AtomicBool
     /// ensures the background watcher task is spawned only once.
     watcher_started: Arc<AtomicBool>,
+    /// Stable per-process identifier for correlating lifecycle logs.
+    instance_id: Arc<str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +206,71 @@ fn friendly_index_error_inner(err: &anyhow::Error, indexing_active: bool) -> Str
     }
 }
 
+fn new_instance_id() -> Arc<str> {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{pid:x}-{nanos:x}").into()
+}
+
+fn sample_process_resources() -> Option<(u64, u64, usize)> {
+    let pid = Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    sys.refresh_processes();
+    let process = sys.process(pid)?;
+    let rss_bytes = process.memory().saturating_mul(1024);
+    let virtual_bytes = process.virtual_memory().saturating_mul(1024);
+    let task_count = process.tasks().map(|t| t.len()).unwrap_or(0);
+    Some((rss_bytes, virtual_bytes, task_count))
+}
+
+fn spawn_index_resource_sampler(
+    instance_id: Arc<str>,
+    index_state: Arc<tokio::sync::RwLock<IndexProgress>>,
+    path: String,
+    trigger: &'static str,
+    provider: String,
+ ) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let snapshot = {
+                let state = index_state.read().await;
+                if state.status != IndexingStatus::Running {
+                    break;
+                }
+                (
+                    state.started_at.elapsed().as_secs(),
+                    state.files_done,
+                    state.files_found,
+                    state.chunks_done,
+                    state.cache_hits,
+                )
+            };
+            if let Some((rss_bytes, virtual_bytes, task_count)) = sample_process_resources() {
+                tracing::info!(
+                    instance_id = %instance_id,
+                    pid = std::process::id(),
+                    path = %path,
+                    trigger,
+                    provider = %provider,
+                    elapsed_s = snapshot.0,
+                    files_done = snapshot.1,
+                    files_found = snapshot.2,
+                    chunks_done = snapshot.3,
+                    cache_hits = snapshot.4,
+                    rss_bytes,
+                    virtual_bytes,
+                    task_count,
+                    "index resource sample"
+                );
+            }
+        }
+    });
+}
+
 
 impl SkeleSearchServer {
     /// Construct the server.
@@ -214,9 +282,19 @@ impl SkeleSearchServer {
         manifest_path: impl Into<PathBuf>,
         provider: impl EmbedProvider + Send + Sync + 'static,
     ) -> Self {
+        let manifest_path = Arc::new(manifest_path.into());
+        let instance_id = new_instance_id();
+        tracing::info!(
+            instance_id = %instance_id,
+            pid = std::process::id(),
+            provider = provider.name(),
+            provider_dim = provider.dim(),
+            manifest_path = %manifest_path.display(),
+            "constructed skelesearch MCP server"
+        );
         Self {
             backend,
-            manifest_path: Arc::new(manifest_path.into()),
+            manifest_path,
             provider: Arc::new(RwLock::new(ArcProvider::new(provider))),
             tool_router: Self::tool_router(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -224,6 +302,7 @@ impl SkeleSearchServer {
             index_state: Arc::new(tokio::sync::RwLock::new(IndexProgress::default())),
             backend_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
+            instance_id,
         }
     }
 
@@ -272,7 +351,7 @@ impl SkeleSearchServer {
         let backend = Arc::new(CozoBackend::open(skele_dir.join("index.db"))?);
         let manifest_path = skele_dir.join("manifest.db");
 
-        tracing::info!(project = %project_root.display(), "opened backend for new project");
+        tracing::info!(instance_id = %self.instance_id, project = %project_root.display(), manifest_path = %manifest_path.display(), "opened backend for new project");
 
         // Cache it
         let mut cache = self.backend_cache.write().await;
@@ -322,7 +401,7 @@ impl SkeleSearchServer {
     /// - Skips if cwd does not look like a code project (no project markers found).
     /// - Provider is auto-detected: Voyage → OpenAI → FastEmbed (zero-config fallback).
     async fn auto_index_if_needed(&self) {
-        tracing::info!("auto_index_if_needed: entry");
+        tracing::info!(instance_id = %self.instance_id, "auto_index_if_needed: entry");
 
         // Opt-out escape hatch for managed environments.
         if std::env::var("SKELESEARCH_NO_AUTO_INDEX").is_ok() {
@@ -334,7 +413,7 @@ impl SkeleSearchServer {
         {
             let state = self.index_state.read().await;
             if state.status == IndexingStatus::Running {
-                tracing::info!("auto_index_if_needed: indexing already in progress, skipping");
+                tracing::info!(instance_id = %self.instance_id, path = %state.path, "auto_index_if_needed: indexing already in progress, skipping");
                 return;
             }
         }
@@ -345,6 +424,7 @@ impl SkeleSearchServer {
         let needs_index = match self.backend.stats().await {
             Ok(s) => {
                 tracing::info!(
+                    instance_id = %self.instance_id,
                     indexed_files = s.indexed_files,
                     total_chunks = s.total_chunks,
                     "auto_index_if_needed: backend stats OK"
@@ -368,7 +448,7 @@ impl SkeleSearchServer {
             }
         };
         if !needs_index {
-            tracing::info!("auto_index_if_needed: index already populated, skipping");
+            tracing::info!(instance_id = %self.instance_id, "auto_index_if_needed: index already populated, skipping");
             return;
         }
 
@@ -732,6 +812,10 @@ impl SkeleSearchServer {
             }
         }
 
+        let provider_name = self.provider
+            .read()
+            .map(|p| p.name().to_string())
+            .unwrap_or_else(|_| "<poisoned-provider-lock>".to_string());
         let t0 = std::time::Instant::now();
         let searcher = self.get_or_build_searcher().await?;
         let build_ms = t0.elapsed().as_millis() as u64;
@@ -747,6 +831,8 @@ impl SkeleSearchServer {
             .await?;
         let total_ms = search_start.elapsed().as_millis() as u64;
         tracing::info!(
+            instance_id = %self.instance_id,
+            provider = %provider_name,
             build_ms,
             embed_ms = timings.embed_ms,
             retrieve_ms = timings.retrieve_ms,
@@ -756,6 +842,10 @@ impl SkeleSearchServer {
             pipeline_ms = timings.total_ms,
             total_ms,
             results = results.len(),
+            query_len = input.query.len(),
+            branch_scope = input.branch_scope,
+            include_graph = input.include_graph,
+            strategy = "semantic",
             "search_code timings"
         );
 
@@ -877,6 +967,14 @@ impl SkeleSearchServer {
             state.error = None;
             state.started_at = std::time::Instant::now();
         }
+        tracing::info!(
+            instance_id = %self.instance_id,
+            trigger = "manual_or_auto",
+            provider = provider_name,
+            path = %input.path,
+            files_queued,
+            "index_codebase accepted"
+        );
 
         // Resolve the correct backend for the target path. For cross-project
         // indexing, this opens/caches a backend in the target's .skelesearch/.
@@ -885,6 +983,14 @@ impl SkeleSearchServer {
         let provider_arc = Arc::clone(&self.provider);
         let cached_searcher_arc = Arc::clone(&self.cached_searcher);
         let index_state = Arc::clone(&self.index_state);
+        let instance_id = Arc::clone(&self.instance_id);
+        spawn_index_resource_sampler(
+            Arc::clone(&instance_id),
+            Arc::clone(&index_state),
+            input.path.clone(),
+            "manual_or_auto",
+            provider_name_owned.clone(),
+        );
 
         tokio::task::spawn(async move {
             let backend2 = Arc::clone(&backend);
@@ -892,8 +998,13 @@ impl SkeleSearchServer {
             let path2 = path.clone();
             let provider_name_for_closure = provider_name_owned;
 
-            // ManifestStore is !Send — run indexing in a dedicated current_thread
-            // runtime inside spawn_blocking so the outer async task stays Send.
+            tracing::info!(
+                instance_id = %instance_id,
+                path = %path2.display(),
+                provider = %provider_name_for_closure,
+                "background index task started"
+            );
+
             let result = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -936,7 +1047,7 @@ impl SkeleSearchServer {
                     // Invalidate cached searcher so the next search rebuilds with
                     // the new provider and any fresh config.
                     *cached_searcher_arc.write().await = None;
-                    tracing::info!("searcher cache invalidated after background indexing");
+                    tracing::info!(instance_id = %instance_id, "searcher cache invalidated after background indexing");
 
                     let mut state = index_state.write().await;
                     state.status = IndexingStatus::Done;
@@ -944,9 +1055,13 @@ impl SkeleSearchServer {
                     state.chunks_done = index_result.total_chunks;
                     state.cache_hits = index_result.cache_hits;
                     tracing::info!(
+                        instance_id = %instance_id,
                         path = %state.path,
+                        provider = provider.name(),
                         indexed = index_result.indexed_files,
                         chunks = index_result.total_chunks,
+                        cache_hits = index_result.cache_hits,
+                        elapsed_s = state.started_at.elapsed().as_secs(),
                         "background indexing complete"
                     );
                 }
@@ -961,14 +1076,14 @@ impl SkeleSearchServer {
                              or set VOYAGE_API_KEY in the MCP server environment."
                         );
                     } else {
-                        tracing::error!(error = %index_err, "background indexing failed");
+                        tracing::error!(instance_id = %instance_id, error = %index_err, "background indexing failed");
                     }
                     let mut state = index_state.write().await;
                     state.status = IndexingStatus::Failed;
                     state.error = Some(friendly_index_error(&index_err));
                 }
                 Err(join_err) => {
-                    tracing::error!(error = %join_err, "indexer task panicked");
+                    tracing::error!(instance_id = %instance_id, error = %join_err, "indexer task panicked");
                     let mut state = index_state.write().await;
                     state.status = IndexingStatus::Failed;
                     state.error = Some(format!("indexer task panicked: {join_err}"));

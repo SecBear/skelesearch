@@ -505,6 +505,7 @@ Auto-clearing index for re-index.",
             }
 
             let mut batch_files: Vec<BatchFile<'_>> = Vec::with_capacity(batch.len());
+            let batch_start = std::time::Instant::now();
 
             for fc in batch {
                 let abs_path = root.join(&fc.rel_path);
@@ -549,6 +550,13 @@ Auto-clearing index for re-index.",
                 batch_idx += 1;
                 continue;
             }
+            tracing::info!(
+                provider = self.provider.name(),
+                batch_idx,
+                files_considered = batch.len(),
+                files_to_process = batch_files.len(),
+                "index batch prepared"
+            );
 
             // 2b. Delete stale backend data for this batch.
             for bf in &batch_files {
@@ -650,6 +658,7 @@ Auto-clearing index for re-index.",
                 let cached_count = sub.len() - miss_indices.len();
                 let miss_count = miss_indices.len();
                 tracing::debug!(hits = cached_count, misses = miss_count, "embedding cache");
+                let embed_batch_start = std::time::Instant::now();
                 result.cache_hits += cached_count;
                 result.cache_misses += miss_count;
 
@@ -666,6 +675,15 @@ Auto-clearing index for re-index.",
                     );
                     result
                 };
+                tracing::info!(
+                    provider = self.provider.name(),
+                    batch_idx,
+                    sub_batch_size = sub.len(),
+                    cache_hits = cached_count,
+                    cache_misses = miss_count,
+                    embed_ms = embed_batch_start.elapsed().as_millis() as u64,
+                    "index embed sub-batch complete"
+                );
 
                 // Persist fresh embeddings to cache.
                 let to_cache: Vec<(String, Vec<f32>)> = miss_indices
@@ -970,6 +988,14 @@ Auto-clearing index for re-index.",
 
             self.manifest.complete_batch(&run_id, batch_idx)?;
             batch_idx += 1;
+            tracing::info!(
+                provider = self.provider.name(),
+                batch_idx = batch_idx - 1,
+                files_indexed = batch_files.len(),
+                chunks_indexed = chunk_records_per_file.iter().map(|v| v.len()).sum::<usize>(),
+                elapsed_ms = batch_start.elapsed().as_millis() as u64,
+                "index batch complete"
+            );
         }
 
         // Clean up stale pending rows from crashed prior runs.  Only reached
@@ -1075,9 +1101,12 @@ Auto-clearing index for re-index.",
         });
 
         tracing::info!(
+            provider = self.provider.name(),
             files_indexed = result.indexed_files,
             files_deleted = result.deleted_files,
             chunks_embedded = result.total_chunks,
+            cache_hits = result.cache_hits,
+            cache_misses = result.cache_misses,
             parse_errors = result.parse_errors,
             graph_files_reprocessed = result.graph_files_reprocessed,
             graph_files_skipped = result.graph_files_skipped,

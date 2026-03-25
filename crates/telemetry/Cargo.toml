@@ -16,7 +16,8 @@ otlp = [
 
 [dependencies]
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
+tracing-appender = "0.2"
 anyhow = { workspace = true }
 
 # Optional: OpenTelemetry OTLP export (feature-gated)
