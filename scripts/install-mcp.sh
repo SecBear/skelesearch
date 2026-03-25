@@ -11,6 +11,13 @@ GLOBAL_MCP_JSON="$HOME/.omp/agent/mcp.json"
 
 mkdir -p "$BIN_DIR"
 
+
+# On macOS with Nix, the Nix linker may shadow the system linker and fail to find libc++.
+# Force system toolchain for linking when building outside nix develop.
+if [[ "$(uname)" == "Darwin" ]] && command -v nix &>/dev/null; then
+  export CC=/usr/bin/cc
+  export CXX=/usr/bin/c++
+fi
 echo "Installing skelesearch-mcp to $BIN_PATH"
 cargo install --path "$ROOT/crates/mcp" --root "$INSTALL_ROOT" --force --features skelesearch-core/storage-rocksdb
 
