@@ -299,12 +299,17 @@ pub async fn index_tier1(&self, files: &[FileContent]) -> anyhow::Result<()> {
         if let (Some(prev_provider), Some(prev_dim)) = (&stored_provider, stored_dim) {
             let cur_provider = self.provider.name();
             if prev_dim != dim {
-                anyhow::bail!(
-                    "embedding dimension mismatch: stored index uses provider '{}' (dim={}) \
-                     but this run requests provider '{}' (dim={}). \
-                     Delete the .skelesearch/ directory to re-index with the new provider.",
+                // A mismatched index is worth zero: the stored vectors are incompatible
+                // with the current provider's output.  `initialize(dim)` above already
+                // dropped and recreated the `chunks` relation with the new dimension.
+                // Clear manifest state so every file gets re-embedded on this run.
+                tracing::warn!(
+                    "provider mismatch: index uses {} (dim={}) but {} (dim={}) requested. \
+Auto-clearing index for re-index.",
                     prev_provider, prev_dim, cur_provider, dim
                 );
+                self.manifest.clear_file_hashes()?;
+                self.manifest.clear_embedding_cache()?;
             } else if prev_provider.as_str() != cur_provider {
                 tracing::info!(
                     prev_provider = %prev_provider,
