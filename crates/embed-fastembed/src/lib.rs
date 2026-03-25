@@ -506,11 +506,11 @@ fn pull_from_hf(
 /// Build an [`EmbedProvider`] by name, returning it boxed as a trait object.
 ///
 /// Supported names:
-/// - `"fastembed"` — GTE-ModernBERT-base (768-dim, CoIR 79.31, default)
-/// - `"fastembed-legacy"` — jina-embeddings-v2-base-code (768-dim, legacy default)
+/// - `"fastembed"` — jina-embeddings-v2-base-code (768-dim, ~90MB, fast, default)
+/// - `"gte-modernbert"` — GTE-ModernBERT-base (768-dim, CoIR 79.31, ~280MB ONNX / ~8GB RAM)
+/// - `"jina"` / `"fastembed-legacy"` — alias for fastembed
 /// - `"fastembed-q"` / `"fastembed-int8"` — quantized jina variant
 /// - `"coderankembed"` — nomic-ai/CodeRankEmbed via ONNX (768-dim, CoIR ≈ 60)
-/// - `"gte-modernbert"` — explicit alias for GTE-ModernBERT-base
 /// - `"openai"` — when the `openai` feature is enabled
 /// - `"voyage"` — when the `voyage` feature is enabled
 ///
@@ -521,14 +521,19 @@ fn pull_from_hf(
 /// provider fails to initialize.
 pub fn provider_from_name(name: &str) -> anyhow::Result<Box<dyn skelesearch_core::EmbedProvider>> {
     match name {
-        "fastembed" | "gte-modernbert" => {
+        "fastembed" => {
+            let p = FastEmbedProvider::default()
+                .map_err(|e| e.context("failed to initialise fastembed (jina) provider"))?;
+            Ok(Box::new(p))
+        }
+        "gte-modernbert" => {
             let p = FastEmbedProvider::gte_modernbert()
                 .map_err(|e| e.context("failed to initialise gte-modernbert provider"))?;
             Ok(Box::new(p))
         }
-        "fastembed-legacy" | "jina" => {
+        "jina" | "fastembed-legacy" => {
             let p = FastEmbedProvider::default()
-                .map_err(|e| e.context("failed to initialise fastembed-legacy (jina) provider"))?;
+                .map_err(|e| e.context("failed to initialise fastembed (jina) provider"))?;
             Ok(Box::new(p))
         }
         "fastembed-q" | "fastembed-int8" => {
