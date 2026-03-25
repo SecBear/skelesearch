@@ -71,6 +71,8 @@
             pkgs.clippy
             pkgs.rustfmt
             pkgs.clang
+            # bindgen needs libclang for RocksDB (cozorocks) builds
+            pkgs.llvmPackages.libclang.lib
             # Native TLS (reqwest -> openssl-sys)
             pkgs.openssl
             # Benchmark scripts (TypeScript)
@@ -84,6 +86,7 @@
           ];
           # numpy and other Python C-extensions need libstdc++.so.6 on NixOS.
           # stdenv.cc.cc.lib provides it; LD_LIBRARY_PATH makes it discoverable.
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
             pkgs.stdenv.cc.cc.lib
           ];
