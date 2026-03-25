@@ -6,7 +6,6 @@ use std::{
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 const LOCK_FILE: &str = ".skelesearch.lock";
@@ -78,7 +77,7 @@ pub fn try_acquire_indexing_lease(
         .open(&lock_path)
         .with_context(|| format!("failed to open indexing lock at {}", lock_path.display()))?;
 
-    match lock_file.try_lock_exclusive() {
+    match fs2::FileExt::try_lock_exclusive(&lock_file) {
         Ok(()) => {
             let lease = IndexingLease {
                 lock_file,
@@ -162,15 +161,15 @@ fn is_lock_held(storage_dir: &Path) -> anyhow::Result<bool> {
         .open(&lock_path)
         .with_context(|| format!("failed to open indexing lock at {}", lock_path.display()))?;
 
-    match lock_file.try_lock_shared() {
+    match fs2::FileExt::try_lock_shared(&lock_file) {
         Ok(()) => {
             lock_file
                 .unlock()
                 .with_context(|| format!("failed to unlock indexing lock at {}", lock_path.display()))?;
             Ok(false)
         }
-        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
-        Err(std::fs::TryLockError::Error(err)) => Err(err)
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(err)
             .with_context(|| format!("failed to check indexing lock at {}", lock_path.display())),
     }
 }
