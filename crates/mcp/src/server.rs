@@ -621,8 +621,19 @@ impl SkeleSearchServer {
 
 
     /// Return a cached Searcher or build one on the first call.
+    ///
     /// The searcher is invalidated (cache cleared) after indexing so
     /// provider changes and config changes are picked up.
+    ///
+    /// # Blocking note
+    /// CozoDB's SQLite backend serialises all transactions through a
+    /// `ShardedLock<()>`.  Write transactions (background indexer) hold
+    /// this lock for the duration of each `upsert_chunks` call, which
+    /// includes incremental HNSW graph updates (potentially seconds per
+    /// batch on a large corpus).  Any concurrent read (stats, search)
+    /// blocks until the write completes, easily exceeding the 30 s MCP
+    /// timeout.  Callers MUST check `is_indexing_active` before calling
+    /// this function and return a fast error when indexing is in progress.
     async fn get_or_build_searcher(&self) -> anyhow::Result<Arc<CachedSearcher>> {
         // Fast path: cached searcher exists.
         {
@@ -633,19 +644,27 @@ impl SkeleSearchServer {
         }
 
         // Slow path: build and cache.
+        let build_start = std::time::Instant::now();
         let mut guard = self.cached_searcher.write().await;
         // Double-check after acquiring write lock.
         if let Some(ref s) = *guard {
             return Ok(Arc::clone(s));
         }
 
+        tracing::info!("searcher cache miss — building searcher");
+        let t0 = std::time::Instant::now();
         let provider = self.prepare_search_provider().await?;
+        tracing::info!(elapsed_ms = t0.elapsed().as_millis() as u64, "prepare_search_provider done");
+
         let searcher = Searcher::new(Arc::clone(&self.backend), provider);
         // Load config early so pipeline auto-configuration can read expansion/sparse settings.
+        let t1 = std::time::Instant::now();
         let root = self.backend.list_indexed_paths().await
             .ok()
             .and_then(|p| common_ancestor(&p))
             .unwrap_or_else(|| PathBuf::from("/"));
+        tracing::info!(elapsed_ms = t1.elapsed().as_millis() as u64, "list_indexed_paths done");
+
         let config = Config::load(&root).unwrap_or_default();
         let (expander, reranker) = self.auto_configure_pipeline(&config);
         let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
@@ -671,7 +690,8 @@ impl SkeleSearchServer {
             }
         };
 
-        tracing::info!("searcher built and cached (LRU + connection pool will be reused)");
+        let total_build_ms = build_start.elapsed().as_millis() as u64;
+        tracing::info!(total_build_ms, "searcher built and cached (LRU + connection pool will be reused)");
         let arc = Arc::new(searcher);
         *guard = Some(Arc::clone(&arc));
         Ok(arc)
@@ -687,27 +707,56 @@ impl SkeleSearchServer {
     /// Semantic + FTS hybrid search.
     ///
     /// Returns an error when the index is empty (via `prepare_search_provider`).
+    /// Returns a fast error when background indexing is active to avoid blocking
+    /// on CozoDB's internal write lock (ShardedLock) held by the indexer.
     #[tracing::instrument(skip_all, fields(query = %input.query, top_k = input.top_k))]
     pub async fn search_code(
         &self,
         input: SearchCodeInput,
     ) -> anyhow::Result<SearchCodeResponse> {
+        let search_start = std::time::Instant::now();
+
+        // Guard: while the background indexer is running it holds CozoDB's
+        // internal ShardedLock in write mode for each batch (potentially
+        // several seconds each).  Any concurrent run_imm (stats, HNSW query)
+        // blocks until the current write completes, easily timing out the 30 s
+        // MCP deadline.  Fail fast so agents get an actionable message.
+        {
+            let state = self.index_state.read().await;
+            if state.status == IndexingStatus::Running {
+                anyhow::bail!(
+                    "Index is being built ({}). Poll index_status to check progress; \
+                     semantic search will be available once indexing completes.",
+                    state.path
+                );
+            }
+        }
+
+        let t0 = std::time::Instant::now();
         let searcher = self.get_or_build_searcher().await?;
+        let build_ms = t0.elapsed().as_millis() as u64;
+        if build_ms > 100 {
+            tracing::info!(build_ms, "get_or_build_searcher was slow (cold build)");
+        }
+
         let top_k = input.top_k.max(1);
         let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
         let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
         let (mut results, timings) = searcher
             .search_with_timings(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
             .await?;
+        let total_ms = search_start.elapsed().as_millis() as u64;
         tracing::info!(
+            build_ms,
             embed_ms = timings.embed_ms,
             retrieve_ms = timings.retrieve_ms,
             expand_ms = timings.expand_ms,
             rerank_ms = timings.rerank_ms,
             graph_ms = timings.graph_ms,
-            total_ms = timings.total_ms,
+            pipeline_ms = timings.total_ms,
+            total_ms,
             results = results.len(),
-            "search_code pipeline timings"
+            "search_code timings"
         );
 
         // Filter to branch-changed files if requested.
