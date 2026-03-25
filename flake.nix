@@ -87,6 +87,9 @@
           # numpy and other Python C-extensions need libstdc++.so.6 on NixOS.
           # stdenv.cc.cc.lib provides it; LD_LIBRARY_PATH makes it discoverable.
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          # Force clang for RocksDB C++ compilation (g++ may lack headers on NixOS)
+          CXX = "clang++";
+          CC = "clang";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
             pkgs.stdenv.cc.cc.lib
           ];
