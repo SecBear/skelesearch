@@ -32,6 +32,12 @@ pub struct IndexResult {
     pub cache_hits: usize,
     /// Number of chunk embeddings computed fresh by the provider.
     pub cache_misses: usize,
+    /// Number of files whose import and call edges were deleted and re-extracted.
+    /// Equal to `indexed_files` — edges are always recomputed when a file changes.
+    pub graph_files_reprocessed: usize,
+    /// Number of files whose existing graph edges were left untouched.
+    /// These files were unchanged (mtime+size match) so no edge work was done.
+    pub graph_files_skipped: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +343,8 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             if !force_reindex.contains(&rel_path)
                 && self.manifest.mtime_size_unchanged(&rel_path, mtime, size)?
             {
+                // Edges from this file are already in the backend and remain valid.
+                result.graph_files_skipped += 1;
                 continue;
             }
 
@@ -789,6 +797,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
 
                 self.manifest.upsert(&fc.rel_path, fc.mtime, fc.size, &bf.hash)?;
                 result.indexed_files += 1;
+                result.graph_files_reprocessed += 1;
             }
             // Phase 2e: Resolve call edges now that all symbols for this batch
             // are committed.  By deferring to here, find_symbols() sees the
@@ -958,6 +967,8 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             files_deleted = result.deleted_files,
             chunks_embedded = result.total_chunks,
             parse_errors = result.parse_errors,
+            graph_files_reprocessed = result.graph_files_reprocessed,
+            graph_files_skipped = result.graph_files_skipped,
             elapsed_ms = index_start.elapsed().as_millis() as u64,
             "index complete"
         );
