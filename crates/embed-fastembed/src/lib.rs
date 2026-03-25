@@ -179,6 +179,74 @@ impl FastEmbedProvider {
         )
     }
 
+    /// Construct a [`FastEmbedProvider`] backed by
+    /// [`Alibaba-NLP/gte-modernbert-base`](https://huggingface.co/Alibaba-NLP/gte-modernbert-base).
+    ///
+    /// **Performance**: CoIR nDCG@10 = 79.31, MTEB Code = 71.66 — substantially
+    /// better than jina-v2-base-code (~48) and CodeRankEmbed (~60).
+    /// **Dimensions**: 768 (same as jina/CodeRankEmbed).
+    /// **Context**: 8 192 tokens. **Pooling**: CLS (not mean).
+    /// **Size**: ~280 MB ONNX weights.
+    ///
+    /// Downloads model from HuggingFace on first call; uses fastembed cache
+    /// (`$FASTEMBED_CACHE_DIR` / `$HF_HOME` / `~/.cache/fastembed`) thereafter.
+    pub fn gte_modernbert() -> anyhow::Result<Self> {
+        let repo = "Alibaba-NLP/gte-modernbert-base";
+        let dim = 768;
+        let provider_name = "gte-modernbert";
+        let max_length = 8192;
+
+        let model_repo = pull_from_hf(repo, true)
+            .with_context(|| format!("failed to access HuggingFace repo '{repo}'"))?;
+
+        // GTE-ModernBERT stores ONNX in onnx/ subdirectory.
+        let onnx_bytes = std::fs::read(
+            model_repo
+                .get("onnx/model.onnx")
+                .with_context(|| format!("failed to download onnx/model.onnx from '{repo}'"))?,
+        )
+        .context("failed to read onnx/model.onnx")?;
+
+        let tokenizer_files = TokenizerFiles {
+            tokenizer_file: std::fs::read(
+                model_repo.get("tokenizer.json").context("failed to download tokenizer.json")?,
+            ).context("failed to read tokenizer.json")?,
+            config_file: std::fs::read(
+                model_repo.get("config.json").context("failed to download config.json")?,
+            ).context("failed to read config.json")?,
+            special_tokens_map_file: std::fs::read(
+                model_repo.get("special_tokens_map.json").context("failed to download special_tokens_map.json")?,
+            ).context("failed to read special_tokens_map.json")?,
+            tokenizer_config_file: std::fs::read(
+                model_repo.get("tokenizer_config.json").context("failed to download tokenizer_config.json")?,
+            ).context("failed to read tokenizer_config.json")?,
+        };
+
+        // GTE-ModernBERT uses CLS pooling: outputs.last_hidden_state[:, 0].
+        let user_model = UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files)
+            .with_pooling(Pooling::Cls);
+
+        let mut te = TextEmbedding::try_new_from_user_defined(
+            user_model,
+            InitOptionsUserDefined::new().with_max_length(max_length),
+        )
+        .with_context(|| format!("failed to initialise TextEmbedding from '{repo}'"))?;
+
+        // Verify dimension.
+        {
+            let probe = te.embed(vec!["dim probe".to_string()], None).context("dimension probe failed")?;
+            if let Some(first) = probe.first() {
+                anyhow::ensure!(first.len() == dim, "declared dim={dim} but model produced {}-dim vectors", first.len());
+            }
+        }
+
+        Ok(Self {
+            model: std::sync::Arc::new(std::sync::Mutex::new(te)),
+            dim,
+            name: provider_name.to_owned(),
+        })
+    }
+
     /// Internal helper shared by [`with_user_defined`] and [`coderankembed`].
     ///
     /// Downloads the model repo from HuggingFace (reusing the fastembed cache
@@ -438,10 +506,11 @@ fn pull_from_hf(
 /// Build an [`EmbedProvider`] by name, returning it boxed as a trait object.
 ///
 /// Supported names:
-/// - `"fastembed"` — jina-embeddings-v2-base-code (768-dim, default)
-/// - `"fastembed-q"` / `"fastembed-int8"` — quantized variant (same model,
-///   warns when no Q-variant available)
+/// - `"fastembed"` — GTE-ModernBERT-base (768-dim, CoIR 79.31, default)
+/// - `"fastembed-legacy"` — jina-embeddings-v2-base-code (768-dim, legacy default)
+/// - `"fastembed-q"` / `"fastembed-int8"` — quantized jina variant
 /// - `"coderankembed"` — nomic-ai/CodeRankEmbed via ONNX (768-dim, CoIR ≈ 60)
+/// - `"gte-modernbert"` — explicit alias for GTE-ModernBERT-base
 /// - `"openai"` — when the `openai` feature is enabled
 /// - `"voyage"` — when the `voyage` feature is enabled
 ///
@@ -452,9 +521,14 @@ fn pull_from_hf(
 /// provider fails to initialize.
 pub fn provider_from_name(name: &str) -> anyhow::Result<Box<dyn skelesearch_core::EmbedProvider>> {
     match name {
-        "fastembed" => {
+        "fastembed" | "gte-modernbert" => {
+            let p = FastEmbedProvider::gte_modernbert()
+                .map_err(|e| e.context("failed to initialise gte-modernbert provider"))?;
+            Ok(Box::new(p))
+        }
+        "fastembed-legacy" | "jina" => {
             let p = FastEmbedProvider::default()
-                .map_err(|e| e.context("failed to initialise fastembed provider"))?;
+                .map_err(|e| e.context("failed to initialise fastembed-legacy (jina) provider"))?;
             Ok(Box::new(p))
         }
         "fastembed-q" | "fastembed-int8" => {
@@ -475,7 +549,7 @@ pub fn provider_from_name(name: &str) -> anyhow::Result<Box<dyn skelesearch_core
         #[cfg(feature = "voyage")]
         "voyage" => Ok(Box::new(skelesearch_embed_voyage::provider_voyage()?)),
         other => {
-            let mut supported = vec!["fastembed", "fastembed-q", "fastembed-int8", "coderankembed"];
+            let mut supported = vec!["fastembed", "gte-modernbert", "fastembed-legacy", "jina", "fastembed-q", "fastembed-int8", "coderankembed"];
             #[cfg(feature = "openai")] supported.push("openai");
             #[cfg(feature = "voyage")] supported.push("voyage");
             anyhow::bail!("unknown embedding provider: '{}'. Supported: {}", other, supported.join(", "))
