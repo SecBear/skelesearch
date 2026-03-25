@@ -27,7 +27,12 @@ use rmcp::{
     service::{NotificationContext, RoleServer},
     tool, tool_handler, tool_router,
 };
-use skelesearch_core::{classify_query, grep_codebase, CozoBackend, Config, EmbedProvider, GrepOptions, IndexResult, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, StorageBackend};
+use skelesearch_core::{
+    classify_query, grep_codebase, is_indexing_active_elsewhere, read_shared_indexing_status,
+    try_acquire_indexing_lease, CozoBackend, Config, EmbedProvider, GrepOptions, IndexResult,
+    Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker,
+    SharedIndexingStatus, Searcher, StorageBackend,
+};
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 
 use crate::tools::{
@@ -95,6 +100,8 @@ pub struct IndexProgress {
     pub status: IndexingStatus,
     /// Absolute path being indexed.
     pub path: String,
+    /// Storage dir backing this indexing run, used to scope local state to one project.
+    pub storage_dir: String,
     /// Rough file count captured before spawning (0 if quick-count timed out).
     pub files_found: usize,
     /// Files indexed on completion (0 while running).
@@ -114,6 +121,7 @@ impl Default for IndexProgress {
         Self {
             status: IndexingStatus::Idle,
             path: String::new(),
+            storage_dir: String::new(),
             files_found: 0,
             files_done: 0,
             chunks_done: 0,
@@ -358,6 +366,13 @@ impl SkeleSearchServer {
         cache.insert(project_root, (Arc::clone(&backend), manifest_path.clone()));
 
         Ok((backend, manifest_path))
+    }
+
+    fn storage_dir_from_manifest_path(manifest_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+        manifest_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .with_context(|| format!("manifest path has no parent: {}", manifest_path.display()))
     }
 
     // -----------------------------------------------------------------------
@@ -796,20 +811,15 @@ impl SkeleSearchServer {
     ) -> anyhow::Result<SearchCodeResponse> {
         let search_start = std::time::Instant::now();
 
-        // Guard: while the background indexer is running it holds CozoDB's
-        // internal ShardedLock in write mode for each batch (potentially
-        // several seconds each).  Any concurrent run_imm (stats, HNSW query)
-        // blocks until the current write completes, easily timing out the 30 s
-        // MCP deadline.  Fail fast so agents get an actionable message.
-        {
-            let state = self.index_state.read().await;
-            if state.status == IndexingStatus::Running {
-                anyhow::bail!(
-                    "Index is being built ({}). Poll index_status to check progress; \
-                     semantic search will be available once indexing completes.",
-                    state.path
-                );
-            }
+        let default_storage_dir = Self::storage_dir_from_manifest_path(self.manifest_path.as_path())?;
+        if matches!(
+            self.current_indexing_progress(&default_storage_dir).await.as_ref().map(|p| p.status.as_str()),
+            Some("running")
+        ) {
+            anyhow::bail!(
+                "Index is being built for '{}'. Poll index_status to check progress; semantic search will be available once indexing completes.",
+                default_storage_dir.display()
+            );
         }
 
         let provider_name = self.provider
@@ -938,6 +948,7 @@ impl SkeleSearchServer {
         let provider_name_owned = provider_name.to_string();
 
         let path = std::path::PathBuf::from(&input.path);
+        let index_path = input.path.clone();
 
         // Quick best-effort file count before spawning.
         // Capped at 1 second so large repos don't delay the response.
@@ -954,12 +965,68 @@ impl SkeleSearchServer {
             }
         };
 
+        // Resolve the correct backend for the target path. For cross-project
+        // indexing, this opens/caches a backend in the target's .skelesearch/.
+        let (backend, manifest_path) = self.resolve_backend(Some(&index_path)).await?;
+        let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
+
+        // Best-effort stale-status cleanup + visibility for logs.
+        let _ = read_shared_indexing_status(&storage_dir)?;
+
+        let now = chrono::Utc::now();
+        let initial_shared_status = SharedIndexingStatus {
+            instance_id: self.instance_id.to_string(),
+            pid: std::process::id(),
+            path: index_path.clone(),
+            provider: provider_name_owned.clone(),
+            trigger: "manual_or_auto".to_string(),
+            status: "running".to_string(),
+            started_at: now,
+            updated_at: now,
+            files_total: files_queued,
+            files_done: 0,
+            chunks_done: 0,
+            cache_hits: 0,
+            error: None,
+        };
+
+        let lease = match try_acquire_indexing_lease(&storage_dir, &initial_shared_status)? {
+            Some(lease) => {
+                tracing::info!(
+                    instance_id = %self.instance_id,
+                    pid = std::process::id(),
+                    path = %index_path,
+                    storage_dir = %storage_dir.display(),
+                    "indexing lease acquired"
+                );
+                lease
+            }
+            None => {
+                let shared = read_shared_indexing_status(&storage_dir)?;
+                tracing::info!(
+                    instance_id = %self.instance_id,
+                    path = %index_path,
+                    storage_dir = %storage_dir.display(),
+                    holder_instance_id = shared.as_ref().map(|s| s.instance_id.as_str()),
+                    holder_pid = shared.as_ref().map(|s| s.pid),
+                    "indexing lease denied: another process is indexing"
+                );
+                return Ok(IndexCodebaseOutput {
+                    status: "already_indexing".to_string(),
+                    path: index_path,
+                    files_queued: 0,
+                    message: "another skelesearch process is indexing this project; use index_status to check progress".to_string(),
+                });
+            }
+        };
+
         // Mark Running before spawning to prevent TOCTOU: a second concurrent call
         // arriving before the spawned task runs would otherwise see Idle.
         {
             let mut state = self.index_state.write().await;
             state.status = IndexingStatus::Running;
             state.path = input.path.clone();
+            state.storage_dir = storage_dir.display().to_string();
             state.files_found = files_queued;
             state.files_done = 0;
             state.chunks_done = 0;
@@ -976,9 +1043,6 @@ impl SkeleSearchServer {
             "index_codebase accepted"
         );
 
-        // Resolve the correct backend for the target path. For cross-project
-        // indexing, this opens/caches a backend in the target's .skelesearch/.
-        let (backend, manifest_path) = self.resolve_backend(Some(&input.path)).await?;
         let manifest_path = Arc::new(manifest_path);
         let provider_arc = Arc::clone(&self.provider);
         let cached_searcher_arc = Arc::clone(&self.cached_searcher);
@@ -993,6 +1057,7 @@ impl SkeleSearchServer {
         );
 
         tokio::task::spawn(async move {
+            let _lease = lease;
             let backend2 = Arc::clone(&backend);
             let manifest_path2 = Arc::clone(&manifest_path);
             let path2 = path.clone();
@@ -1157,8 +1222,19 @@ impl SkeleSearchServer {
         &self,
         input: IndexStatusInput,
     ) -> anyhow::Result<IndexStatusOutput> {
-        let (backend, _) = self.resolve_backend(input.path.as_deref()).await?;
-        let indexing = self.current_indexing_progress().await;
+        let (backend, manifest_path) = self.resolve_backend(input.path.as_deref()).await?;
+        let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
+        let indexing = self.current_indexing_progress(&storage_dir).await;
+        if matches!(indexing.as_ref().map(|p| p.status.as_str()), Some("running")) {
+            return Ok(IndexStatusOutput {
+                indexed_files: indexing.as_ref().map(|p| p.files_done).unwrap_or(0),
+                total_chunks: indexing.as_ref().map(|p| p.chunks_done).unwrap_or(0),
+                last_indexed: None,
+                estimated_stale: 0,
+                watching: self.watcher_started.load(Ordering::Relaxed),
+                indexing,
+            });
+        }
         let stats = match backend.stats().await {
             Ok(s) => s,
             Err(ref e) if is_uninitialized_index_error(e) => {
@@ -1177,7 +1253,6 @@ impl SkeleSearchServer {
             indexed_files: stats.indexed_files,
             total_chunks: stats.total_chunks,
             last_indexed: stats.last_indexed.map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
-            // v1: no file-change detection; always 0 after a fresh index run.
             estimated_stale: 0,
             watching: self.watcher_started.load(Ordering::Relaxed),
             indexing,
@@ -1185,28 +1260,86 @@ impl SkeleSearchServer {
     }
 
     /// Snapshot the current background indexing progress for inclusion in `IndexStatusOutput`.
-    /// Returns `None` when no indexing has been started on this server instance.
-    async fn current_indexing_progress(&self) -> Option<IndexingProgress> {
-        let state = self.index_state.read().await;
-        match state.status {
-            IndexingStatus::Idle => None,
-            _ => {
-                let elapsed = state.started_at.elapsed().as_secs_f64();
+    /// Returns `None` when neither local nor shared cross-process indexing is active.
+    async fn current_indexing_progress(&self, storage_dir: &std::path::Path) -> Option<IndexingProgress> {
+        let storage_dir_str = storage_dir.display().to_string();
+        let local = {
+            let state = self.index_state.read().await;
+            match state.status {
+                IndexingStatus::Idle => None,
+                _ if state.storage_dir != storage_dir_str => None,
+                _ => {
+                    let elapsed = state.started_at.elapsed().as_secs_f64();
+                    Some(IndexingProgress {
+                        status: match state.status {
+                            IndexingStatus::Running => "running".to_string(),
+                            IndexingStatus::Done => "done".to_string(),
+                            IndexingStatus::Failed => "failed".to_string(),
+                            IndexingStatus::Idle => unreachable!(),
+                        },
+                        path: state.path.clone(),
+                        files_done: state.files_done,
+                        files_total: state.files_found,
+                        chunks_done: state.chunks_done,
+                        cache_hits: state.cache_hits,
+                        elapsed_seconds: elapsed,
+                        error: state.error.clone(),
+                    })
+                }
+            }
+        };
+
+        if matches!(local.as_ref().map(|p| p.status.as_str()), Some("running")) {
+            return local;
+        }
+
+        match read_shared_indexing_status(storage_dir) {
+            Ok(Some(shared)) => {
+                let elapsed_seconds = (chrono::Utc::now() - shared.started_at)
+                    .to_std()
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
                 Some(IndexingProgress {
-                    status: match state.status {
-                        IndexingStatus::Running => "running".to_string(),
-                        IndexingStatus::Done => "done".to_string(),
-                        IndexingStatus::Failed => "failed".to_string(),
-                        IndexingStatus::Idle => unreachable!(),
-                    },
-                    path: state.path.clone(),
-                    files_done: state.files_done,
-                    files_total: state.files_found,
-                    chunks_done: state.chunks_done,
-                    cache_hits: state.cache_hits,
-                    elapsed_seconds: elapsed,
-                    error: state.error.clone(),
+                    status: shared.status,
+                    path: shared.path,
+                    files_done: shared.files_done,
+                    files_total: shared.files_total,
+                    chunks_done: shared.chunks_done,
+                    cache_hits: shared.cache_hits,
+                    elapsed_seconds,
+                    error: shared.error,
                 })
+            }
+            Ok(None) => match is_indexing_active_elsewhere(storage_dir) {
+                Ok(true) => Some(IndexingProgress {
+                    status: "running".to_string(),
+                    path: storage_dir.display().to_string(),
+                    files_done: 0,
+                    files_total: 0,
+                    chunks_done: 0,
+                    cache_hits: 0,
+                    elapsed_seconds: 0.0,
+                    error: None,
+                }),
+                Ok(false) => local,
+                Err(err) => {
+                    tracing::warn!(
+                        instance_id = %self.instance_id,
+                        storage_dir = %storage_dir.display(),
+                        error = %err,
+                        "failed to probe indexing lock while reading shared indexing status"
+                    );
+                    local
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    instance_id = %self.instance_id,
+                    storage_dir = %storage_dir.display(),
+                    error = %err,
+                    "failed to read shared indexing status"
+                );
+                local
             }
         }
     }
@@ -1258,6 +1391,16 @@ impl SkeleSearchServer {
         // cross-project yet, resolve the backend and build a temporary searcher.
         if let Some(ref project) = input.project {
             let (backend, manifest_path) = self.resolve_backend(Some(project.as_str())).await?;
+            let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
+            if matches!(
+                self.current_indexing_progress(&storage_dir).await.as_ref().map(|p| p.status.as_str()),
+                Some("running")
+            ) {
+                anyhow::bail!(
+                    "Index is being built for '{}'. Poll index_status to check progress; semantic search will be available once indexing completes.",
+                    project
+                );
+            }
             // Read provider from target project's manifest — dimensions must match its index.
             let provider_name = ManifestStore::open(&manifest_path)
                 .ok()
