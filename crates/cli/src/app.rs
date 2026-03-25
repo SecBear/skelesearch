@@ -188,14 +188,27 @@ where
         _ => searcher.with_search_tuning(&config),
     };
 
-    // Query expansion: skip if explicitly disabled; otherwise attach LLMExpander
-    // when OPENAI_API_KEY is available.
-    let searcher = match config.search.expansion.enabled {
-        Some(false) => searcher,
-        _ => match std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()) {
+    // Query expansion: requires explicit opt-in via config (search.expansion.enabled = true)
+    // or the SKELESEARCH_EXPANSION env var.  OPENAI_API_KEY alone does not enable it —
+    // many devs have that key set for other tools and should not pay 1s+ latency per query.
+    let expansion_enabled = match config.search.expansion.enabled {
+        Some(true) => true,
+        Some(false) => false,
+        None => std::env::var("SKELESEARCH_EXPANSION").ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
+    };
+    let searcher = if expansion_enabled {
+        match std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()) {
             Some(key) => searcher.with_expander(Box::new(skelesearch_core::LLMExpander::new(key))),
-            None => searcher,
-        },
+            None => {
+                tracing::warn!("SKELESEARCH_EXPANSION set but OPENAI_API_KEY is missing; skipping expansion");
+                searcher
+            }
+        }
+    } else {
+        tracing::info!("query expansion disabled (set SKELESEARCH_EXPANSION=1 to enable)");
+        searcher
     };
 
     // Reranker: explicit config wins; fall back to env-var auto-detect.

@@ -113,7 +113,7 @@ pub struct RerankerConfig {
 /// Query expansion configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExpansionConfig {
-    /// Enable LLM query expansion.  Absent = auto-detect from OPENAI_API_KEY.
+    /// Enable LLM query expansion.  Default: disabled.  Set to true, or set SKELESEARCH_EXPANSION=1.
     #[serde(default)]
     pub enabled: Option<bool>,
 }

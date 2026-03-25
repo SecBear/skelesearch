@@ -512,15 +512,28 @@ impl SkeleSearchServer {
         hasher.finish()
     }
 
-    /// Auto-detect available API keys and configure the search pipeline.
-    /// Called once per search — cheap (just env var lookups), no memoization needed.
-    fn auto_configure_pipeline(&self) -> (Option<Box<dyn QueryExpander>>, Option<Box<dyn Reranker>>) {
-        let expander: Option<Box<dyn QueryExpander>> =
+    /// Configure the search pipeline from project config and env vars.
+    /// Expansion is opt-in (SKELESEARCH_EXPANSION=1 or config); rerankers auto-detect API keys.
+    fn auto_configure_pipeline(&self, config: &Config) -> (Option<Box<dyn QueryExpander>>, Option<Box<dyn Reranker>>) {
+        // Expansion requires explicit opt-in: either config.search.expansion.enabled = true
+        // or SKELESEARCH_EXPANSION=1|true|yes.  Having OPENAI_API_KEY alone is not enough —
+        // many devs have it set for other tools and should not pay 1s+ latency per query.
+        let expansion_enabled = match config.search.expansion.enabled {
+            Some(true) => true,
+            Some(false) => false,
+            None => std::env::var("SKELESEARCH_EXPANSION").ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+        };
+        let expander: Option<Box<dyn QueryExpander>> = if expansion_enabled {
             std::env::var("OPENAI_API_KEY").ok()
                 .filter(|k| !k.is_empty())
                 .map(|key| -> Box<dyn QueryExpander> {
                     Box::new(LLMExpander::new(key))
-                });
+                })
+        } else {
+            None
+        };
 
         // Try reranker keys in order: JINA_API_KEY, COHERE_API_KEY, VOYAGE_API_KEY.
         let reranker: Option<Box<dyn Reranker>> = None
@@ -591,6 +604,8 @@ impl SkeleSearchServer {
 
         if expander.is_some() {
             tracing::info!("query expansion enabled (OPENAI_API_KEY detected)");
+        } else {
+            tracing::info!("query expansion disabled (set SKELESEARCH_EXPANSION=1 to enable)");
         }
         if reranker.is_some() {
             let source = match std::env::var("SKELESEARCH_RERANKER").ok().as_deref() {
@@ -626,16 +641,17 @@ impl SkeleSearchServer {
 
         let provider = self.prepare_search_provider().await?;
         let searcher = Searcher::new(Arc::clone(&self.backend), provider);
-        let (expander, reranker) = self.auto_configure_pipeline();
+        // Load config early so pipeline auto-configuration can read expansion/sparse settings.
+        let root = self.backend.list_indexed_paths().await
+            .ok()
+            .and_then(|p| common_ancestor(&p))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let config = Config::load(&root).unwrap_or_default();
+        let (expander, reranker) = self.auto_configure_pipeline(&config);
         let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
         let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
         // Apply pagerank_boost and tuning from project config.
         let searcher = {
-            let root = self.backend.list_indexed_paths().await
-                .ok()
-                .and_then(|p| common_ancestor(&p))
-                .unwrap_or_else(|| PathBuf::from("/"));
-            let config = Config::load(&root).unwrap_or_default();
             let searcher = searcher.with_search_tuning(&config);
             let searcher = if config.search.pagerank_boost == Some(false) {
                 searcher.with_pagerank_boost(false)
