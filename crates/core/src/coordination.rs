@@ -52,7 +52,7 @@ impl Drop for IndexingLease {
                 tracing::debug!(path = %self.status_path.display(), error = %err, "failed to remove shared indexing status");
             }
         }
-        if let Err(err) = self.lock_file.unlock() {
+        if let Err(err) = fs2::FileExt::unlock(&self.lock_file) {
             tracing::debug!(path = %self.status_path.display(), error = %err, "failed to unlock indexing lease");
         }
     }
@@ -163,8 +163,7 @@ fn is_lock_held(storage_dir: &Path) -> anyhow::Result<bool> {
 
     match fs2::FileExt::try_lock_shared(&lock_file) {
         Ok(()) => {
-            lock_file
-                .unlock()
+            fs2::FileExt::unlock(&lock_file)
                 .with_context(|| format!("failed to unlock indexing lock at {}", lock_path.display()))?;
             Ok(false)
         }
