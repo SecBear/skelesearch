@@ -570,7 +570,7 @@ impl CozoBackend {
         let script = format!(
             r#"?[file_path, chunk_idx, bm25, content, chunk_type, start_line, end_line] :=
     ~chunks:text{{ file_path, chunk_idx | query: $qs, k: {limit}, score_kind: 'tf_idf', bind_score: bm25 }},
-    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _, _]
+    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _]
 :order -bm25
 :limit {limit}"#
         );
@@ -622,7 +622,7 @@ impl CozoBackend {
         let script = format!(
             r#"?[file_path, chunk_idx, dist, content, chunk_type, start_line, end_line] :=
     ~chunks:semantic{{ file_path, chunk_idx | query: $qv, k: {limit}, ef: 64, bind_distance: dist }},
-    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _, _]
+    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _]
 :order dist
 :limit {limit}"#
         );
@@ -673,7 +673,7 @@ impl CozoBackend {
         };
         let script = format!(
             r#"?[file_path, chunk_idx, dist] :=
-    ~chunks:doc_index{{ file_path, chunk_idx | query: $qv, k: {limit}, ef: 64, bind_distance: dist }}
+    ~doc_embeddings:doc_index{{ file_path, chunk_idx | query: $qv, k: {limit}, ef: 64, bind_distance: dist }}
 :order dist
 :limit {limit}"#
         );
@@ -770,9 +770,9 @@ impl StorageBackend for CozoBackend {
         // drop the dependent indexes (HNSW/FTS/LSH) and the relation itself, then recreate.
         // CozoDB has no ALTER TABLE, so a full drop+recreate is the only path.
         // This loses existing data — the caller must re-index after a migration.
-        const CHUNKS_EXPECTED_COLS: usize = 10;
+        const CHUNKS_EXPECTED_COLS: usize = 9;
         let chunks_create = format!(
-            ":create chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}>, doc_embedding: <F32; {dim}> }}"
+            ":create chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
         );
         match self.run_mut(&chunks_create, BTreeMap::new()) {
             Ok(_) => {}
@@ -805,14 +805,14 @@ impl StorageBackend for CozoBackend {
                                 // Indexes must be dropped before the relation that they reference.
                                 // Ignore errors — an index may not exist if a prior migration was partial.
                                 let _ = self.run_mut("::hnsw drop chunks:semantic", BTreeMap::new());
-                                let _ = self.run_mut("::hnsw drop chunks:doc_index", BTreeMap::new());
+                                let _ = self.run_mut("::hnsw drop chunks:doc_index", BTreeMap::new()); // legacy drop, may not exist
                                 let _ = self.run_mut("::fts drop chunks:text", BTreeMap::new());
                                 let _ = self.run_mut("::lsh drop chunks:dedup", BTreeMap::new());
                                 // :replace drops the existing relation and recreates it with the new schema.
                                 // An empty output rule is required — :replace cannot omit the query unlike :create.
                                 let chunks_replace = format!(
-                                    "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding, doc_embedding] <- [] \
-                                     :replace chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}>, doc_embedding: <F32; {dim}> }}"
+                                    "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] <- [] \
+                                     :replace chunks {{ file_path: String, chunk_idx: Int => content: String, normalized: String, description: String, chunk_type: String, start_line: Int, end_line: Int, embedding: <F32; {dim}> }}"
                                 );
                                 self.run_mut(&chunks_replace, BTreeMap::new())
                                     .map_err(|e| anyhow::anyhow!("chunks schema migration failed: {}", e))?;
@@ -837,6 +837,10 @@ impl StorageBackend for CozoBackend {
                                 let _ = self.run_mut(
                                     "?[from_file, from_chunk, to_file, edge_type, created_at] <- [] \
                                      :replace code_edges { from_file: String, from_chunk: Int, to_file: String => edge_type: String, created_at: Int }",
+                                    BTreeMap::new(),
+                                );
+                                let _ = self.run_mut(
+                                    "?[file_path, chunk_idx] := *doc_embeddings[file_path, chunk_idx, _] :rm doc_embeddings { file_path, chunk_idx }",
                                     BTreeMap::new(),
                                 );
                             }
@@ -866,9 +870,17 @@ impl StorageBackend for CozoBackend {
         );
         self.run_mut_ignore(&hnsw)?;
 
-        // Create second HNSW index for doc-comment/docstring embeddings — idempotent.
+        // Create the doc_embeddings relation for dual-HNSW (doc-comment embeddings).
+        // This is a separate relation from chunks so that chunks without doc comments
+        // never enter the HNSW (zero vectors break cosine-distance HNSW).
+        let doc_emb_create = format!(
+            ":create doc_embeddings {{ file_path: String, chunk_idx: Int => doc_embedding: <F32; {dim}> }}"
+        );
+        self.run_mut_ignore(&doc_emb_create)?;
+
+        // Create HNSW index on doc_embeddings — idempotent.
         let doc_hnsw = format!(
-            "::hnsw create chunks:doc_index {{ dim: {dim}, dtype: F32, fields: [doc_embedding], distance: Cosine, m: 32, ef_construction: 128 }}"
+            "::hnsw create doc_embeddings:doc_index {{ dim: {dim}, dtype: F32, fields: [doc_embedding], distance: Cosine, m: 32, ef_construction: 128 }}"
         );
         self.run_mut_ignore(&doc_hnsw)?;
 
@@ -985,7 +997,7 @@ impl StorageBackend for CozoBackend {
                         Self::dv_int(c.start_line as i64),
                         Self::dv_int(c.end_line as i64),
                         Self::embedding_to_dv(&c.embedding, dim),
-                        Self::embedding_to_dv(&c.doc_embedding, dim),
+
                     ]
                 })
                 .collect();
@@ -1000,10 +1012,38 @@ impl StorageBackend for CozoBackend {
             p.insert("rows".into(), data);
 
             self.run_mut(
-                "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding, doc_embedding] <- $rows \
-                 :put chunks { file_path, chunk_idx => content, normalized, description, chunk_type, start_line, end_line, embedding, doc_embedding }",
+                "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] <- $rows \
+                 :put chunks { file_path, chunk_idx => content, normalized, description, chunk_type, start_line, end_line, embedding }",
                 p,
             )?;
+            // Also upsert non-None doc_embeddings into the separate doc_embeddings relation.
+            // Only chunks with actual doc comments get an entry; zero-vector sentinels
+            // are never inserted (they would break the cosine-distance HNSW).
+            let doc_rows: Vec<Vec<DataValue>> = batch
+                .iter()
+                .filter_map(|c| {
+                    c.doc_embedding.as_ref().map(|emb| {
+                        vec![
+                            Self::dv_str(&c.file_path),
+                            Self::dv_int(c.chunk_idx as i64),
+                            DataValue::Vec(cozo::Vector::F32(ndarray::Array1::from(emb.clone()))),
+                        ]
+                    })
+                })
+                .collect();
+            if !doc_rows.is_empty() {
+                let doc_data = DataValue::List(
+                    doc_rows.into_iter().map(|r| DataValue::List(r)).collect(),
+                );
+                let mut dp = BTreeMap::new();
+                dp.insert("rows".into(), doc_data);
+                // Non-fatal: if doc_embeddings relation doesn't exist (old schema), skip.
+                let _ = self.run_mut(
+                    "?[file_path, chunk_idx, doc_embedding] <- $rows \
+                     :put doc_embeddings { file_path, chunk_idx => doc_embedding }",
+                    dp,
+                );
+            }
         }
         Ok(())
     }
@@ -1012,10 +1052,21 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("fp".into(), Self::dv_str(file_path));
         self.run_mut(
-            "?[file_path, chunk_idx] := *chunks[file_path, chunk_idx, _, _, _, _, _, _, _, _], file_path = $fp \
+            "?[file_path, chunk_idx] := *chunks[file_path, chunk_idx, _, _, _, _, _, _, _], file_path = $fp \
              :rm chunks { file_path, chunk_idx }",
             p,
         )?;
+        // Also delete any doc_embeddings entries for this file.
+        // Non-fatal: if the relation doesn't exist (old schema), the error is silently dropped.
+        let _ = self.run_mut(
+            "?[file_path, chunk_idx] := *doc_embeddings[file_path, chunk_idx, _], file_path = $fp \
+             :rm doc_embeddings { file_path, chunk_idx }",
+            {
+                let mut p2 = BTreeMap::new();
+                p2.insert("fp".into(), Self::dv_str(file_path));
+                p2
+            },
+        );
         Ok(())
     }
 
@@ -1023,8 +1074,8 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("fp".into(), Self::dv_str(file_path));
         let rows = self.run_imm(
-            "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding, doc_embedding] \
-             := *chunks[$fp, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding, doc_embedding], \
+            "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] \
+             := *chunks[$fp, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding], \
                 file_path = $fp",
             p,
         )?;
@@ -1039,8 +1090,8 @@ impl StorageBackend for CozoBackend {
         let mut p = BTreeMap::new();
         p.insert("fps".into(), fps);
         let rows = self.run_imm(
-            "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding, doc_embedding] \
-             := *chunks[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding, doc_embedding], \
+            "?[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding] \
+             := *chunks[file_path, chunk_idx, content, normalized, description, chunk_type, start_line, end_line, embedding], \
              is_in(file_path, $fps)",
             p,
         )?;
@@ -1206,8 +1257,8 @@ impl StorageBackend for CozoBackend {
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Single round-trip: count total chunks and chunks-with-embeddings together.
         let guard_rows = self.run_imm(
-            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _, _]\n\
-             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, emb, _], !is_null(emb)\n\
+            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _]\n\
+             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, emb], !is_null(emb)\n\
              ?[t, e] := total[t], with_emb[e]",
             BTreeMap::new(),
         )?;
@@ -1337,9 +1388,9 @@ impl StorageBackend for CozoBackend {
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Guard: empty index - nothing to search.
         let guard_rows = self.run_imm(
-            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _, _]
+            "total[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _]
 \
-             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, emb, _], !is_null(emb)
+             with_emb[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, emb], !is_null(emb)
 \
              ?[t, e] := total[t], with_emb[e]",
             BTreeMap::new(),
@@ -1419,7 +1470,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    *code_edges[file_path, _, target_fp, _, _],
 ",
-                    "    *chunks[file_path, chunk_idx, _, _, _, _, _, _, emb, _], !is_null(emb),
+                    "    *chunks[file_path, chunk_idx, _, _, _, _, _, _, emb], !is_null(emb),
 ",
                     "    s = parent_score * {gsf}
 ",
@@ -1441,7 +1492,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    boosted[file_path, chunk_idx, score],
 ",
-                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _, _],
+                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _],
 ",
                     "    why = 'hybrid'
 ",
@@ -1449,7 +1500,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    graph[file_path, chunk_idx, score],
 ",
-                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _, _],
+                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _],
 ",
                     "    why = 'graph'
 ",
@@ -1510,7 +1561,7 @@ impl StorageBackend for CozoBackend {
 ",
                     "    boosted[file_path, chunk_idx, score],
 ",
-                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _, _]
+                    "    *chunks[file_path, chunk_idx, content, _, _, chunk_type, start_line, end_line, _]
 ",
                     ":order -score
 ",
@@ -1597,7 +1648,7 @@ impl StorageBackend for CozoBackend {
         // unwrap_or covers that case.
         let rows = self.run_imm(
             "fc[count(fp)] := *files[fp, _, _, _, _]\n\
-             cc[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _, _]\n\
+             cc[count(fp)] := *chunks[fp, _, _, _, _, _, _, _, _]\n\
              ml[max(li)] := *files[_, _, _, li, _]\n\
              ?[f, c, m] := fc[f], cc[c], ml[m]",
             BTreeMap::new(),
@@ -1875,7 +1926,7 @@ impl StorageBackend for CozoBackend {
         p.insert("fps".into(), DataValue::List(unique_fps));
 
         let rows = self.run_imm(
-            "?[fp, ci, emb] := *chunks[fp, ci, _, _, _, _, _, _, emb, _], is_in(fp, $fps)",
+            "?[fp, ci, emb] := *chunks[fp, ci, _, _, _, _, _, _, emb], is_in(fp, $fps)",
             p,
         )?;
 

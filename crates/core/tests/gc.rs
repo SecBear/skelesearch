@@ -31,6 +31,7 @@ async fn gc_removes_orphaned_chunks() -> anyhow::Result<()> {
             start_line: 1,
             end_line: 1,
             embedding: Some(vec![0.1; 8]),
+            doc_embedding: None,
         }])
         .await?;
 

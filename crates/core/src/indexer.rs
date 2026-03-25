@@ -74,6 +74,9 @@ pub struct Indexer<B, P> {
     /// Optional sparse embedding provider (e.g. BGE-M3 sparse).
     /// When set, sparse vectors are computed and stored for each chunk at index time.
     sparse_provider: Option<Arc<dyn SparseEmbedProvider>>,
+    /// Enable dual HNSW indexing: extract doc comments from each chunk and embed
+    /// them separately as `doc_embedding`.
+    dual_embedding: bool,
 }
 
 impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
@@ -89,6 +92,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
             summary_provider: None,
             scope_prefix: false,
             sparse_provider: None,
+            dual_embedding: false,
         }
     }
 
@@ -135,6 +139,14 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
     /// and stored alongside dense embeddings for each chunk during indexing.
     pub fn with_sparse_provider(mut self, provider: Arc<dyn SparseEmbedProvider>) -> Self {
         self.sparse_provider = Some(provider);
+        self
+    }
+
+    /// Enable dual HNSW indexing: extract doc comments from each chunk and embed
+    /// them separately as `doc_embedding`. Requires the schema to have the
+    /// `chunks:doc_index` HNSW index (initialized via `IndexConfig.dual_embedding = true`).
+    pub fn with_dual_embedding(mut self, enabled: bool) -> Self {
+        self.dual_embedding = enabled;
         self
     }
 
@@ -566,7 +578,50 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                         start_line: chunk.start_line,
                         end_line: chunk.end_line,
                         embedding: Some(emb),
+                        doc_embedding: None,
                     });
+                }
+
+                // --- Doc embeddings (optional dual-HNSW) ---
+                // Extract doc comments and embed them when dual_embedding is enabled.
+                // A missing doc comment results in doc_embedding=None (zero-vector sentinel
+                // stored in the schema). Embedding failures are non-fatal.
+                if self.dual_embedding {
+                    let doc_texts: Vec<(usize, String)> = sub
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(sub_idx, (fi, chunk))| {
+                            let lang = &batch_files[*fi].candidate.lang;
+                            extract_doc_comment(&chunk.content, lang)
+                                .map(|doc| (sub_idx, doc))
+                        })
+                        .collect();
+
+                    if !doc_texts.is_empty() {
+                        let doc_embed_texts: Vec<String> =
+                            doc_texts.iter().map(|(_, t)| t.clone()).collect();
+                        match self.provider.embed_batch(doc_embed_texts).await {
+                            Ok(doc_embs) => {
+                                for ((sub_idx, _), doc_emb) in
+                                    doc_texts.iter().zip(doc_embs.iter())
+                                {
+                                    let (fi, chunk) = sub[*sub_idx];
+                                    if let Some(cr) = chunk_records_per_file[fi]
+                                        .iter_mut()
+                                        .find(|r| r.chunk_idx == chunk.chunk_idx)
+                                    {
+                                        cr.doc_embedding = Some(doc_emb.clone());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "doc embed_batch failed, skipping doc embeddings for sub-batch"
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1131,6 +1186,81 @@ fn short_kind(kind: &str) -> &str {
         "module" => "mod",
         other => other,
     }
+}
+
+/// Extract a leading doc comment / docstring from a chunk's source text.
+///
+/// Strategy by language pattern:
+/// - Rust/Go/TypeScript/JS: consecutive `///`, `//!`, or `//` lines at the
+///   start of the chunk (up to 30 lines).
+/// - Python: a triple-quoted string `\"\"\"...\"\"\"` or `'''...'''` at the chunk start.
+/// - Block comments: `/** ... */` or `/* ... */` at the chunk start.
+///
+/// Returns `None` when no doc comment is found or when the extracted text is
+/// shorter than 10 characters (too short to produce a useful embedding).
+pub(crate) fn extract_doc_comment(content: &str, _lang: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+
+    // Python triple-quoted docstring (double or single quotes).
+    for delim in ["\"\"\"", "'''"] {
+        if trimmed.starts_with(delim) {
+            let rest = &trimmed[delim.len()..];
+            if let Some(end) = rest.find(delim) {
+                let doc = rest[..end].trim().to_string();
+                if doc.len() >= 10 {
+                    return Some(doc);
+                }
+            }
+        }
+    }
+
+    // Block comment: /** ... */ or /* ... */
+    if trimmed.starts_with("/**") || trimmed.starts_with("/*") {
+        if let Some(end) = trimmed.find("*/") {
+            let doc: String = trimmed[..end]
+                .lines()
+                .map(|l| l.trim_start_matches(|c: char| c == '/' || c == '*' || c == ' '))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+            if doc.len() >= 10 {
+                return Some(doc);
+            }
+        }
+    }
+
+    // Line comments: ///, //!, or //.
+    let mut doc_lines: Vec<&str> = Vec::new();
+    for line in content.lines().take(30) {
+        let t = line.trim();
+        if t.starts_with("///") {
+            doc_lines.push(t.trim_start_matches('/').trim());
+        } else if t.starts_with("//!") {
+            doc_lines.push(t.trim_start_matches(|c: char| c == '/' || c == '!').trim());
+        } else if t.starts_with("//") && !doc_lines.is_empty() {
+            // Continue a // comment block only if already started.
+            doc_lines.push(t.trim_start_matches('/').trim());
+        } else if !t.is_empty() {
+            // First non-comment, non-blank line stops the scan.
+            break;
+        }
+    }
+
+    // Second pass: allow a // block to start a doc comment.
+    if doc_lines.is_empty() {
+        for line in content.lines().take(30) {
+            let t = line.trim();
+            if t.starts_with("//") {
+                doc_lines.push(t.trim_start_matches('/').trim());
+            } else if !t.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let doc = doc_lines.join(" ").trim().to_string();
+    if doc.len() >= 10 { Some(doc) } else { None }
 }
 
 #[cfg(test)]

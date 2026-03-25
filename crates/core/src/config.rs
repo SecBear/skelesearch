@@ -30,6 +30,12 @@ pub struct IndexConfig {
     /// Gives the embedding model spatial context about where a chunk lives.
     /// Default: `false`. Set via config or `SKELESEARCH_SCOPE_PREFIX=true`.
     pub scope_prefix: bool,
+    /// Enable dual HNSW indexing: extract doc comments from each chunk and embed
+    /// them separately as `doc_embedding`. The searcher will query both
+    /// `chunks:semantic` and `chunks:doc_index` and merge via RRF.
+    /// Requires re-indexing. Default: `None` (disabled).
+    #[serde(default)]
+    pub dual_embedding: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,6 +190,7 @@ impl Default for IndexConfig {
             include_extensions: None,
             summarize: false,
             scope_prefix: false,
+            dual_embedding: None,
         }
     }
 }
