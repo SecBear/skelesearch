@@ -41,6 +41,8 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
 tracing-subscriber = { workspace = true }
 skelesearch-telemetry = { path = "../telemetry" }
 

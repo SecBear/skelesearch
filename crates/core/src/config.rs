@@ -6,6 +6,11 @@ use std::path::Path;
 pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
+    /// Watch the project directory for changes and automatically re-index.
+    /// Default: `false`. Enable with `watch = true` in `.skelesearch.toml`
+    /// or set `SKELESEARCH_WATCH=1` in the environment.
+    #[serde(default)]
+    pub watch: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -197,7 +202,7 @@ impl Default for IndexConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { index: IndexConfig::default(), search: SearchConfig::default() }
+        Self { index: IndexConfig::default(), search: SearchConfig::default(), watch: false }
     }
 }
 

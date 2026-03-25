@@ -13,7 +13,9 @@
 //     public method that tests can call directly.
 //   - Provider selection is explicit: unknown names return a clear error.
 
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{Arc, Mutex, RwLock}};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock}};
+
+use notify::Watcher as _;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -160,6 +162,10 @@ pub struct SkeleSearchServer {
     /// The default backend (self.backend) handles the cwd project; this cache
     /// serves tools that specify an explicit `path` to a different project.
     backend_cache: Arc<tokio::sync::RwLock<HashMap<PathBuf, (Arc<CozoBackend>, PathBuf)>>>,
+    /// Guards against starting more than one file watcher per server lifetime.
+    /// `on_initialized` is called on every client reconnect; this AtomicBool
+    /// ensures the background watcher task is spawned only once.
+    watcher_started: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +223,7 @@ impl SkeleSearchServer {
             cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
             index_state: Arc::new(tokio::sync::RwLock::new(IndexProgress::default())),
             backend_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            watcher_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -980,7 +987,7 @@ impl SkeleSearchServer {
                     total_chunks: 0,
                     last_indexed: None,
                     estimated_stale: 0,
-                    watching: false,
+                    watching: self.watcher_started.load(Ordering::Relaxed),
                     indexing,
                 });
             }
@@ -992,7 +999,7 @@ impl SkeleSearchServer {
             last_indexed: stats.last_indexed.map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
             // v1: no file-change detection; always 0 after a fresh index run.
             estimated_stale: 0,
-            watching: false,
+            watching: self.watcher_started.load(Ordering::Relaxed),
             indexing,
         })
     }
@@ -1867,6 +1874,55 @@ impl SkeleSearchServer {
             Err(e) => Err(self.friendly_err(e).await),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // File watcher
+    // -----------------------------------------------------------------------
+
+    /// Check the environment and project config; if watching is requested,
+    /// spawn the background file watcher task.
+    ///
+    /// Called from `on_initialized` on every client reconnect.  The
+    /// `watcher_started` AtomicBool acts as a once-guard so the watcher is
+    /// started at most once per server process lifetime.
+    async fn start_file_watcher_if_enabled(&self) {
+        let root = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "watcher: cannot determine cwd, skipping");
+                return;
+            }
+        };
+
+        // Check env var first, then project config.
+        let enabled = std::env::var("SKELESEARCH_WATCH")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+            || Config::load(&root).map(|c| c.watch).unwrap_or(false);
+
+        if !enabled {
+            tracing::debug!(
+                "watcher: disabled (set SKELESEARCH_WATCH=1 or watch=true in .skelesearch.toml)"
+            );
+            return;
+        }
+
+        // CAS false → true: if another call already started the watcher, skip.
+        if self
+            .watcher_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            tracing::debug!("watcher: already started, skipping");
+            return;
+        }
+
+        tracing::info!(path = %root.display(), "watcher: starting background file watcher");
+        let server_clone = self.clone();
+        tokio::spawn(run_file_watcher(server_clone, root));
+    }
+
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1902,6 +1958,7 @@ impl ServerHandler for SkeleSearchServer {
         async move {
             tracing::info!("on_initialized: called — triggering auto-index check");
             self.auto_index_if_needed().await;
+            self.start_file_watcher_if_enabled().await;
             // Quick health check: verify the index backend is queryable.
             // Does not block startup — logs clearly so the user sees problems in server logs.
             // An uninitialized index is expected on first launch (auto-indexing runs in background).
@@ -1926,6 +1983,124 @@ impl ServerHandler for SkeleSearchServer {
     }
 
 }
+
+// ---------------------------------------------------------------------------
+// File watcher task
+// ---------------------------------------------------------------------------
+
+/// Background task that watches `root` for file changes and triggers a
+/// re-index on the owning server when relevant changes are detected.
+///
+/// # Design
+/// - `notify_debouncer_full` coalescces rapid bursts of filesystem events into
+///   a single callback after a 2-second quiet window.
+/// - A sync-to-async bridge thread forwards debounced events to a tokio channel
+///   so the main loop can be written as a clean async select.
+/// - Changes inside `.skelesearch/` and `.git/` are ignored: they are written
+///   by the indexer and VCS machinery, not by the user.
+/// - If indexing is already in progress when a change arrives, the re-index is
+///   skipped (not queued); the next batch of changes will trigger a fresh run.
+async fn run_file_watcher(server: SkeleSearchServer, root: PathBuf) {
+    let skele_dir = root.join(".skelesearch");
+    let git_dir = root.join(".git");
+
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel();
+    let mut debouncer = match notify_debouncer_full::new_debouncer(
+        std::time::Duration::from_secs(2),
+        None,
+        sync_tx,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "watcher: failed to create debouncer — watching disabled");
+            // Reset the guard so a future call can retry if the watcher setup fails.
+            server.watcher_started.store(false, Ordering::Release);
+            return;
+        }
+    };
+
+    if let Err(e) = debouncer.watcher().watch(&root, notify::RecursiveMode::Recursive) {
+        tracing::error!(error = %e, path = %root.display(), "watcher: failed to set watch path — watching disabled");
+        server.watcher_started.store(false, Ordering::Release);
+        return;
+    }
+
+    tracing::info!(path = %root.display(), "watcher: active (2 s debounce)");
+
+    // Bridge sync mpsc → tokio unbounded channel so we can await in the loop.
+    // The bridge thread exits when the debouncer drops (sync_tx closed → sync_rx returns Err).
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = sync_rx.recv() {
+            if async_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Keep the debouncer alive for the loop's duration.
+    let _debouncer = debouncer;
+
+    loop {
+        match async_rx.recv().await {
+            None => break, // sender dropped; watcher gone
+            Some(Err(errs)) => {
+                for e in errs {
+                    tracing::warn!(error = %e, "watcher: filesystem event error");
+                }
+            }
+            Some(Ok(events)) => {
+                let relevant = events
+                    .iter()
+                    .flat_map(|e| &e.paths)
+                    .filter(|p| !p.starts_with(&skele_dir) && !p.starts_with(&git_dir))
+                    .count();
+
+                if relevant == 0 {
+                    continue;
+                }
+
+                // Skip if a re-index is already in flight.
+                {
+                    let state = server.index_state.read().await;
+                    if state.status == IndexingStatus::Running {
+                        tracing::debug!(
+                            changed_files = relevant,
+                            "watcher: re-index skipped — indexing already running"
+                        );
+                        continue;
+                    }
+                }
+
+                tracing::info!(changed_files = relevant, "watcher: triggering incremental re-index");
+
+                // Determine the provider name from the persisted manifest so the
+                // re-index uses the same embedding model as the original index.
+                let provider_name = ManifestStore::open(server.manifest_path.as_path())
+                    .ok()
+                    .and_then(|m| m.get_meta("provider").ok().flatten())
+                    .unwrap_or_else(|| "fastembed".to_string());
+
+                match server
+                    .index_codebase(IndexCodebaseInput {
+                        path: root.to_string_lossy().to_string(),
+                        provider: Some(provider_name),
+                    })
+                    .await
+                {
+                    Ok(out) => tracing::info!(
+                        status = %out.status,
+                        "watcher: re-index triggered"
+                    ),
+                    Err(e) => tracing::error!(error = %e, "watcher: failed to trigger re-index"),
+                }
+            }
+        }
+    }
+
+    tracing::info!(path = %root.display(), "watcher: stopped");
+}
+
 
 // ---------------------------------------------------------------------------
 // Path utilities
