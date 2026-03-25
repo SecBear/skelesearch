@@ -683,7 +683,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 .get(&candidate_cache_key)
                 .cloned()
         };
-        let mut hits = if let Some(cached) = cached_hits {
+        let hits = if let Some(cached) = cached_hits {
             tracing::debug!("candidate cache hit");
             cached
         } else {
@@ -790,6 +790,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                                                             score: 0.0,
                                                             match_quality: String::new(),
                                                             why: "sparse".to_string(),
+                                                            materialization_tier: chunk.materialization_tier,
                                                         });
                                                     }
                                                 }
@@ -873,6 +874,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             );
             return Ok((vec![], timings));
         }
+
+        // Tier dedup: when progressive indexing is active, Tier 1 and Tier 2
+        // chunks for the same file+line range may both appear in the candidate
+        // set during the background upgrade window.  Keep only the highest tier.
+        let mut hits = dedup_by_tier(hits);
 
         // MMR re-ranking: clamp diversity to [0, 1]; skip if 0 or only one result.
         let diversity = diversity.clamp(0.0, 1.0);
@@ -1200,6 +1206,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 score,
                 match_quality: "graph".to_string(),
                 why: "graph".to_string(),
+                materialization_tier: chunk.materialization_tier,
             });
         }
 
@@ -1251,6 +1258,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                                 score: prox_score,
                                 match_quality: "hnsw_proximity".to_string(),
                                 why: "hnsw_proximity".to_string(),
+                                materialization_tier: chunk.materialization_tier,
                             });
                         }
                     }
@@ -1334,6 +1342,59 @@ pub(crate) async fn apply_cochange_boost<B: StorageBackend>(
     }
     hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     hits
+}
+
+
+// ---------------------------------------------------------------------------
+// Tier deduplication
+// ---------------------------------------------------------------------------
+
+/// When both Tier 1 and Tier 2 chunks exist for overlapping line ranges in the
+/// same file (during the progressive background upgrade window), keep only the
+/// highest-tier chunk.  If all results are the same tier, this is a no-op.
+///
+/// Algorithm: per file, sort by tier descending then greedily accept chunks
+/// that don't overlap with any already-accepted higher-tier chunk.
+fn dedup_by_tier(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    // Fast path: if every result has the same tier (the common case when not
+    // in a progressive upgrade window), skip the O(n²) overlap check entirely.
+    let max_tier = results.iter().map(|r| r.materialization_tier).max().unwrap_or(2);
+    let min_tier = results.iter().map(|r| r.materialization_tier).min().unwrap_or(2);
+    if max_tier == min_tier {
+        return results;
+    }
+
+    use std::collections::HashMap;
+    let mut by_file: HashMap<String, Vec<SearchResult>> = HashMap::new();
+    for r in results {
+        by_file.entry(r.file_path.clone()).or_default().push(r);
+    }
+
+    let mut output: Vec<SearchResult> = Vec::new();
+    for (_, mut chunks) in by_file {
+        // Sort by tier desc (higher tier wins), then score desc.
+        chunks.sort_by(|a, b| {
+            b.materialization_tier.cmp(&a.materialization_tier)
+                .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        // Greedy accept: skip any chunk that overlaps with an already-accepted chunk.
+        // Since we sorted by tier desc, lower-tier overlapping chunks are encountered
+        // after their higher-tier replacement and are skipped.
+        let mut kept: Vec<SearchResult> = Vec::new();
+        'outer: for chunk in chunks {
+            for existing in &kept {
+                // Line-range overlap: [s1, e1] ∩ [s2, e2] ≠ ∅
+                if chunk.start_line <= existing.end_line && chunk.end_line >= existing.start_line {
+                    continue 'outer; // overlap — already have a higher-tier chunk here
+                }
+            }
+            kept.push(chunk);
+        }
+        output.extend(kept);
+    }
+
+    output.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    output
 }
 
 
@@ -2062,6 +2123,7 @@ mod tests {
             // well above the GRAPH_SIM_THRESHOLD=0.25 gate.
             embedding: Some(vec![1.0_f32, 0.0, 0.0, 0.0]),
             doc_embedding: None,
+            materialization_tier: 2,
         }
     }
 
@@ -2187,6 +2249,7 @@ mod tests {
             score: 1.0,
             match_quality: "high".to_string(),
             why: "vector".to_string(),
+            materialization_tier: 2,
         }
     }
 
@@ -2277,6 +2340,7 @@ mod tests {
                 score: 1.0,
                 match_quality: "".to_string(),
                 why: "hybrid".to_string(),
+                materialization_tier: 2,
             }])
         }
         async fn stats(&self) -> anyhow::Result<IndexStats> { Ok(IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None, watching: false, estimated_stale: 0 }) }
@@ -2430,6 +2494,7 @@ mod tests {
             score,
             match_quality: String::new(),
             why: "hybrid".to_string(),
+            materialization_tier: 2,
         }
     }
 
@@ -2483,6 +2548,7 @@ mod tests {
             score,
             match_quality: String::new(),
             why: "hybrid".to_string(),
+            materialization_tier: 2,
         }
     }
 

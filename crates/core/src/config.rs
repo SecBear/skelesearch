@@ -41,6 +41,12 @@ pub struct IndexConfig {
     /// Requires re-indexing. Default: `None` (disabled).
     #[serde(default)]
     pub dual_embedding: Option<bool>,
+    /// Enable progressive (two-tier) indexing.  When `true`, `index_tier1` runs
+    /// first (token-window chunking, seconds) making the index immediately
+    /// searchable, then a background task replaces those chunks with AST-aware
+    /// Tier 2 chunks.  Default: `None` (false).
+    #[serde(default)]
+    pub progressive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -196,6 +202,7 @@ impl Default for IndexConfig {
             summarize: false,
             scope_prefix: false,
             dual_embedding: None,
+            progressive: None,
         }
     }
 }

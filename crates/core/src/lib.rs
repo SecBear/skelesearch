@@ -22,7 +22,7 @@ pub mod config;
 // Re-export the most-used public types so callers can write
 // `use skelesearch_core::CozoBackend` instead of the full path.
 pub use chunker::{normalize_for_fts, Chunker, ImportEdge, ParsedChunk};
-pub use indexer::{IndexResult, Indexer};
+pub use indexer::{FileContent, IndexResult, Indexer};
 pub use manifest::{content_hash, IncompleteBatch, ManifestStore};
 pub use provider::EmbedProvider;
 pub use schema::{

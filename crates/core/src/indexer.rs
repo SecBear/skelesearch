@@ -41,6 +41,59 @@ pub struct IndexResult {
 }
 
 // ---------------------------------------------------------------------------
+// FileContent — input type for index_tier1
+// ---------------------------------------------------------------------------
+
+/// A pre-loaded file for Tier 1 fast indexing.
+///
+/// `rel_path` is relative to the project root (e.g. `"src/lib.rs"`).
+/// `content` is the raw text of the file.
+#[derive(Debug, Clone)]
+pub struct FileContent {
+    pub rel_path: String,
+    pub content: String,
+}
+
+/// Chunk a file into fixed-size line-window `ChunkRecord`s for Tier 1 indexing.
+///
+/// Simple split: every 50 lines with 5 lines of overlap.  No tree-sitter —
+/// the goal is milliseconds-level latency before AST chunking is ready.
+fn tier1_chunk_file(_rel_path: &str, content: &str) -> Vec<crate::ParsedChunk> {
+    const LINES_PER_CHUNK: usize = 50;
+    const OVERLAP: usize = 5;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total == 0 {
+        return vec![];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut chunk_idx = 0usize;
+
+    while start < total {
+        let end = (start + LINES_PER_CHUNK).min(total);
+        let chunk_content = lines[start..end].join("\n");
+        let normalized = crate::normalize_for_fts(&chunk_content);
+        chunks.push(crate::ParsedChunk {
+            chunk_idx,
+            content: chunk_content,
+            normalized,
+            chunk_type: "window".to_string(),
+            start_line: start + 1, // 1-indexed
+            end_line: end,
+        });
+        chunk_idx += 1;
+        if end == total {
+            break;
+        }
+        start += LINES_PER_CHUNK.saturating_sub(OVERLAP);
+    }
+    chunks
+}
+
+// ---------------------------------------------------------------------------
 // Indexer
 // ---------------------------------------------------------------------------
 
@@ -163,6 +216,59 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
         self.summary_provider = Some(provider);
         self
     }
+
+/// Tier 1 fast indexing: token-window chunking, embed, store with tier=1.
+///
+/// Takes pre-loaded file content so callers can feed arbitrary file sets
+/// (e.g. the changed files detected by the MCP server before walking the full
+/// tree).  Returns quickly — the goal is sub-second latency.
+///
+/// The backend is assumed to already be initialized (`initialize` called).
+/// Tier 2 (`index_path`) must be run afterwards to replace these chunks with
+/// AST-aware equivalents; call `delete_tier1_chunks_for_file` per file after
+/// Tier 2 chunks for that file have been committed.
+#[tracing::instrument(skip_all, fields(file_count = files.len()))]
+pub async fn index_tier1(&self, files: &[FileContent]) -> anyhow::Result<()> {
+
+    for file in files {
+        let raw_chunks = tier1_chunk_file(&file.rel_path, &file.content);
+        if raw_chunks.is_empty() {
+            continue;
+        }
+
+        // Build embed texts using the same contextual prefix as Tier 2.
+        let embed_texts: Vec<String> = raw_chunks.iter().map(|c| {
+            format!("{} {}\n{}", file.rel_path, c.chunk_type, c.content)
+        }).collect();
+
+        let embs = self.provider.embed_batch(embed_texts).await?;
+        anyhow::ensure!(
+            embs.len() == raw_chunks.len(),
+            "tier1 embed count mismatch: {} chunks, {} embeddings",
+            raw_chunks.len(), embs.len()
+        );
+
+        let chunk_records: Vec<crate::ChunkRecord> = raw_chunks.into_iter().zip(embs).map(|(c, emb)| {
+            crate::ChunkRecord {
+                file_path: file.rel_path.clone(),
+                chunk_idx: c.chunk_idx,
+                content: c.content,
+                normalized: c.normalized,
+                description: String::new(),
+                chunk_type: c.chunk_type,
+                start_line: c.start_line,
+                end_line: c.end_line,
+                embedding: Some(emb),
+                doc_embedding: None,
+                materialization_tier: 1,
+            }
+        }).collect();
+
+        self.backend.upsert_chunks(&chunk_records).await?;
+    }
+    Ok(())
+}
+
 
     /// Walk `root`, detect changed files via the manifest, chunk and embed
     /// them, upsert to the backend, then reconcile deletions/renames.
@@ -587,6 +693,7 @@ impl<B: StorageBackend + 'static, P: EmbedProvider> Indexer<B, P> {
                         end_line: chunk.end_line,
                         embedding: Some(emb),
                         doc_embedding: None,
+                        materialization_tier: 2,
                     });
                 }
 

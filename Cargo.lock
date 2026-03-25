@@ -3916,6 +3916,8 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "notify",
+ "notify-debouncer-full",
  "rmcp",
  "schemars",
  "serde",
