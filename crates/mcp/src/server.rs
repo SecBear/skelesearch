@@ -15,6 +15,9 @@
 
 use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock}, time::Duration};
 
+#[path = "client.rs"]
+mod client;
+
 use notify::Watcher as _;
 
 use sysinfo::{Pid, System};
@@ -34,7 +37,9 @@ use skelesearch_core::{
     SharedIndexingStatus, Searcher, StorageBackend,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
+use skelesearch_service::{ProjectTarget as DaemonProjectTarget, protocol::{IndexCodebaseStatus as DaemonIndexCodebaseStatus, IndexingState as DaemonIndexingState}};
 
+use self::client::{DaemonClient, TokioDaemonConnector};
 use crate::tools::{
     CallEdgeInfo, ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
     GetFileContextInput, GetRepoMapInput, GetSymbolContextInput, GrepSearchRow, ImpactEntry,
@@ -156,6 +161,7 @@ pub struct SkeleSearchServer {
     /// RwLock so `run_index` can promote it to the real provider after a
     /// successful indexing run without requiring a full server restart.
     provider: Arc<RwLock<ArcProvider>>,
+    daemon_client: Arc<DaemonClient<TokioDaemonConnector>>,
     tool_router: ToolRouter<Self>,
     /// Tracks content hashes seen per session for dedup.
     /// TODO: add periodic cleanup for long-running servers (sessions accumulate in memory).
@@ -292,18 +298,21 @@ impl SkeleSearchServer {
     ) -> Self {
         let manifest_path = Arc::new(manifest_path.into());
         let instance_id = new_instance_id();
+        let daemon_client = Arc::new(DaemonClient::from_env());
         tracing::info!(
             instance_id = %instance_id,
             pid = std::process::id(),
             provider = provider.name(),
             provider_dim = provider.dim(),
             manifest_path = %manifest_path.display(),
+            daemon_endpoint = %daemon_client.endpoint(),
             "constructed skelesearch MCP server"
         );
         Self {
             backend,
             manifest_path,
             provider: Arc::new(RwLock::new(ArcProvider::new(provider))),
+            daemon_client,
             tool_router: Self::tool_router(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
@@ -318,6 +327,126 @@ impl SkeleSearchServer {
     async fn friendly_err(&self, err: anyhow::Error) -> String {
         let active = self.index_state.read().await.status == IndexingStatus::Running;
         friendly_index_error_inner(&err, active)
+    }
+
+    fn daemon_proxy_error(&self, method: &str, err: anyhow::Error) -> String {
+        format!(
+            "daemon proxy for {method} is unavailable at {}: {err:#}. Start skelesearchd, or set SKELESEARCH_DAEMON_SOCKET to a reachable socket.",
+            self.daemon_client.endpoint()
+        )
+    }
+
+    fn daemon_target_from_path(path: &str) -> anyhow::Result<DaemonProjectTarget> {
+        let target = PathBuf::from(path);
+        let abs = if target.is_absolute() {
+            target
+        } else {
+            std::env::current_dir()
+                .context("resolve current working directory for daemon project target")?
+                .join(target)
+        };
+        let original = abs.clone();
+        let mut dir = if abs.is_dir() {
+            abs.clone()
+        } else {
+            abs.parent().unwrap_or(&abs).to_path_buf()
+        };
+        let root = loop {
+            if dir.join(".git").exists() {
+                break dir;
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => break original,
+            }
+        };
+        Ok(DaemonProjectTarget::RootPath {
+            root_path: root.to_string_lossy().into_owned(),
+            logical_id: None,
+        })
+    }
+
+
+    fn daemon_target_for_status(&self, path: Option<&str>) -> anyhow::Result<DaemonProjectTarget> {
+        if let Some(path) = path {
+            return Self::daemon_target_from_path(path);
+        }
+
+        let cwd = std::env::current_dir().context("resolve current working directory for daemon status target")?;
+        let original = cwd.clone();
+        let mut dir = cwd;
+        let root = loop {
+            if dir.join(".git").exists() {
+                break dir;
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => break original,
+            }
+        };
+
+        Ok(DaemonProjectTarget::RootPath {
+            root_path: root.to_string_lossy().into_owned(),
+            logical_id: None,
+        })
+    }
+
+    fn map_daemon_indexing_progress(
+        progress: skelesearch_service::IndexingProgress,
+    ) -> IndexingProgress {
+        IndexingProgress {
+            status: match progress.status {
+                DaemonIndexingState::Running => "running".to_string(),
+                DaemonIndexingState::Done => "done".to_string(),
+                DaemonIndexingState::Failed => "failed".to_string(),
+            },
+            path: progress.path,
+            files_done: progress.files_done,
+            files_total: progress.files_total,
+            chunks_done: progress.chunks_done,
+            cache_hits: progress.cache_hits,
+            elapsed_seconds: progress.elapsed_seconds,
+            error: progress.error,
+        }
+    }
+
+    async fn proxy_index_codebase_via_daemon(
+        &self,
+        input: IndexCodebaseInput,
+    ) -> anyhow::Result<IndexCodebaseOutput> {
+        let target = Self::daemon_target_from_path(&input.path)?;
+        let response = self
+            .daemon_client
+            .index_codebase(target, input.provider)
+            .await?;
+        self.invalidate_searcher_cache().await;
+
+        Ok(IndexCodebaseOutput {
+            status: match response.status {
+                DaemonIndexCodebaseStatus::IndexingStarted => "indexing_started".to_string(),
+                DaemonIndexCodebaseStatus::AlreadyIndexing => "already_indexing".to_string(),
+            },
+            path: response.project_key.canonical_root,
+            files_queued: response.files_queued,
+            message: response.message,
+        })
+    }
+
+    async fn proxy_index_status_via_daemon(
+        &self,
+        input: IndexStatusInput,
+    ) -> anyhow::Result<IndexStatusOutput> {
+        let target = self.daemon_target_for_status(input.path.as_deref())?;
+        let response = self.daemon_client.index_status(target).await?;
+
+        Ok(IndexStatusOutput {
+            indexed_files: response.indexed_files,
+            total_chunks: response.total_chunks,
+            last_indexed: response.last_indexed,
+            estimated_stale: response.estimated_stale,
+            watching: response.watching,
+            indexing: response.indexing.map(Self::map_daemon_indexing_progress),
+        })
     }
 
     /// Resolve a backend for the given path. If `path` is None, returns the
@@ -514,7 +643,7 @@ impl SkeleSearchServer {
         // Surface auto-index failures so the user can act on them.
         // A failed auto-index must not crash the server, but silence is worse —
         // the user needs to know why search tools are returning errors.
-        match self.index_codebase(IndexCodebaseInput {
+        match self.proxy_index_codebase_via_daemon(IndexCodebaseInput {
             path: cwd.to_string_lossy().to_string(),
             provider: Some(provider_name.to_string()),
         }).await {
@@ -522,7 +651,7 @@ impl SkeleSearchServer {
                 tracing::info!("auto_index_if_needed: index_codebase started successfully");
             }
             Err(e) => {
-                let friendly = friendly_index_error(&e);
+                let friendly = self.daemon_proxy_error("index_codebase", e);
                 tracing::error!(
                     error = %friendly,
                     "auto_index_if_needed: index_codebase failed to start; search tools may not be available"
@@ -553,19 +682,6 @@ impl SkeleSearchServer {
             return Err(self.empty_index_error().await);
         }
 
-        // Fast path: already a real provider.
-        {
-            let guard = self.provider.read().map_err(|_| anyhow::anyhow!("provider lock poisoned"))?;
-            if guard.dim() > 1 {
-                return Ok(guard.clone());
-            }
-        }
-
-        // Slow path: started with NoopProvider (dim == 1) but a persisted
-        // index exists.  Lazily initialize the real provider and promote it
-        // so subsequent calls skip this branch.
-        // Read which provider built this index so we use the correct embedding
-        // dimension (e.g. voyage=1024, openai=1536, fastembed=768).
         let provider_name = {
             let manifest = ManifestStore::open(self.manifest_path.as_path())
                 .context("failed to open manifest")?;
@@ -573,6 +689,18 @@ impl SkeleSearchServer {
                 .context("failed to read provider from manifest")?
                 .unwrap_or_else(|| "fastembed".to_string())
         };
+
+        // Fast path: current provider already matches the persisted index provider.
+        {
+            let guard = self.provider.read().map_err(|_| anyhow::anyhow!("provider lock poisoned"))?;
+            if guard.dim() > 1 && guard.name() == provider_name {
+                return Ok(guard.clone());
+            }
+        }
+
+        // Slow path: started with NoopProvider or the persisted provider changed (for example
+        // after daemon-side indexing with a different embedding model). Reload the correct provider
+        // from the manifest and promote it for future searches.
         let real = provider_from_name(&provider_name)
             .with_context(|| format!("failed to initialize provider '{provider_name}'"))?;
         let arc_provider = ArcProvider::new(real);
@@ -2104,10 +2232,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<IndexCodebaseInput>,
     ) -> Result<String, String> {
-        match self.index_codebase(input).await {
-                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
+        match self.proxy_index_codebase_via_daemon(input).await {
+            Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+            Err(err) => Err(self.daemon_proxy_error("index_codebase", err)),
+        }
     }
 
     /// Check if the code index exists and is current.
@@ -2116,10 +2244,10 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<IndexStatusInput>,
     ) -> Result<String, String> {
-        match self.index_status(input).await {
-                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
+        match self.proxy_index_status_via_daemon(input).await {
+            Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+            Err(err) => Err(self.daemon_proxy_error("index_status", err)),
+        }
     }
 
     /// Find code by concept or keyword. Auto-routes to best search strategy.
@@ -2405,7 +2533,7 @@ async fn run_file_watcher(server: SkeleSearchServer, root: PathBuf) {
                     .unwrap_or_else(|| "fastembed".to_string());
 
                 match server
-                    .index_codebase(IndexCodebaseInput {
+                    .proxy_index_codebase_via_daemon(IndexCodebaseInput {
                         path: root.to_string_lossy().to_string(),
                         provider: Some(provider_name),
                     })
@@ -2415,7 +2543,10 @@ async fn run_file_watcher(server: SkeleSearchServer, root: PathBuf) {
                         status = %out.status,
                         "watcher: re-index triggered"
                     ),
-                    Err(e) => tracing::error!(error = %e, "watcher: failed to trigger re-index"),
+                    Err(e) => tracing::error!(
+                        error = %server.daemon_proxy_error("index_codebase", e),
+                        "watcher: failed to trigger re-index"
+                    ),
                 }
             }
         }

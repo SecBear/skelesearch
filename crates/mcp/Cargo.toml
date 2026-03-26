@@ -22,6 +22,7 @@ qwen3 = ["dep:skelesearch-rerank-qwen3"]
 
 [dependencies]
 skelesearch-core = { path = "../core" }
+skelesearch-service = { path = "../service" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 skelesearch-embed-openai = { path = "../embed-openai" }
 skelesearch-rerank-api = { path = "../rerank-api" }
