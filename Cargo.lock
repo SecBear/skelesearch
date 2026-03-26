@@ -3856,6 +3856,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "cozo",
+ "fs2",
  "ignore",
  "lru",
  "ndarray 0.15.6",
@@ -3891,6 +3892,21 @@ dependencies = [
  "tree-sitter-tags",
  "tree-sitter-typescript",
  "twox-hash 2.1.2",
+]
+
+[[package]]
+name = "skelesearch-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fs2",
+ "skelesearch-service",
+ "skelesearch-telemetry",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4009,6 +4025,15 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "skelesearch-service"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 skelesearch-telemetry = { path = "../telemetry" }
+skelesearch-service = { path = "../service" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

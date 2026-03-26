@@ -1,4 +1,7 @@
+pub mod service;
 pub mod transport;
+
+pub use service::{DaemonState, ProjectLookup, ProjectState};
 
 use std::{
     fs::{File, OpenOptions},
