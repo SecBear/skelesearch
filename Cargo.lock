@@ -3899,8 +3899,11 @@ name = "skelesearch-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "fs2",
+ "serde_json",
+ "skelesearch-core",
  "skelesearch-service",
  "skelesearch-telemetry",
  "tempfile",
@@ -3974,6 +3977,7 @@ dependencies = [
  "skelesearch-rerank-api",
  "skelesearch-rerank-local",
  "skelesearch-rerank-qwen3",
+ "skelesearch-service",
  "skelesearch-telemetry",
  "sysinfo",
  "tempfile",

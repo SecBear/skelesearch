@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
-use skelesearch_daemon::{DaemonPaths, DaemonSingleton, SingletonError};
+use skelesearch_daemon::{DaemonPaths, DaemonService, DaemonSingleton, DaemonState, SingletonError};
 use skelesearch_telemetry::TracingOptions;
 
 #[derive(Debug, Parser)]
@@ -42,7 +42,8 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     let endpoint = skelesearch_daemon::transport::ListenerEndpoint::unix(paths.socket_path.clone());
-    let listener = skelesearch_daemon::transport::bind(&endpoint)
+    let service = DaemonService::new(DaemonState::new());
+    let listener = skelesearch_daemon::transport::bind(&endpoint, service)
         .await
         .with_context(|| format!("bind daemon listener at {}", paths.socket_path.display()))?;
 

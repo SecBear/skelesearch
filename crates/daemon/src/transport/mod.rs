@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use tokio::sync::watch;
 
+use crate::service::DaemonService;
+
 pub mod uds;
 
 #[derive(Debug, Clone)]
@@ -26,11 +28,12 @@ pub enum BoundTransport {
     Unix(uds::UdsListener),
 }
 
-pub async fn bind(endpoint: &ListenerEndpoint) -> Result<BoundTransport> {
+pub async fn bind(endpoint: &ListenerEndpoint, service: DaemonService) -> Result<BoundTransport> {
     match endpoint {
-        ListenerEndpoint::UnixSocket(path) => {
-            Ok(BoundTransport::Unix(uds::UdsListener::bind(path.clone())?))
-        }
+        ListenerEndpoint::UnixSocket(path) => Ok(BoundTransport::Unix(uds::UdsListener::bind(
+            path.clone(),
+            service,
+        )?)),
     }
 }
 
