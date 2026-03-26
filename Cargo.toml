@@ -2,6 +2,7 @@
 members = [
    "crates/core",
    "crates/service",
+   "crates/daemon",
    "crates/embed-fastembed",
    "crates/embed-openai",
    "crates/embed-voyage",

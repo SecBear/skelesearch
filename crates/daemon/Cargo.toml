@@ -1,0 +1,26 @@
+[package]
+name = "skelesearch-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local singleton daemon skeleton for skelesearch"
+
+[lib]
+name = "skelesearch_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "skelesearchd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+fs2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+skelesearch-telemetry = { path = "../telemetry" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
