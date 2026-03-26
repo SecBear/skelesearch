@@ -9,6 +9,7 @@ use skelesearch_service::{
     DAEMON_PROTOCOL_VERSION, DaemonErrorResponse, DaemonEvent, DaemonRequest, DaemonResponse,
     HandshakeRequest, HandshakeResponse, IndexCodebaseRequest, IndexCodebaseResponse,
     IndexStatusRequest, IndexStatusResponse, ProtocolFrame, ProjectTarget, RequestId,
+    SearchCodeRequest, SearchCodeResponse,
 };
 #[cfg(test)]
 use skelesearch_service::{InfoRequest, InfoResponse};
@@ -222,6 +223,29 @@ where
             DaemonResponse::Error(err) => Err(daemon_method_error("index_status", &err)),
             other => anyhow::bail!(
                 "daemon protocol violation: expected index_status response, got {}",
+                response_kind(&other)
+            ),
+        }
+    }
+
+    pub async fn search_code(&self, request: SearchCodeRequest) -> anyhow::Result<SearchCodeResponse> {
+        let handshake = self.handshake().await?;
+        if !handshake.capabilities.search_code {
+            anyhow::bail!(
+                "daemon at {} does not advertise search_code capability",
+                self.endpoint
+            );
+        }
+
+        let response = self
+            .request_response(DaemonRequest::SearchCode(request))
+            .await?;
+
+        match response {
+            DaemonResponse::SearchCode(response) => Ok(response),
+            DaemonResponse::Error(err) => Err(daemon_method_error("search_code", &err)),
+            other => anyhow::bail!(
+                "daemon protocol violation: expected search_code response, got {}",
                 response_kind(&other)
             ),
         }

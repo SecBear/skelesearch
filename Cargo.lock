@@ -3899,11 +3899,13 @@ name = "skelesearch-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "fs2",
  "serde_json",
  "skelesearch-core",
+ "skelesearch-embed-fastembed",
  "skelesearch-service",
  "skelesearch-telemetry",
  "tempfile",

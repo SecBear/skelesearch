@@ -149,7 +149,7 @@ impl Drop for DaemonSingleton {
             }
         }
 
-        if let Err(err) = self.lock_file.unlock() {
+        if let Err(err) = fs2::FileExt::unlock(&self.lock_file) {
             tracing::debug!(
                 path = %self.lock_path.display(),
                 error = %err,

@@ -3,17 +3,23 @@ use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Instant, SystemTime},
 };
 
 use anyhow::Context as _;
 use chrono::Utc;
-use skelesearch_core::{try_acquire_indexing_lease, SharedIndexingStatus};
+use async_trait::async_trait;
+use skelesearch_core::{
+    git::changed_files_on_branch, Config, CozoBackend, EmbedProvider, Indexer, ManifestStore,
+    Searcher, SharedIndexingStatus, StorageBackend, try_acquire_indexing_lease,
+};
+use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 use skelesearch_service::{
     DaemonCapabilities, DaemonErrorCode, DaemonErrorResponse, DaemonRequest, DaemonResponse,
     HandshakeRequest, HandshakeResponse, IndexCodebaseRequest, IndexCodebaseResponse,
     IndexStatusRequest, IndexStatusResponse, IndexingProgress, InfoResponse, ProjectKey,
-    ProjectKeyError, ProjectTarget, DAEMON_PROTOCOL_VERSION,
+    ProjectKeyError, ProjectTarget, SearchCodeRequest, SearchCodeResponse, SearchResultRow,
+    DAEMON_PROTOCOL_VERSION,
 };
 use skelesearch_service::protocol::{
     DaemonEvent, IndexCodebaseStatus, IndexingState, ProtocolErrorEvent, ProtocolFrame, RequestId,
@@ -26,9 +32,28 @@ const BACKEND_DB_FILE: &str = "index.db";
 const MANIFEST_DB_FILE: &str = "manifest.db";
 const INDEX_LOCK_FILE: &str = ".skelesearch.lock";
 const INDEX_STATUS_FILE: &str = "indexing-status.json";
-const PLACEHOLDER_INDEX_DELAY_MS: u64 = 250;
 
-#[derive(Debug, Clone, Default)]
+
+type CachedSearcher = Searcher<CozoBackend, ArcProvider>;
+
+#[derive(Clone)]
+pub struct ArcProvider(pub Arc<dyn EmbedProvider + Send + Sync>);
+
+impl ArcProvider {
+    pub fn new(p: impl EmbedProvider + Send + Sync + 'static) -> Self {
+        Self(Arc::new(p))
+    }
+}
+
+#[async_trait]
+impl EmbedProvider for ArcProvider {
+    fn dim(&self) -> usize { self.0.dim() }
+    fn name(&self) -> &str { self.0.name() }
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> { self.0.embed_batch(texts).await }
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> { self.0.embed_queries(texts).await }
+    fn query_prefix(&self) -> Option<&str> { self.0.query_prefix() }
+}
+#[derive(Clone, Default)]
 pub struct DaemonState {
     projects: Arc<RwLock<HashMap<ProjectKey, Arc<ProjectState>>>>,
 }
@@ -68,7 +93,7 @@ impl DaemonState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DaemonService {
     state: DaemonState,
     server_name: Arc<str>,
@@ -169,7 +194,7 @@ impl DaemonService {
             DaemonRequest::Info(_) => DaemonResponse::Info(self.info_response()),
             DaemonRequest::IndexStatus(request) => self.handle_index_status(request).await,
             DaemonRequest::IndexCodebase(request) => self.handle_index_codebase(request).await,
-            DaemonRequest::SearchCode(_) => Self::unsupported_method("search_code"),
+            DaemonRequest::SearchCode(request) => self.handle_search_code(request).await,
             DaemonRequest::SmartSearch(_) => Self::unsupported_method("smart_search"),
         }
     }
@@ -209,7 +234,15 @@ impl DaemonService {
             Err(response) => return response,
         };
 
-        let runtime = project.index_runtime_snapshot().await;
+        let mut runtime = project.index_runtime_snapshot().await;
+        if runtime.indexing.is_none() && runtime.indexed_files == 0 && runtime.total_chunks == 0 && runtime.last_indexed.is_none() {
+            if let Ok(Some((indexed_files, total_chunks, last_indexed))) = read_persisted_index_stats(&project).await {
+                runtime.indexed_files = indexed_files;
+                runtime.total_chunks = total_chunks;
+                runtime.last_indexed = last_indexed;
+            }
+        }
+
         DaemonResponse::IndexStatus(IndexStatusResponse {
             project_key: project.project_key.clone(),
             indexed_files: runtime.indexed_files,
@@ -231,7 +264,7 @@ impl DaemonService {
             return already_indexing_response(project.project_key.clone());
         }
 
-        let provider_name = request.provider.unwrap_or_else(|| "placeholder".to_string());
+        let provider_name = request.provider.unwrap_or_else(|| "fastembed".to_string());
         let now = Utc::now();
         let path = project.canonical_root.to_string_lossy().into_owned();
         let mut shared_status = SharedIndexingStatus {
@@ -262,61 +295,46 @@ impl DaemonService {
             }
         };
 
-        project
-            .mark_indexing_started(path.clone(), provider_name)
-            .await;
+        project.mark_indexing_started(path.clone(), provider_name.clone()).await;
+        project.invalidate_searcher().await;
 
         let project_for_task = Arc::clone(&project);
         tokio::spawn(async move {
             let started = Instant::now();
-            match count_indexable_files(&project_for_task.canonical_root) {
-                Ok(files_total) => {
-                    project_for_task.update_running_totals(files_total).await;
-                    shared_status.files_total = files_total;
-                    shared_status.updated_at = Utc::now();
-                    if let Err(err) = lease.write_status(&shared_status) {
-                        tracing::warn!(
-                            project = %project_for_task.project_key,
-                            error = %err,
-                            "failed to write running indexing status"
-                        );
-                    }
-
-                    tokio::time::sleep(Duration::from_millis(PLACEHOLDER_INDEX_DELAY_MS)).await;
-
+            match run_real_index(Arc::clone(&project_for_task), provider_name.clone()).await {
+                Ok(index_result) => {
                     let elapsed = started.elapsed().as_secs_f64();
                     project_for_task
-                        .mark_indexing_done(files_total, elapsed)
+                        .mark_indexing_done(
+                            index_result.indexed_files,
+                            index_result.total_chunks,
+                            index_result.cache_hits,
+                            elapsed,
+                        )
                         .await;
+                    project_for_task.invalidate_searcher().await;
 
                     shared_status.status = "done".to_string();
                     shared_status.updated_at = Utc::now();
-                    shared_status.files_done = files_total;
-                    shared_status.chunks_done = files_total;
+                    shared_status.files_total = index_result.indexed_files;
+                    shared_status.files_done = index_result.indexed_files;
+                    shared_status.chunks_done = index_result.total_chunks;
+                    shared_status.cache_hits = index_result.cache_hits;
                     if let Err(err) = lease.write_status(&shared_status) {
-                        tracing::warn!(
-                            project = %project_for_task.project_key,
-                            error = %err,
-                            "failed to write completed indexing status"
-                        );
+                        tracing::warn!(project = %project_for_task.project_key, error = %err, "failed to write completed indexing status");
                     }
                 }
                 Err(err) => {
                     let elapsed = started.elapsed().as_secs_f64();
                     let error_message = err.to_string();
-                    project_for_task
-                        .mark_indexing_failed(elapsed, error_message.clone())
-                        .await;
+                    project_for_task.mark_indexing_failed(elapsed, error_message.clone()).await;
+                    project_for_task.invalidate_searcher().await;
 
                     shared_status.status = "failed".to_string();
                     shared_status.updated_at = Utc::now();
                     shared_status.error = Some(error_message);
                     if let Err(write_err) = lease.write_status(&shared_status) {
-                        tracing::warn!(
-                            project = %project_for_task.project_key,
-                            error = %write_err,
-                            "failed to write failed indexing status"
-                        );
+                        tracing::warn!(project = %project_for_task.project_key, error = %write_err, "failed to write failed indexing status");
                     }
                 }
             }
@@ -326,10 +344,86 @@ impl DaemonService {
             status: IndexCodebaseStatus::IndexingStarted,
             project_key: project.project_key.clone(),
             files_queued: 0,
-            message: format!(
-                "indexing started for '{}'; poll index_status for progress",
-                project.project_key
-            ),
+            message: format!("indexing started for '{}'; poll index_status for progress", project.project_key),
+        })
+    }
+
+    async fn handle_search_code(&self, request: SearchCodeRequest) -> DaemonResponse {
+        let project = match self.resolve_project(request.target).await {
+            Ok(project) => project,
+            Err(response) => return response,
+        };
+
+        if project.is_indexing_running().await {
+            return daemon_error(
+                DaemonErrorCode::IndexUnavailable,
+                format!("index is being built for '{}'; poll index_status to check progress", project.project_key),
+                true,
+            );
+        }
+
+        let searcher = match get_or_build_searcher(&project).await {
+            Ok(searcher) => searcher,
+            Err(err) => {
+                return daemon_error(
+                    DaemonErrorCode::IndexUnavailable,
+                    format!("failed to build searcher for '{}': {err:#}", project.project_key),
+                    true,
+                )
+            }
+        };
+
+        let top_k = request.top_k.max(1);
+        let max_tokens = request.max_tokens.or(Some(8192));
+        let max_depth = request.max_depth.unwrap_or(if request.include_graph { 2 } else { 0 });
+        let search_result = searcher
+            .search_with_timings(
+                &request.query,
+                top_k,
+                request.include_graph,
+                max_depth,
+                request.diversity,
+                max_tokens,
+            )
+            .await;
+
+        let (mut results, _timings) = match search_result {
+            Ok(v) => v,
+            Err(err) => {
+                return daemon_error(
+                    DaemonErrorCode::IndexUnavailable,
+                    format!("search failed for '{}': {err:#}", project.project_key),
+                    true,
+                )
+            }
+        };
+
+        if request.branch_scope {
+            match changed_files_on_branch(&project.canonical_root) {
+                Ok(changed) if !changed.is_empty() => {
+                    results.retain(|r| changed.iter().any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(project = %project.project_key, error = %err, "branch-scope filtering failed; returning unfiltered results");
+                }
+            }
+        }
+
+        DaemonResponse::SearchCode(SearchCodeResponse {
+            project_key: project.project_key.clone(),
+            results: results
+                .into_iter()
+                .map(|r| SearchResultRow {
+                    file_path: r.file_path,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    content: r.content,
+                    score: r.score,
+                    match_quality: r.match_quality,
+                    why: r.why,
+                })
+                .collect(),
         })
     }
 
@@ -347,6 +441,122 @@ impl DaemonService {
             false,
         )
     }
+}
+
+async fn read_persisted_index_stats(
+    project: &ProjectState,
+ ) -> anyhow::Result<Option<(usize, usize, Option<String>)>> {
+    let backend = Arc::new(CozoBackend::open(&project.backend.index_db_path)?);
+    match backend.stats().await {
+        Ok(stats) => Ok(Some((
+            stats.indexed_files,
+            stats.total_chunks,
+            stats.last_indexed.map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
+        ))),
+        Err(err) if err.to_string().to_lowercase().contains("stored relation") && err.to_string().to_lowercase().contains("not found") => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn provider_name_for_project(project: &ProjectState) -> anyhow::Result<String> {
+    let manifest = ManifestStore::open(project.manifest_path.as_path())
+        .context("failed to open manifest")?;
+    Ok(manifest
+        .get_meta("provider")
+        .context("failed to read provider from manifest")?
+        .unwrap_or_else(|| "fastembed".to_string()))
+}
+
+fn build_arc_provider(provider_name: &str) -> anyhow::Result<ArcProvider> {
+    let boxed: Box<dyn EmbedProvider + Send + Sync> = provider_from_name(provider_name)
+        .with_context(|| format!("failed to initialize provider '{provider_name}'"))?;
+    Ok(ArcProvider(Arc::from(boxed)))
+}
+
+async fn build_searcher_for_project(project: &ProjectState) -> anyhow::Result<Arc<CachedSearcher>> {
+    let provider_name = provider_name_for_project(project)?;
+    let provider = build_arc_provider(&provider_name)?;
+    {
+        let mut guard = project.provider_identity.write().await;
+        *guard = Some(provider_name.clone());
+    }
+    let backend = Arc::new(CozoBackend::open(&project.backend.index_db_path)?);
+    let root = project.canonical_root.clone();
+    let config = Config::load(&root).unwrap_or_default();
+    let searcher = Searcher::new(backend, provider);
+    let searcher = {
+        let searcher = searcher.with_search_tuning(&config);
+        let searcher = if config.search.pagerank_boost == Some(false) {
+            searcher.with_pagerank_boost(false)
+        } else {
+            searcher
+        };
+        if config.search.sparse.enabled {
+            match FastEmbedSparseProvider::bgem3() {
+                Ok(sp) => searcher.with_sparse_provider(Arc::new(sp)),
+                Err(err) => {
+                    tracing::warn!(project = %project.project_key, error = %err, "sparse provider init failed in daemon search; skipping sparse search");
+                    searcher
+                }
+            }
+        } else {
+            searcher
+        }
+    };
+    Ok(Arc::new(searcher))
+}
+
+async fn get_or_build_searcher(project: &ProjectState) -> anyhow::Result<Arc<CachedSearcher>> {
+    {
+        let guard = project.cached_searcher.read().await;
+        if let Some(searcher) = guard.as_ref() {
+            return Ok(Arc::clone(searcher));
+        }
+    }
+
+    let mut guard = project.cached_searcher.write().await;
+    if let Some(searcher) = guard.as_ref() {
+        return Ok(Arc::clone(searcher));
+    }
+    let searcher = build_searcher_for_project(project).await?;
+    *guard = Some(Arc::clone(&searcher));
+    Ok(searcher)
+}
+
+async fn run_real_index(project: Arc<ProjectState>, provider_name: String) -> anyhow::Result<skelesearch_core::IndexResult> {
+    let backend_path = project.backend.index_db_path.clone();
+    let manifest_path = project.manifest_path.clone();
+    let root = project.canonical_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("runtime build: {e}"))?;
+        rt.block_on(async move {
+            let backend = Arc::new(CozoBackend::open(&backend_path)?);
+            let manifest = Arc::new(ManifestStore::open(&manifest_path)?);
+            let provider = build_arc_provider(&provider_name)?;
+            let config = Config::load(&root).context("load .skelesearch.toml")?;
+            let indexer = Indexer::new(backend, manifest, provider)
+                .with_excludes(config.index.exclude.clone())
+                .with_include_extensions(config.index.include_extensions.clone())
+                .with_scope_prefix(config.index.scope_prefix);
+            let indexer = if config.search.sparse.enabled {
+                match FastEmbedSparseProvider::bgem3() {
+                    Ok(sp) => indexer.with_sparse_provider(Arc::new(sp)),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "sparse provider init failed in daemon index; skipping sparse indexing");
+                        indexer
+                    }
+                }
+            } else {
+                indexer
+            };
+            indexer.index_path(&root).await
+        })
+    })
+    .await
+    .context("daemon index task panicked")?
 }
 
 #[derive(Debug, Clone)]
@@ -382,15 +592,14 @@ impl From<ProjectTarget> for ProjectLookup {
     }
 }
 
-#[derive(Debug)]
 pub struct ProjectState {
     pub project_key: ProjectKey,
     pub canonical_root: PathBuf,
     pub storage_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub backend: Arc<BackendHandle>,
-    pub cached_searcher: Arc<RwLock<Option<Arc<CachedSearcherPlaceholder>>>>,
-    pub provider_identity: Arc<RwLock<Option<ProviderIdentityPlaceholder>>>,
+    pub cached_searcher: Arc<RwLock<Option<Arc<CachedSearcher>>>>,
+    pub provider_identity: Arc<RwLock<Option<String>>>,
     pub index_progress: Arc<RwLock<ProjectIndexRuntime>>,
     pub coordination: CoordinationStatePlaceholder,
     manifest: Arc<ManifestHandle>,
@@ -455,9 +664,7 @@ impl ProjectState {
     async fn mark_indexing_started(&self, path: String, provider: String) {
         {
             let mut provider_identity = self.provider_identity.write().await;
-            *provider_identity = Some(ProviderIdentityPlaceholder {
-                provider_name: provider,
-            });
+            *provider_identity = Some(provider);
         }
 
         let mut runtime = self.index_progress.write().await;
@@ -473,17 +680,17 @@ impl ProjectState {
         });
     }
 
-    async fn update_running_totals(&self, files_total: usize) {
-        let mut runtime = self.index_progress.write().await;
-        if let Some(progress) = runtime.indexing.as_mut() {
-            progress.files_total = files_total;
-        }
-    }
 
-    async fn mark_indexing_done(&self, files_total: usize, elapsed_seconds: f64) {
+    async fn mark_indexing_done(
+        &self,
+        indexed_files: usize,
+        total_chunks: usize,
+        cache_hits: usize,
+        elapsed_seconds: f64,
+    ) {
         let mut runtime = self.index_progress.write().await;
-        runtime.indexed_files = files_total;
-        runtime.total_chunks = files_total;
+        runtime.indexed_files = indexed_files;
+        runtime.total_chunks = total_chunks;
         runtime.last_indexed = Some(Utc::now().to_rfc3339());
         let path = runtime
             .indexing
@@ -493,10 +700,10 @@ impl ProjectState {
         runtime.indexing = Some(IndexingProgress {
             status: IndexingState::Done,
             path,
-            files_done: files_total,
-            files_total,
-            chunks_done: files_total,
-            cache_hits: 0,
+            files_done: indexed_files,
+            files_total: indexed_files,
+            chunks_done: total_chunks,
+            cache_hits,
             elapsed_seconds,
             error: None,
         });
@@ -519,6 +726,11 @@ impl ProjectState {
             elapsed_seconds,
             error: Some(error),
         });
+    }
+
+    async fn invalidate_searcher(&self) {
+        let mut guard = self.cached_searcher.write().await;
+        *guard = None;
     }
 }
 
@@ -556,10 +768,6 @@ impl ManifestHandle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderIdentityPlaceholder {
-    pub provider_name: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProjectIndexRuntime {
@@ -571,8 +779,6 @@ pub struct ProjectIndexRuntime {
     pub indexing: Option<IndexingProgress>,
 }
 
-#[derive(Debug)]
-pub struct CachedSearcherPlaceholder;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinationStatePlaceholder {
@@ -588,6 +794,7 @@ impl CoordinationStatePlaceholder {
         }
     }
 }
+
 
 fn canonical_project_key(target: ProjectLookup) -> Result<ProjectKey, ProjectKeyError> {
     match target {
@@ -615,48 +822,13 @@ fn open_or_create_rw(path: &Path) -> anyhow::Result<File> {
         .with_context(|| format!("open project state file '{}'", path.display()))
 }
 
-fn count_indexable_files(root: &Path) -> anyhow::Result<usize> {
-    if !root.exists() {
-        return Ok(0);
-    }
-
-    let mut count = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)
-            .with_context(|| format!("read project directory '{}'", dir.display()))?
-        {
-            let entry = entry.with_context(|| format!("read entry under '{}'", dir.display()))?;
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("read file type for '{}'", entry.path().display()))?;
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-
-            if file_type.is_dir() {
-                if file_name == ".git" || file_name == STORAGE_DIR_NAME {
-                    continue;
-                }
-                stack.push(entry.path());
-                continue;
-            }
-
-            if file_type.is_file() {
-                count += 1;
-            }
-        }
-    }
-
-    Ok(count)
-}
 
 fn daemon_capabilities() -> DaemonCapabilities {
     DaemonCapabilities {
         info: true,
         index_codebase: true,
         index_status: true,
-        search_code: false,
+        search_code: true,
         smart_search: false,
     }
 }
@@ -793,6 +965,36 @@ mod tests {
         assert_eq!(first.status, IndexCodebaseStatus::IndexingStarted);
         assert_eq!(second.status, IndexCodebaseStatus::AlreadyIndexing);
 
-        tokio::time::sleep(Duration::from_millis(PLACEHOLDER_INDEX_DELAY_MS + 100)).await;
+    }
+
+    #[tokio::test]
+    async fn search_code_returns_index_unavailable_for_unindexed_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let service = DaemonService::default();
+        let response = service
+            .handle_request(DaemonRequest::SearchCode(SearchCodeRequest {
+                target: ProjectTarget::RootPath {
+                    root_path: root.to_string_lossy().into_owned(),
+                    logical_id: None,
+                },
+                query: "find main".to_string(),
+                top_k: 3,
+                include_graph: false,
+                max_depth: None,
+                diversity: 0.3,
+                max_tokens: Some(1024),
+                branch_scope: false,
+                session_id: None,
+            }))
+            .await;
+
+        let DaemonResponse::Error(err) = response else {
+            panic!("expected daemon error response");
+        };
+        assert_eq!(err.code, DaemonErrorCode::IndexUnavailable);
+        assert!(err.retryable);
     }
 }

@@ -12,10 +12,18 @@ use std::{
     io::Write as _,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
 };
 
 use async_trait::async_trait;
+use skelesearch_service::{
+    DaemonCapabilities, DaemonRequest, DaemonResponse, HandshakeResponse, ProjectKey, ProtocolFrame,
+    SearchCodeResponse as DaemonSearchCodeResponse, SearchResultRow as DaemonSearchResultRow,
+};
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+    net::UnixListener,
+};
 use skelesearch_core::{CozoBackend, EmbedProvider, Indexer, ManifestStore};
 use skelesearch_mcp::{
     server::{ArcProvider, SkeleSearchServer},
@@ -81,6 +89,78 @@ fn fixture_repo_path() -> anyhow::Result<PathBuf> {
         anyhow::bail!("fixture repo not found at {}", path.display());
     }
     Ok(path)
+}
+
+fn env_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+#[cfg(unix)]
+async fn spawn_stub_search_daemon(
+    socket_path: &std::path::Path,
+ ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+        while let Some(line) = lines.next_line().await? {
+            let frame: ProtocolFrame = serde_json::from_str(&line)?;
+            let response = match frame {
+                ProtocolFrame::Request { id, request } => match request {
+                    DaemonRequest::Handshake(_) => ProtocolFrame::Response {
+                        id,
+                        response: DaemonResponse::Handshake(HandshakeResponse {
+                            protocol_version: skelesearch_service::DAEMON_PROTOCOL_VERSION.to_string(),
+                            server_name: "stub-daemon".to_string(),
+                            server_version: "0.1.0".to_string(),
+                            capabilities: DaemonCapabilities {
+                                info: true,
+                                index_codebase: true,
+                                index_status: true,
+                                search_code: true,
+                                smart_search: false,
+                            },
+                        }),
+                    },
+                    DaemonRequest::SearchCode(_) => ProtocolFrame::Response {
+                        id,
+                        response: DaemonResponse::SearchCode(DaemonSearchCodeResponse {
+                            project_key: ProjectKey {
+                                canonical_root: "/tmp/repo".to_string(),
+                                logical_id: None,
+                            },
+                            results: vec![DaemonSearchResultRow {
+                                file_path: "src/searcher.rs".to_string(),
+                                start_line: 10,
+                                end_line: 20,
+                                content: "fn search() {}".to_string(),
+                                score: 0.9,
+                                match_quality: "high".to_string(),
+                                why: "semantic".to_string(),
+                            }],
+                        }),
+                    },
+                    other => ProtocolFrame::Response {
+                        id,
+                        response: DaemonResponse::Error(skelesearch_service::DaemonErrorResponse {
+                            code: skelesearch_service::DaemonErrorCode::BadRequest,
+                            message: format!("unexpected request in stub: {other:?}"),
+                            details: None,
+                            retryable: false,
+                        }),
+                    },
+                },
+                _ => continue,
+            };
+            let encoded = serde_json::to_string(&response)?;
+            write_half.write_all(encoded.as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+            write_half.flush().await?;
+        }
+        Ok(())
+    }))
 }
 
 /// Create a pre-indexed `SkeleSearchServer` backed by temp databases.
@@ -216,31 +296,45 @@ async fn list_tools_exposes_the_v1_tools() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn search_code_output_exposes_spec_fields() -> anyhow::Result<()> {
-    let server = test_server().await?;
-    let response = server
-        .search_code(SearchCodeInput {
-            query: "import edges".into(),
-            top_k: 3,
-            include_graph: true,
-            max_depth: None,
-            diversity: 0.0,
-            max_tokens: None,
-            branch_scope: false,
-            session_id: None,
-        })
-        .await?;
-    assert!(
-        !response.results.is_empty(),
-        "expected at least one result from pre-indexed fixture"
-    );
-    let row = &response.results[0];
-    assert!(!row.file_path.is_empty());
-    assert!(row.end_line >= row.start_line);
-    assert!(!row.content.is_empty());
-    assert!(row.score > 0.0);
-    assert!(!row.match_quality.is_empty());
-    assert!(!row.why.is_empty());
-    Ok(())
+    #[cfg(unix)]
+    {
+        let _guard = env_lock().lock().expect("env lock");
+        let temp = TempDir::new()?;
+        let socket_path = temp.path().join("daemon.sock");
+        let daemon = spawn_stub_search_daemon(&socket_path).await?;
+        std::env::set_var("SKELESEARCH_DAEMON_SOCKET", &socket_path);
+
+        let server = test_server().await?;
+        let response = server
+            .search_code(SearchCodeInput {
+                query: "import edges".into(),
+                top_k: 3,
+                include_graph: true,
+                max_depth: None,
+                diversity: 0.0,
+                max_tokens: None,
+                branch_scope: false,
+                session_id: None,
+            })
+            .await?;
+        assert!(!response.results.is_empty(), "expected at least one result from daemon-backed search");
+        let row = &response.results[0];
+        assert!(!row.file_path.is_empty());
+        assert!(row.end_line >= row.start_line);
+        assert!(!row.content.is_empty());
+        assert!(row.score > 0.0);
+        assert!(!row.match_quality.is_empty());
+        assert!(!row.why.is_empty());
+
+        std::env::remove_var("SKELESEARCH_DAEMON_SOCKET");
+        daemon.abort();
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
 }
 
 #[tokio::test]

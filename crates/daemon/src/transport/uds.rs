@@ -264,7 +264,7 @@ mod tests {
                 assert!(response.capabilities.info);
                 assert!(response.capabilities.index_codebase);
                 assert!(response.capabilities.index_status);
-                assert!(!response.capabilities.search_code);
+                assert!(response.capabilities.search_code);
                 assert!(!response.capabilities.smart_search);
             }
             other => panic!("expected handshake response frame, got {other:?}"),

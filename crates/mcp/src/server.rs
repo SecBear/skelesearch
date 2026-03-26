@@ -13,7 +13,7 @@
 //     public method that tests can call directly.
 //   - Provider selection is explicit: unknown names return a clear error.
 
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock}, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, RwLock}, time::Duration};
 
 #[path = "client.rs"]
 mod client;
@@ -163,9 +163,6 @@ pub struct SkeleSearchServer {
     provider: Arc<RwLock<ArcProvider>>,
     daemon_client: Arc<DaemonClient<TokioDaemonConnector>>,
     tool_router: ToolRouter<Self>,
-    /// Tracks content hashes seen per session for dedup.
-    /// TODO: add periodic cleanup for long-running servers (sessions accumulate in memory).
-    sessions: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
     /// Cached searcher — built once on first search, invalidated after indexing.
     /// Keeps the LRU query-embedding cache and TCP connection pool alive across
     /// MCP calls, eliminating cold TLS handshakes and redundant embed API calls.
@@ -314,7 +311,6 @@ impl SkeleSearchServer {
             provider: Arc::new(RwLock::new(ArcProvider::new(provider))),
             daemon_client,
             tool_router: Self::tool_router(),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
             cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
             index_state: Arc::new(tokio::sync::RwLock::new(IndexProgress::default())),
             backend_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -712,28 +708,6 @@ impl SkeleSearchServer {
     // Session dedup helpers
     // -----------------------------------------------------------------------
 
-    /// Record that these content hashes were returned in this session.
-    fn record_seen(&self, session_id: &str, hashes: &[u64]) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            let seen = sessions.entry(session_id.to_string()).or_default();
-            seen.extend(hashes);
-        }
-    }
-
-    /// Return the set of content hashes seen so far in this session.
-    fn get_seen(&self, session_id: &str) -> HashSet<u64> {
-        self.sessions.lock()
-            .map(|s| s.get(session_id).cloned().unwrap_or_default())
-            .unwrap_or_default()
-    }
-
-    /// Stable hash of a chunk's full content string for session dedup.
-    fn content_hash(s: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish()
-    }
 
     /// Configure the search pipeline from project config and env vars.
     /// Expansion is opt-in (SKELESEARCH_EXPANSION=1 or config); rerankers auto-detect API keys.
@@ -937,98 +911,39 @@ impl SkeleSearchServer {
         &self,
         input: SearchCodeInput,
     ) -> anyhow::Result<SearchCodeResponse> {
-        let search_start = std::time::Instant::now();
-
-        let default_storage_dir = Self::storage_dir_from_manifest_path(self.manifest_path.as_path())?;
-        if matches!(
-            self.current_indexing_progress(&default_storage_dir).await.as_ref().map(|p| p.status.as_str()),
-            Some("running")
-        ) {
-            anyhow::bail!(
-                "Index is being built for '{}'. Poll index_status to check progress; semantic search will be available once indexing completes.",
-                default_storage_dir.display()
-            );
-        }
-
-        let provider_name = self.provider
-            .read()
-            .map(|p| p.name().to_string())
-            .unwrap_or_else(|_| "<poisoned-provider-lock>".to_string());
-        let t0 = std::time::Instant::now();
-        let searcher = self.get_or_build_searcher().await?;
-        let build_ms = t0.elapsed().as_millis() as u64;
-        if build_ms > 100 {
-            tracing::info!(build_ms, "get_or_build_searcher was slow (cold build)");
-        }
-
-        let top_k = input.top_k.max(1);
-        let max_tokens = input.max_tokens.or(Some(8192)); // agent-friendly default
-        let max_depth = input.max_depth.unwrap_or(if input.include_graph { 2 } else { 0 });
-        let (mut results, timings) = searcher
-            .search_with_timings(&input.query, top_k, input.include_graph, max_depth, input.diversity, max_tokens)
-            .await?;
-        let total_ms = search_start.elapsed().as_millis() as u64;
-        tracing::info!(
-            instance_id = %self.instance_id,
-            provider = %provider_name,
-            build_ms,
-            embed_ms = timings.embed_ms,
-            retrieve_ms = timings.retrieve_ms,
-            expand_ms = timings.expand_ms,
-            rerank_ms = timings.rerank_ms,
-            graph_ms = timings.graph_ms,
-            pipeline_ms = timings.total_ms,
-            total_ms,
-            results = results.len(),
-            query_len = input.query.len(),
-            branch_scope = input.branch_scope,
-            include_graph = input.include_graph,
-            strategy = "semantic",
-            "search_code timings"
-        );
-
-        // Filter to branch-changed files if requested.
-        if input.branch_scope {
-            // Derive project root from manifest path: .skelesearch/manifest.db -> project_root
-            let root = self.manifest_path
-                .parent()
-                .and_then(|p| p.parent())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let changed = skelesearch_core::git::changed_files_on_branch(root)?;
-            if !changed.is_empty() {
-                results.retain(|r| changed.iter().any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)));
-            }
-        }
-
-        let mut rows: Vec<SearchCodeRow> = results
-            .into_iter()
-            .map(|r| SearchCodeRow {
-                file_path: r.file_path,
-                start_line: r.start_line,
-                end_line: r.end_line,
-                content: r.content,
-                score: r.score,
-                match_quality: r.match_quality,
-                why: r.why,
+        let target = self.daemon_target_for_status(None)?;
+        let response = self
+            .daemon_client
+            .search_code(skelesearch_service::SearchCodeRequest {
+                target,
+                query: input.query,
+                top_k: input.top_k,
+                include_graph: input.include_graph,
+                max_depth: input.max_depth,
+                diversity: input.diversity,
+                max_tokens: input.max_tokens,
+                branch_scope: input.branch_scope,
+                session_id: input.session_id,
             })
-            .collect();
+            .await
+            .map_err(|err| anyhow::anyhow!(self.daemon_proxy_error("search_code", err)))?;
 
-        // Session dedup: deprioritize (not exclude) content seen in prior searches.
-        if let Some(ref sid) = input.session_id {
-            let seen = self.get_seen(sid);
-            // Stable partition preserving score order within each group.
-            let (mut unseen, mut already_seen): (Vec<_>, Vec<_>) = rows
+        Ok(SearchCodeResponse {
+            results: response
+                .results
                 .into_iter()
-                .partition(|r| !seen.contains(&Self::content_hash(&r.content)));
-            unseen.append(&mut already_seen);
-            // Record every chunk returned (seen and unseen alike) so they are
-            // deprioritized on the next call in this session.
-            let hashes: Vec<u64> = unseen.iter().map(|r| Self::content_hash(&r.content)).collect();
-            self.record_seen(sid, &hashes);
-            rows = unseen;
-        }
-
-        Ok(SearchCodeResponse { results: rows, _timings: timings })
+                .map(|r| SearchCodeRow {
+                    file_path: r.file_path,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    content: r.content,
+                    score: r.score,
+                    match_quality: r.match_quality,
+                    why: r.why,
+                })
+                .collect(),
+            _timings: skelesearch_core::SearchTimings::default(),
+        })
     }
 
     /// Index the codebase at `input.path` in the background.
