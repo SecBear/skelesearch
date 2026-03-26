@@ -4,6 +4,72 @@ use serde::{Deserialize, Serialize};
 /// Current transport-neutral daemon protocol version.
 pub const DAEMON_PROTOCOL_VERSION: &str = "1";
 
+/// Correlation identifier for request/response pairs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct RequestId(pub u64);
+
+/// Logical stream identifier used by event frames.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct StreamId(pub u64);
+
+/// Framed daemon protocol envelope.
+///
+/// This stays transport-neutral and can be carried over UDS/TCP line framing,
+/// HTTP/SSE adapters, or WebSocket adapters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum ProtocolFrame {
+    Request { id: RequestId, request: DaemonRequest },
+    Response { id: RequestId, response: DaemonResponse },
+    Event { stream_id: StreamId, event: DaemonEvent },
+    Cancel { id: RequestId },
+    Ping,
+    Pong,
+}
+
+/// Daemon-originated stream event payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "event", content = "payload", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    IndexProgress(IndexProgressEvent),
+    Status(DaemonStatusEvent),
+    ProtocolError(ProtocolErrorEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IndexProgressEvent {
+    pub project_key: ProjectKey,
+    pub progress: IndexingProgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonStatusEvent {
+    pub level: StatusLevel,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProtocolErrorEvent {
+    pub error: DaemonErrorResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -101,6 +167,8 @@ pub struct InfoResponse {
     pub protocol_version: String,
     pub server_name: String,
     pub server_version: String,
+    #[serde(default)]
+    pub capabilities: DaemonCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,46 +352,97 @@ mod tests {
     }
 
     #[test]
-    fn protocol_request_round_trip() {
-        let request = DaemonRequest::SmartSearch(SmartSearchRequest {
-            target: ProjectTarget::ProjectKey {
-                project_key: fixture_project_key(),
-            },
-            query: "find protocol parser".to_string(),
-            top_k: 7,
-            include_graph: true,
-            diversity: 0.2,
-            max_tokens: Some(1200),
-            branch_scope: false,
-            session_id: Some("session-1".to_string()),
-            intent: Some("find".to_string()),
-            symbols: vec!["Protocol".to_string()],
-            scope: Some("crates/service".to_string()),
-        });
+    fn protocol_request_frame_round_trip() {
+        let frame = ProtocolFrame::Request {
+            id: RequestId(42),
+            request: DaemonRequest::SmartSearch(SmartSearchRequest {
+                target: ProjectTarget::ProjectKey {
+                    project_key: fixture_project_key(),
+                },
+                query: "find protocol parser".to_string(),
+                top_k: 7,
+                include_graph: true,
+                diversity: 0.2,
+                max_tokens: Some(1200),
+                branch_scope: false,
+                session_id: Some("session-1".to_string()),
+                intent: Some("find".to_string()),
+                symbols: vec!["Protocol".to_string()],
+                scope: Some("crates/service".to_string()),
+            }),
+        };
 
-        let encoded = serde_json::to_string(&request).expect("serialize");
-        let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize");
-        assert_eq!(decoded, request);
+        let encoded = serde_json::to_string(&frame).expect("serialize");
+        let decoded: ProtocolFrame = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, frame);
     }
 
     #[test]
-    fn protocol_response_round_trip() {
-        let response = DaemonResponse::SearchCode(SearchCodeResponse {
-            project_key: fixture_project_key(),
-            results: vec![SearchResultRow {
-                file_path: "src/protocol.rs".to_string(),
-                start_line: 12,
-                end_line: 21,
-                content: "pub enum DaemonRequest".to_string(),
-                score: 42.0,
-                match_quality: "high".to_string(),
-                why: "hybrid".to_string(),
-            }],
-        });
+    fn protocol_response_frame_round_trip() {
+        let frame = ProtocolFrame::Response {
+            id: RequestId(42),
+            response: DaemonResponse::SearchCode(SearchCodeResponse {
+                project_key: fixture_project_key(),
+                results: vec![SearchResultRow {
+                    file_path: "src/protocol.rs".to_string(),
+                    start_line: 12,
+                    end_line: 21,
+                    content: "pub enum DaemonRequest".to_string(),
+                    score: 42.0,
+                    match_quality: "high".to_string(),
+                    why: "hybrid".to_string(),
+                }],
+            }),
+        };
 
-        let encoded = serde_json::to_string(&response).expect("serialize");
-        let decoded: DaemonResponse = serde_json::from_str(&encoded).expect("deserialize");
-        assert_eq!(decoded, response);
+        let encoded = serde_json::to_string(&frame).expect("serialize");
+        let decoded: ProtocolFrame = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn protocol_event_frame_round_trip() {
+        let frame = ProtocolFrame::Event {
+            stream_id: StreamId(7),
+            event: DaemonEvent::IndexProgress(IndexProgressEvent {
+                project_key: fixture_project_key(),
+                progress: IndexingProgress {
+                    status: IndexingState::Running,
+                    path: "/tmp/example".to_string(),
+                    files_done: 2,
+                    files_total: 10,
+                    chunks_done: 6,
+                    cache_hits: 1,
+                    elapsed_seconds: 0.55,
+                    error: None,
+                },
+                request_id: Some(RequestId(42)),
+            }),
+        };
+
+        let encoded = serde_json::to_string(&frame).expect("serialize");
+        let decoded: ProtocolFrame = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn protocol_cancel_ping_pong_round_trip() {
+        let cancel = ProtocolFrame::Cancel { id: RequestId(9) };
+        let ping = ProtocolFrame::Ping;
+        let pong = ProtocolFrame::Pong;
+
+        let encoded_cancel = serde_json::to_string(&cancel).expect("serialize cancel");
+        let encoded_ping = serde_json::to_string(&ping).expect("serialize ping");
+        let encoded_pong = serde_json::to_string(&pong).expect("serialize pong");
+
+        let decoded_cancel: ProtocolFrame =
+            serde_json::from_str(&encoded_cancel).expect("deserialize cancel");
+        let decoded_ping: ProtocolFrame = serde_json::from_str(&encoded_ping).expect("deserialize ping");
+        let decoded_pong: ProtocolFrame = serde_json::from_str(&encoded_pong).expect("deserialize pong");
+
+        assert_eq!(decoded_cancel, cancel);
+        assert_eq!(decoded_ping, ping);
+        assert_eq!(decoded_pong, pong);
     }
 
     #[test]

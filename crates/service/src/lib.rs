@@ -3,9 +3,10 @@ pub mod protocol;
 
 pub use project::{ProjectKey, ProjectKeyError};
 pub use protocol::{
-    DaemonCapabilities, DaemonErrorCode, DaemonErrorResponse, DaemonRequest, DaemonResponse,
-    HandshakeRequest, HandshakeResponse, IndexCodebaseRequest, IndexCodebaseResponse,
-    IndexStatusRequest, IndexStatusResponse, IndexingProgress, InfoRequest, InfoResponse,
-    ProjectTarget, SearchCodeRequest, SearchCodeResponse, SearchResultRow, SmartSearchRequest,
-    SmartSearchResponse, SmartSearchResults, DAEMON_PROTOCOL_VERSION,
+    DaemonCapabilities, DaemonErrorCode, DaemonErrorResponse, DaemonEvent, DaemonRequest,
+    DaemonResponse, DaemonStatusEvent, HandshakeRequest, HandshakeResponse, IndexCodebaseRequest,
+    IndexCodebaseResponse, IndexProgressEvent, IndexStatusRequest, IndexStatusResponse,
+    IndexingProgress, InfoRequest, InfoResponse, ProjectTarget, ProtocolErrorEvent, ProtocolFrame,
+    RequestId, SearchCodeRequest, SearchCodeResponse, SearchResultRow, SmartSearchRequest,
+    SmartSearchResponse, SmartSearchResults, StatusLevel, StreamId, DAEMON_PROTOCOL_VERSION,
 };
