@@ -68,7 +68,14 @@ async fn async_main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let project_root = find_project_root();
-    let skelesearch_dir = resolve_storage_dir(&project_root);
+    let is_project = looks_like_project_root(&project_root);
+    let skelesearch_dir = if is_project {
+        resolve_storage_dir(&project_root)
+    } else {
+        let inert = std::env::temp_dir().join(format!(".skelesearch-inert-{pid}"));
+        let _ = std::fs::create_dir_all(&inert);
+        inert
+    };
 
     let backend = Arc::new(
         skelesearch_core::CozoBackend::open(skelesearch_dir.join("index.db"))
@@ -76,7 +83,8 @@ async fn async_main() -> anyhow::Result<()> {
     );
     let manifest_path = skelesearch_dir.join("manifest.db");
 
-    let server = SkeleSearchServer::new(backend, manifest_path, NoopProvider);
+    let server = SkeleSearchServer::new(backend, &manifest_path, NoopProvider)
+        .with_default_project_root(if is_project { Some(project_root.clone()) } else { None });
 
     if let Some(addr_str) = args.http {
         let addr: std::net::SocketAddr = addr_str.parse()
@@ -169,4 +177,13 @@ fn default_mcp_log_path() -> PathBuf {
         .join(".cache")
         .join("skelesearch")
         .join("skelesearch-mcp.log")
+}
+
+fn looks_like_project_root(dir: &std::path::Path) -> bool {
+    if dir.to_string_lossy() == "/" {
+        return false;
+    }
+    [".git", "Cargo.toml", "package.json", "pyproject.toml", "go.mod", ".skelesearch.toml"]
+        .iter()
+        .any(|marker| dir.join(marker).exists())
 }

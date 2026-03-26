@@ -180,6 +180,10 @@ pub struct SkeleSearchServer {
     watcher_started: Arc<AtomicBool>,
     /// Stable per-process identifier for correlating lifecycle logs.
     instance_id: Arc<str>,
+    /// Default project root for pathless operations. None means inert/non-project mode.
+    default_project_root: Option<PathBuf>,
+    /// When true, skip auto-index, watcher startup, and health checks until an explicit project path is supplied.
+    inert_mode: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +300,7 @@ impl SkeleSearchServer {
         let manifest_path = Arc::new(manifest_path.into());
         let instance_id = new_instance_id();
         let daemon_client = Arc::new(DaemonClient::from_env());
+        let default_project_root = manifest_path.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf());
         tracing::info!(
             instance_id = %instance_id,
             pid = std::process::id(),
@@ -316,7 +321,15 @@ impl SkeleSearchServer {
             backend_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
             instance_id,
+            default_project_root,
+            inert_mode: false,
         }
+    }
+
+    pub fn with_default_project_root(mut self, root: Option<PathBuf>) -> Self {
+        self.inert_mode = root.is_none();
+        self.default_project_root = root;
+        self
     }
 
     /// Map an error to a friendly string, noting if indexing is in progress.
@@ -368,23 +381,14 @@ impl SkeleSearchServer {
             return Self::daemon_target_from_path(path);
         }
 
-        let cwd = std::env::current_dir().context("resolve current working directory for daemon status target")?;
-        let original = cwd.clone();
-        let mut dir = cwd;
-        let root = loop {
-            if dir.join(".git").exists() {
-                break dir;
-            }
-            match dir.parent() {
-                Some(parent) => dir = parent.to_path_buf(),
-                None => break original,
-            }
-        };
+        if let Some(root) = &self.default_project_root {
+            return Ok(DaemonProjectTarget::RootPath {
+                root_path: root.to_string_lossy().into_owned(),
+                logical_id: None,
+            });
+        }
 
-        Ok(DaemonProjectTarget::RootPath {
-            root_path: root.to_string_lossy().into_owned(),
-            logical_id: None,
-        })
+        anyhow::bail!("no default project root for this MCP instance; pass an explicit project path")
     }
 
     fn map_daemon_indexing_progress(
@@ -542,6 +546,10 @@ impl SkeleSearchServer {
     /// - Provider is auto-detected: Voyage → OpenAI → FastEmbed (zero-config fallback).
     async fn auto_index_if_needed(&self) {
         tracing::info!(instance_id = %self.instance_id, "auto_index_if_needed: entry");
+        if self.inert_mode {
+            tracing::info!(instance_id = %self.instance_id, "auto_index_if_needed: inert mode, skipping");
+            return;
+        }
 
         // Opt-out escape hatch for managed environments.
         if std::env::var("SKELESEARCH_NO_AUTO_INDEX").is_ok() {
@@ -2323,11 +2331,12 @@ impl ServerHandler for SkeleSearchServer {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
             tracing::info!("on_initialized: called — triggering auto-index check");
+            if self.inert_mode {
+                tracing::info!(instance_id = %self.instance_id, "on_initialized: inert mode, skipping auto-index, watcher, and health check");
+                return;
+            }
             self.auto_index_if_needed().await;
             self.start_file_watcher_if_enabled().await;
-            // Quick health check: verify the index backend is queryable.
-            // Does not block startup — logs clearly so the user sees problems in server logs.
-            // An uninitialized index is expected on first launch (auto-indexing runs in background).
             match self.backend.stats().await {
                 Ok(stats) => {
                     tracing::info!(
@@ -2337,7 +2346,6 @@ impl ServerHandler for SkeleSearchServer {
                     );
                 }
                 Err(ref e) if is_uninitialized_index_error(e) => {
-                    // Expected on fresh start before any indexing has run.
                     tracing::info!("index health check: not yet initialized (auto-indexing will handle this)");
                 }
                 Err(e) => {
