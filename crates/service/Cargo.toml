@@ -1,0 +1,15 @@
+[package]
+name = "skelesearch-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transport-neutral daemon protocol and project routing types for skelesearch"
+
+[lib]
+name = "skelesearch_service"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
