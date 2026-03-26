@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "skelesearchd"
 path = "src/main.rs"
 
+
+[features]
+default = []
+storage-rocksdb = ["skelesearch-core/storage-rocksdb"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
