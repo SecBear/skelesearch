@@ -84,6 +84,12 @@ skelesearch clear                     Delete the entire local index
 skelesearch watch <path>              Re-index on file changes (2s debounce)
 ```
 
+`skelesearch status --json` reports both freshness and watcher state. Freshness
+uses four states: `fresh`, `stale`, `refreshing`, and `unknown`.
+`estimated_stale` is the current manifest-based estimate of how many files may
+be out of date, `watching` only reports whether a watch process is active, and
+the two signals are intentionally separate.
+
 ## MCP server
 
 For agent integration (Claude Code, Codex, and any MCP-compatible host):
@@ -101,17 +107,20 @@ skelesearch-mcp --http 127.0.0.1:3000
 > Recommended when you want skelesearch available across projects.
 
 ```bash
-# Minimal install (fastembed backend, default)
-cargo install --path crates/mcp
-
-# With RocksDB backend (higher write throughput at scale)
-cargo install --path crates/mcp --root ~/.local --force --features skelesearch-core/storage-rocksdb
-# or use the helper script
+# Reproducible global install via Nix (RocksDB-backed by default)
 ./scripts/install-mcp.sh
+
+# Or build the pinned flake packages directly
+nix build .#skelesearch-mcp
+nix build .#skelesearch-daemon
 ```
 
-This installs `skelesearch-mcp` into PATH (or `~/.local/bin` when using `--root`).
-Add the binary to your MCP config. See [docs/integrations.md](docs/integrations.md) for config examples.
+This installs `skelesearch-mcp` and `skelesearchd` into `~/.local/bin` as small
+wrapper scripts pointing at the pinned Nix store outputs and exporting the required
+ONNX Runtime library path. The install path is reproducible and RocksDB-backed by
+default. `skelesearch-mcp` auto-starts the sibling `skelesearchd` binary for
+daemon-backed tools such as `index` and `get_index_status`. Add the MCP binary to
+your MCP config. See [docs/integrations.md](docs/integrations.md) for config examples.
 
 
 ### MCP tools
@@ -125,7 +134,18 @@ Add the binary to your MCP config. See [docs/integrations.md](docs/integrations.
 | `find_tests` | Find test files that cover a source file. |
 | `get_repo_map` | Return a fast structural map of the indexed repo (tree, roles, symbols, edges). |
 | `index` | Start background indexing for a project. |
-| `get_index_status` | Check indexing progress and freshness. |
+| `get_index_status` | Check indexing progress, freshness (`fresh`, `stale`, `refreshing`, `unknown`), and watcher state. |
+
+On MCP startup, skelesearch auto-starts the daemon and, by default, performs a
+best-effort startup refresh when a project has no index yet or has a populated
+but stale index. Set `SKELESEARCH_NO_AUTO_INDEX=1` to opt out. If provider
+startup fails during that remediation, the last good index stays readable and
+`get_index_status` keeps reporting an honest stale or unknown freshness result
+instead of pretending the index is current.
+
+AST-level function diffing is still deferred. Changed files are refreshed at
+file granularity today, even though chunk embeddings for unchanged content are
+still reused through the embedding cache.
 
 ### Claude Code config
 

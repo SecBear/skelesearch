@@ -37,7 +37,13 @@ Once connected, Claude Code can call these tools:
 | `find_tests` | Discover tests covering a file |
 | `get_repo_map` | Fast structural overview of the indexed repo |
 | `index` | Trigger background indexing from within a session |
-| `get_index_status` | Check whether indexing is current or still running |
+| `get_index_status` | Check indexing progress, freshness state, stale estimate, and watcher state |
+
+`get_index_status` returns additive freshness fields. `freshness_state` is one
+of `fresh`, `stale`, `refreshing`, or `unknown`. `estimated_stale` is a
+best-effort manifest-based count of files that may be out of date.
+`watching` is separate and only tells you whether a background watcher is
+active.
 
 **Tip:** The `diversity` parameter defaults to `0.3` for MCP calls, which
 re-ranks results with Maximal Marginal Relevance to reduce redundancy. Lower
@@ -90,9 +96,12 @@ host's normal MCP config mechanism.
 Example install:
 
 ```bash
-cargo install --path crates/mcp --root ~/.local --force --features skelesearch-core/storage-rocksdb
-# or use the helper script
+# Reproducible RocksDB-backed install via the pinned flake
 ./scripts/install-mcp.sh
+
+# Or build the flake packages directly
+nix build .#skelesearch-mcp
+nix build .#skelesearch-daemon
 ```
 
 Example MCP entry:
@@ -113,10 +122,22 @@ Example MCP entry:
 
 Workflow:
 
-1. Install or rebuild the MCP binary
+1. Install or rebuild both `skelesearch-mcp` and `skelesearchd` from the flake
 2. Update your host's MCP config
 3. Restart the host
-4. skelesearch will auto-index on startup when needed (unless `SKELESEARCH_NO_AUTO_INDEX` is set)
+4. `skelesearch-mcp` will auto-start the sibling `skelesearchd` for daemon-backed tools
+5. skelesearch will auto-index on startup when needed, including a stale
+   populated index that needs one remediation refresh, unless
+   `SKELESEARCH_NO_AUTO_INDEX=1` is set
+
+Startup behavior is intentionally honest:
+
+- Empty project, no index yet: startup schedules an initial build.
+- Populated project, stale manifest: startup schedules one stale-refresh pass.
+- Fresh project: startup leaves the index alone.
+- Provider init failure during startup remediation: the existing index remains
+  readable, and status stays `stale` or `unknown` instead of flipping to
+  `fresh`.
 
 Tool recommendations:
 
@@ -144,8 +165,10 @@ skelesearch-mcp --http 127.0.0.1:3000
 
 This transport is available in current builds. Use stdio transport only if your
 client lacks Streamable HTTP support.
-> **Auto-indexing:** After connecting, call `get_index_status` before searching.
-> Auto-indexing runs in the background but may not be complete on first connect.
+> **Auto-indexing:** After connecting, call `get_index_status` before
+> searching. Auto-indexing runs in the background and may report
+> `refreshing` on first connect while the startup build or stale refresh is
+> still running.
 
 
 ---
@@ -198,12 +221,20 @@ The `hooks/post-edit-reindex` script keeps the index current automatically.
 
 **Behavior:**
 
-- If a `skelesearch watch` sentinel is active, the hook detects it via the
-  lock file and exits 0 without spawning a duplicate indexer.
+- If a `skelesearch watch` sentinel is active, the hook detects it by calling
+  `skelesearch status --json` and checking for `"watching": true`, then exits 0
+  without spawning a duplicate indexer. `watching=true` does not imply freshness
+  is `fresh`; it only means the watcher loop is alive.
 - Concurrent saves are safe: the script uses an exclusive lock
   (`.skelesearch/.skelesearch.lock`) so at most one indexer runs at a time.
 - The hook only re-embeds files whose content has changed since the last run
   (embedding cache), so subsequent runs are fast.
+- MCP watcher refreshes are coalesced. If edits arrive during an active refresh,
+  skelesearch queues one follow-up pass instead of dropping those edits or
+  spawning unbounded duplicate runs.
+
+AST-level function diffing remains deferred. Current refresh behavior is still
+file-granular, with chunk-level embedding reuse for unchanged content.
 
 ---
 

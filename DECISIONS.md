@@ -125,12 +125,27 @@ works with Claude Code's MCP configuration out of the box.
 ## ADR-008: Watch mode is a separate `watch` subcommand, opt-in in v1
 
 **Decision:** `skelesearch watch <path>` is a separate CLI subcommand. There is no `--watch`
-flag on `index`, and no automatic background watcher.
+flag on `index`, and watcher behavior remains opt-in.
 
 **Why:** The embedding step (5–50 chunks/sec depending on provider) is expensive enough that
 auto-triggering on every save would be disruptive. Keeping watch as a separate subcommand
 makes the "I'm now running a daemon" distinction explicit. Watch mode uses `notify` 6.x +
-`notify-debouncer-full` (handles vim's rename-over-tempfile pattern). Debounce window: 1s.
+`notify-debouncer-full` (handles vim's rename-over-tempfile pattern). Debounce window: 2s.
+
+**Freshness contract note:** Watcher state and freshness are reported separately.
+An active watcher does not imply the index is fresh, and a stale index can still
+be under active watch. Runtime freshness is reported as `fresh`, `stale`,
+`refreshing`, or `unknown`, based on manifest truth plus the current refresh
+overlay.
+
+**Startup remediation note:** MCP and daemon startup attempt one best-effort
+auto-refresh for empty indexes and populated stale indexes unless
+`SKELESEARCH_NO_AUTO_INDEX=1` is set. If provider initialization fails during
+that pass, skelesearch keeps serving the last good index and reports the stale
+or unknown state honestly.
+
+**Deferred scope:** AST-level function diffing is still deferred. Incremental
+refresh remains file-granular today.
 
 ---
 

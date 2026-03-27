@@ -35,8 +35,14 @@ Check that indexing completed:
 skelesearch status --json
 ```
 
-The response includes `indexed_files`, `total_chunks`, `last_indexed`, and
-`estimated_stale`. When `estimated_stale` is high, re-run `skelesearch index .`.
+The response includes `indexed_files`, `total_chunks`, `last_indexed`,
+`estimated_stale`, and `freshness_state`.
+
+- `freshness_state` is one of `fresh`, `stale`, `refreshing`, or `unknown`
+- `watching` is separate from freshness and only tells you whether the watch loop is alive
+- `estimated_stale` is a best-effort manifest-based count, not a hard guarantee
+
+When status is `stale`, re-run `skelesearch index .` (or let startup/watch remediation catch up).
 
 ## 3. CLI search
 
@@ -82,7 +88,7 @@ Once connected, Claude Code can call these tools:
 | `find_tests` | Find tests covering a source file |
 | `get_repo_map` | Fast structural overview of the indexed repo |
 | `index` | Trigger background indexing from within a session |
-| `get_index_status` | Check indexing progress and freshness |
+| `get_index_status` | Check indexing progress, freshness state, stale estimate, and watcher state |
 
 ## 5. Re-indexing
 
@@ -90,16 +96,18 @@ Re-run `skelesearch index .` (or call `index` via MCP) after:
 
 - A fresh clone on a new machine
 - Large merges or rebases
-- Any time `get_index_status` shows stale files or indexing errors
+- Any time `get_index_status` reports `stale`, `unknown`, or indexing errors
 
 The `hooks/post-edit-reindex` hook re-indexes automatically in the background after
 each file edit when skelesearch is wired via the Claude Code plugin manifest.
 
 ## 6. Index location
 
-`.skelesearch/` at the project root contains:
+`.skelesearch/` at the project root contains the active index state. In current
+builds that may be either:
 
-- `manifest.db` — SQLite manifest tracking indexed files and chunk metadata
-- `index.db` (or RocksDB-backed equivalent) — the embedded vector and graph database
+- legacy root files: `manifest.db` and `index.db`
+- generation-backed state: `active-generation` plus `generations/<id>/manifest.db`
+  and `generations/<id>/index.db`
 
 These files are machine-local. Do not commit them.
