@@ -6,12 +6,23 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cozo::{DataValue, DbInstance, NamedRows};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Public record types
 // ---------------------------------------------------------------------------
+
+pub const INDEX_DB_FILE: &str = "index.db";
+pub const MANIFEST_DB_FILE: &str = "manifest.db";
+
+pub fn generation_db_paths(generation_dir: &Path) -> (PathBuf, PathBuf) {
+    (
+        generation_dir.join(INDEX_DB_FILE),
+        generation_dir.join(MANIFEST_DB_FILE),
+    )
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileRecord {

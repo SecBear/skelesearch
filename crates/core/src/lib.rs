@@ -19,6 +19,7 @@ pub mod gc;
 pub mod grep;
 pub mod config;
 pub mod coordination;
+pub mod freshness;
 
 // Re-export the most-used public types so callers can write
 // `use skelesearch_core::CozoBackend` instead of the full path.
@@ -27,8 +28,9 @@ pub use indexer::{FileContent, IndexResult, Indexer};
 pub use manifest::{content_hash, IncompleteBatch, ManifestStore};
 pub use provider::EmbedProvider;
 pub use schema::{
-    CallEdge, ChunkRecord, CozoBackend, EdgeRecord, FileRecord, IndexStats, RepoMapData, RepoMapFile,
-    RepoMapSymbol, SearchResult, StorageBackend,
+    generation_db_paths, CallEdge, ChunkRecord, CozoBackend, EdgeRecord, FileRecord, IndexStats,
+    RepoMapData, RepoMapFile, RepoMapSymbol, SearchResult, StorageBackend, INDEX_DB_FILE,
+    MANIFEST_DB_FILE,
 };
 pub use searcher::{FileContext, Searcher, SearchTimings};
 pub use gc::collect_garbage;
@@ -36,8 +38,10 @@ pub use grep::{grep_codebase, GrepMatch, GrepOptions};
 pub use config::{Config, ExpansionConfig, GraphConfig, IndexConfig, RerankerConfig, SearchConfig, SparseConfig};
 pub use coordination::{
     is_indexing_active_elsewhere, read_shared_indexing_status, try_acquire_indexing_lease,
+    write_file_atomic,
     IndexingLease, SharedIndexingStatus,
 };
+pub use freshness::{FreshnessSnapshot, FreshnessState};
 pub mod reranker;
 pub use reranker::{NoopReranker, RerankCandidate, Reranker};
 pub mod router;

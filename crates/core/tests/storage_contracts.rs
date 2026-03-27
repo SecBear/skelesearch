@@ -26,6 +26,7 @@ async fn cozo_backend_round_trips_storage_backend_contract() -> anyhow::Result<(
             chunk_type: "function".into(),
             start_line: 1,
             end_line: 1,
+            materialization_tier: 2,
             embedding: Some(vec![0.1; 8]),
             doc_embedding: None,
         }])
@@ -100,6 +101,7 @@ async fn upsert_chunks_batch_handles_500_chunks() -> anyhow::Result<()> {
             chunk_type: "code".into(),
             start_line: i * 10 + 1,
             end_line: (i + 1) * 10,
+            materialization_tier: 2,
             // Use unique embeddings: identical vectors have cosine distance 0, which
             // causes CozoDB's HNSW algorithm to loop indefinitely.
             embedding: Some((0..8).map(|j| if j == i % 8 { 1.0_f32 } else { 0.01 }).collect()),

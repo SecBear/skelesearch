@@ -45,6 +45,53 @@ impl IndexingLease {
     }
 }
 
+pub fn write_file_atomic(path: &Path, payload: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create parent dir: {}", parent.display()))?;
+
+    let temp_name = format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("atomic"),
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let temp_path = parent.join(temp_name);
+
+    let mut temp = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .with_context(|| format!("failed to create temp file at {}", temp_path.display()))?;
+    temp.write_all(payload)
+        .with_context(|| format!("failed to write temp file at {}", temp_path.display()))?;
+    temp.sync_all()
+        .with_context(|| format!("failed to fsync temp file at {}", temp_path.display()))?;
+
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        if path.exists() {
+            std::fs::remove_file(path)
+                .with_context(|| format!("failed to replace file at {}", path.display()))?;
+            std::fs::rename(&temp_path, path)
+                .with_context(|| format!("failed to move file into place at {}", path.display()))?;
+        } else {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to rename temp file '{}' to '{}'",
+                    temp_path.display(),
+                    path.display()
+                )
+            });
+        }
+    }
+
+    Ok(())
+}
+
 impl Drop for IndexingLease {
     fn drop(&mut self) {
         if let Err(err) = std::fs::remove_file(&self.status_path) {
@@ -96,7 +143,9 @@ pub fn try_acquire_indexing_lease(
 ///
 /// If a status file exists while no lock is held, it is treated as stale and
 /// removed best-effort.
-pub fn read_shared_indexing_status(storage_dir: &Path) -> anyhow::Result<Option<SharedIndexingStatus>> {
+pub fn read_shared_indexing_status(
+    storage_dir: &Path,
+) -> anyhow::Result<Option<SharedIndexingStatus>> {
     let status_path = status_path(storage_dir);
     if !status_path.exists() {
         return Ok(None);
@@ -119,7 +168,10 @@ pub fn read_shared_indexing_status(storage_dir: &Path) -> anyhow::Result<Option<
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(err).with_context(|| {
-                format!("failed to read shared indexing status at {}", status_path.display())
+                format!(
+                    "failed to read shared indexing status at {}",
+                    status_path.display()
+                )
             })
         }
     };
@@ -163,8 +215,9 @@ fn is_lock_held(storage_dir: &Path) -> anyhow::Result<bool> {
 
     match fs2::FileExt::try_lock_shared(&lock_file) {
         Ok(()) => {
-            fs2::FileExt::unlock(&lock_file)
-                .with_context(|| format!("failed to unlock indexing lock at {}", lock_path.display()))?;
+            fs2::FileExt::unlock(&lock_file).with_context(|| {
+                format!("failed to unlock indexing lock at {}", lock_path.display())
+            })?;
             Ok(false)
         }
         Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(true),
@@ -182,43 +235,7 @@ fn status_path(storage_dir: &Path) -> PathBuf {
 }
 
 fn write_status_atomic(path: &Path, status: &SharedIndexingStatus) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("status path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create status parent dir: {}", parent.display()))?;
-
-    let temp_name = format!(
-        ".{}.tmp-{}-{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("status"),
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let temp_path = parent.join(temp_name);
-
-    let payload = serde_json::to_vec_pretty(status).context("failed to serialize shared indexing status")?;
-
-    let mut temp = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp_path)
-        .with_context(|| format!("failed to create temp status file at {}", temp_path.display()))?;
-    temp.write_all(&payload)
-        .with_context(|| format!("failed to write temp status file at {}", temp_path.display()))?;
-    temp.sync_all()
-        .with_context(|| format!("failed to fsync temp status file at {}", temp_path.display()))?;
-
-    if let Err(err) = std::fs::rename(&temp_path, path) {
-        if path.exists() {
-            std::fs::remove_file(path)
-                .with_context(|| format!("failed to replace status file at {}", path.display()))?;
-            std::fs::rename(&temp_path, path)
-                .with_context(|| format!("failed to move status file into place at {}", path.display()))?;
-        } else {
-            return Err(err)
-                .with_context(|| format!("failed to rename temp status file to {}", path.display()));
-        }
-    }
-
-    Ok(())
+    let payload =
+        serde_json::to_vec_pretty(status).context("failed to serialize shared indexing status")?;
+    write_file_atomic(path, &payload)
 }

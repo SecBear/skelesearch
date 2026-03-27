@@ -30,6 +30,7 @@ async fn gc_removes_orphaned_chunks() -> anyhow::Result<()> {
             chunk_type: "code".into(),
             start_line: 1,
             end_line: 1,
+            materialization_tier: 2,
             embedding: Some(vec![0.1; 8]),
             doc_embedding: None,
         }])

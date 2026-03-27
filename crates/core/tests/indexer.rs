@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rusqlite::{params, Connection, OptionalExtension};
 mod test_utils;
 use test_utils::{copy_dir_all, DeterministicTestProvider};
 use skelesearch_core::{
@@ -43,10 +44,50 @@ impl CountingTestProvider {
     }
 }
 
+#[derive(Clone)]
+struct NamedCountingProvider {
+    name: &'static str,
+    dim: usize,
+    calls: Arc<Mutex<usize>>,
+    chunks: Arc<Mutex<usize>>,
+}
+
+impl NamedCountingProvider {
+    pub fn new(name: &'static str, dim: usize) -> Self {
+        Self {
+            name,
+            dim,
+            calls: Arc::new(Mutex::new(0)),
+            chunks: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    pub fn chunk_count_seen(&self) -> usize {
+        *self.chunks.lock().unwrap()
+    }
+}
+
 #[async_trait]
 impl EmbedProvider for CountingTestProvider {
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        *self.calls.lock().unwrap() += 1;
+        *self.chunks.lock().unwrap() += texts.len();
+        Ok(texts.iter().map(|_| vec![0.1_f32; self.dim]).collect())
+    }
+}
+
+#[async_trait]
+impl EmbedProvider for NamedCountingProvider {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn name(&self) -> &str {
+        self.name
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -85,6 +126,35 @@ fn fixture_repo() -> anyhow::Result<TempDir> {
     // Recursively copy src/ sub-tree.
     copy_dir_all(&fixture_src, dir.path())?;
     Ok(dir)
+}
+
+fn seed_embedding_cache_entry(
+    db_path: &std::path::Path,
+    content_hash: &str,
+    dim: usize,
+) -> anyhow::Result<()> {
+    let conn = Connection::open(db_path)?;
+    let bytes: Vec<u8> = std::iter::repeat(0.25_f32)
+        .take(dim)
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    conn.execute(
+        "INSERT OR REPLACE INTO embedding_cache (content_hash, dim, embedding) VALUES (?1, ?2, ?3)",
+        params![content_hash, dim as i64, bytes],
+    )?;
+    Ok(())
+}
+
+fn embedding_cache_has_entry(db_path: &std::path::Path, content_hash: &str) -> anyhow::Result<bool> {
+    let conn = Connection::open(db_path)?;
+    let present: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM embedding_cache WHERE content_hash = ?1",
+            params![content_hash],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(present.is_some())
 }
 
 
@@ -210,6 +280,125 @@ async fn indexer_second_pass_skips_unchanged_files() -> anyhow::Result<()> {
         "unchanged files must not trigger re-embedding"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_refresh_preserves_cache_hits() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+
+    std::fs::write(repo.join("alpha.rs"), "fn alpha_one() {}\nfn alpha_two() {}\n")?;
+    std::fs::write(repo.join("beta.rs"), "fn beta_one() {}\n")?;
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+
+    backend.initialize(8).await?;
+    let provider = CountingTestProvider::new(8);
+    let indexer = Indexer::new(backend.clone(), manifest.clone(), provider.clone());
+
+    indexer.index_path(&repo).await?;
+    let first_seen = provider.chunk_count_seen();
+    assert!(first_seen > 0, "expected initial chunks for both files");
+
+    std::fs::write(
+        repo.join("alpha.rs"),
+        "fn alpha_one() {}\nfn alpha_two() {}\nfn alpha_three() {}\n",
+    )?;
+
+    indexer.index_path(&repo).await?;
+    let second_seen = provider.chunk_count_seen();
+
+    assert_eq!(
+        second_seen - first_seen,
+        1,
+        "stale refresh should reuse cached embeddings for unchanged chunks"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_change_clears_embedding_cache_and_file_hashes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+
+    std::fs::write(repo.join("alpha.rs"), "fn alpha_one() {}\nfn alpha_two() {}\n")?;
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+    let manifest_db = idx_dir.join("manifest.db");
+
+    backend.initialize(8).await?;
+    let provider_a = NamedCountingProvider::new("provider-a", 8);
+    let indexer_a = Indexer::new(backend.clone(), manifest.clone(), provider_a.clone());
+    indexer_a.index_path(&repo).await?;
+    let first_seen = provider_a.chunk_count_seen();
+
+    let sentinel_hash = "9f5f4b0e0d8d4d6e";
+    seed_embedding_cache_entry(&manifest_db, sentinel_hash, 8)?;
+    assert!(embedding_cache_has_entry(&manifest_db, sentinel_hash)?);
+
+    let provider_b = NamedCountingProvider::new("provider-b", 8);
+    let indexer_b = Indexer::new(backend.clone(), manifest.clone(), provider_b.clone());
+    indexer_b.index_path(&repo).await?;
+
+    assert_eq!(
+        provider_b.chunk_count_seen(),
+        first_seen,
+        "provider change must force a full re-embed"
+    );
+    assert!(
+        !embedding_cache_has_entry(&manifest_db, sentinel_hash)?,
+        "provider change must clear stale embedding cache rows"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dimension_change_clears_embedding_cache_and_file_hashes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+
+    std::fs::write(repo.join("alpha.rs"), "fn alpha_one() {}\nfn alpha_two() {}\n")?;
+
+    let idx_dir = dir.path().join("idx");
+    std::fs::create_dir_all(&idx_dir)?;
+    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
+    let manifest_db = idx_dir.join("manifest.db");
+
+    backend.initialize(8).await?;
+    let provider_a = NamedCountingProvider::new("provider-a", 8);
+    let indexer_a = Indexer::new(backend.clone(), manifest.clone(), provider_a.clone());
+    indexer_a.index_path(&repo).await?;
+    let first_seen = provider_a.chunk_count_seen();
+
+    let sentinel_hash = "3c4dd5c1e1b94c4f";
+    seed_embedding_cache_entry(&manifest_db, sentinel_hash, 8)?;
+    assert!(embedding_cache_has_entry(&manifest_db, sentinel_hash)?);
+
+    backend.initialize(9).await?;
+    let provider_b = NamedCountingProvider::new("provider-a", 9);
+    let indexer_b = Indexer::new(backend.clone(), manifest.clone(), provider_b.clone());
+    indexer_b.index_path(&repo).await?;
+
+    assert_eq!(
+        provider_b.chunk_count_seen(),
+        first_seen,
+        "dimension change must force a full re-embed"
+    );
+    assert!(
+        !embedding_cache_has_entry(&manifest_db, sentinel_hash)?,
+        "dimension change must clear stale embedding cache rows"
+    );
     Ok(())
 }
 
