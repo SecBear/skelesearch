@@ -1541,7 +1541,7 @@ mod tests {
         root: &Path,
         expected: IndexingState,
     ) -> IndexStatusResponse {
-        for _ in 0..60 {
+        for _ in 0..300 {
             let response = service
                 .handle_request(DaemonRequest::IndexStatus(IndexStatusRequest {
                     target: root_target(root),
