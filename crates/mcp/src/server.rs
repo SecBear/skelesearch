@@ -13,39 +13,54 @@
 //     public method that tests can call directly.
 //   - Provider selection is explicit: unknown names return a clear error.
 
-use std::{collections::HashMap, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, RwLock}, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
+    time::Duration,
+};
 
 #[path = "client.rs"]
 mod client;
 
 use notify::Watcher as _;
 
-use sysinfo::{Pid, System};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use rmcp::{
-    ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
     service::{NotificationContext, RoleServer},
-    tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use skelesearch_core::{
-    classify_query, grep_codebase, is_indexing_active_elsewhere, read_shared_indexing_status,
-    try_acquire_indexing_lease, CozoBackend, Config, EmbedProvider, GrepOptions, IndexResult,
-    Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker,
-    SharedIndexingStatus, Searcher, StorageBackend,
+    classify_query, generation_db_paths, grep_codebase, is_indexing_active_elsewhere,
+    read_shared_indexing_status, try_acquire_indexing_lease, Config, CozoBackend, EmbedProvider,
+    FreshnessSnapshot, FreshnessState, GrepOptions, IndexResult, Indexer, LLMExpander,
+    ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, SharedIndexingStatus,
+    StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
-use skelesearch_service::{ProjectTarget as DaemonProjectTarget, protocol::{IndexCodebaseStatus as DaemonIndexCodebaseStatus, IndexingState as DaemonIndexingState}};
+use skelesearch_service::{
+    protocol::{
+        IndexCodebaseStatus as DaemonIndexCodebaseStatus,
+        IndexFreshnessState as DaemonIndexFreshnessState, IndexingState as DaemonIndexingState,
+    },
+    ProjectTarget as DaemonProjectTarget,
+};
+use sysinfo::{Pid, System};
 
 use self::client::{DaemonClient, TokioDaemonConnector};
 use crate::tools::{
-    CallEdgeInfo, ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput, FindTestContextInput,
-    GetFileContextInput, GetRepoMapInput, GetSymbolContextInput, GrepSearchRow, ImpactEntry,
-    ImpactSetOutput, IndexCodebaseInput, IndexCodebaseOutput, IndexingProgress, IndexStatusInput,
-    IndexStatusOutput, SearchCodeInput, SearchCodeResponse, SearchCodeRow, SmartSearchInput,
-    SmartSearchOutput, SmartSearchResults, SymbolContextOutput, SymbolRow, TestContextOutput,
+    CallEdgeInfo, ChunkInfo, FileContextOutput, FindImpactSetInput, FindSymbolInput,
+    FindTestContextInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
+    GrepSearchRow, ImpactEntry, ImpactSetOutput, IndexCodebaseInput, IndexCodebaseOutput,
+    IndexFreshnessState, IndexStatusInput, IndexStatusOutput, IndexingProgress, SearchCodeInput,
+    SearchCodeResponse, SearchCodeRow, SmartSearchInput, SmartSearchOutput, SmartSearchResults,
+    SymbolContextOutput, SymbolRow, TestContextOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -167,6 +182,7 @@ pub struct SkeleSearchServer {
     /// Keeps the LRU query-embedding cache and TCP connection pool alive across
     /// MCP calls, eliminating cold TLS handshakes and redundant embed API calls.
     cached_searcher: Arc<tokio::sync::RwLock<Option<Arc<CachedSearcher>>>>,
+    cached_searcher_manifest_path: Arc<tokio::sync::RwLock<Option<PathBuf>>>,
     /// Shared state for background indexing.  Written by the spawned task,
     /// read by `index_status` and `index_codebase` (duplicate-check).
     index_state: Arc<tokio::sync::RwLock<IndexProgress>>,
@@ -184,6 +200,8 @@ pub struct SkeleSearchServer {
     default_project_root: Option<PathBuf>,
     /// When true, skip auto-index, watcher startup, and health checks until an explicit project path is supplied.
     inert_mode: bool,
+    /// Shared daemon-session lease for managed helper lifetime.
+    daemon_session_control: Arc<DaemonSessionControl>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,13 +259,29 @@ fn sample_process_resources() -> Option<(u64, u64, usize)> {
     Some((rss_bytes, virtual_bytes, task_count))
 }
 
+#[derive(Default)]
+struct DaemonSessionControl {
+    started: AtomicBool,
+    shutdown_tx: std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+}
+
+impl Drop for DaemonSessionControl {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.shutdown_tx.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(true);
+            }
+        }
+    }
+}
+
 fn spawn_index_resource_sampler(
     instance_id: Arc<str>,
     index_state: Arc<tokio::sync::RwLock<IndexProgress>>,
     path: String,
     trigger: &'static str,
     provider: String,
- ) {
+) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -286,7 +320,6 @@ fn spawn_index_resource_sampler(
     });
 }
 
-
 impl SkeleSearchServer {
     /// Construct the server.
     ///
@@ -300,7 +333,7 @@ impl SkeleSearchServer {
         let manifest_path = Arc::new(manifest_path.into());
         let instance_id = new_instance_id();
         let daemon_client = Arc::new(DaemonClient::from_env());
-        let default_project_root = manifest_path.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        let default_project_root = Self::project_root_from_manifest_path(manifest_path.as_ref()).ok();
         tracing::info!(
             instance_id = %instance_id,
             pid = std::process::id(),
@@ -317,12 +350,14 @@ impl SkeleSearchServer {
             daemon_client,
             tool_router: Self::tool_router(),
             cached_searcher: Arc::new(tokio::sync::RwLock::new(None)),
+            cached_searcher_manifest_path: Arc::new(tokio::sync::RwLock::new(None)),
             index_state: Arc::new(tokio::sync::RwLock::new(IndexProgress::default())),
             backend_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             watcher_started: Arc::new(AtomicBool::new(false)),
             instance_id,
             default_project_root,
             inert_mode: false,
+            daemon_session_control: Arc::new(DaemonSessionControl::default()),
         }
     }
 
@@ -343,6 +378,27 @@ impl SkeleSearchServer {
             "daemon proxy for {method} is unavailable at {}: {err:#}. Start skelesearchd, or set SKELESEARCH_DAEMON_SOCKET to a reachable socket.",
             self.daemon_client.endpoint()
         )
+    }
+
+    async fn ensure_daemon_session(&self) {
+        if self
+            .daemon_session_control
+            .started
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        if let Ok(mut guard) = self.daemon_session_control.shutdown_tx.lock() {
+            *guard = Some(shutdown_tx);
+        }
+
+        let daemon_client = Arc::clone(&self.daemon_client);
+        let instance_id = Arc::clone(&self.instance_id);
+        tokio::spawn(async move {
+            maintain_daemon_session(daemon_client, shutdown_rx, instance_id).await;
+        });
     }
 
     fn daemon_target_from_path(path: &str) -> anyhow::Result<DaemonProjectTarget> {
@@ -375,7 +431,6 @@ impl SkeleSearchServer {
         })
     }
 
-
     fn daemon_target_for_status(&self, path: Option<&str>) -> anyhow::Result<DaemonProjectTarget> {
         if let Some(path) = path {
             return Self::daemon_target_from_path(path);
@@ -388,7 +443,9 @@ impl SkeleSearchServer {
             });
         }
 
-        anyhow::bail!("no default project root for this MCP instance; pass an explicit project path")
+        anyhow::bail!(
+            "no default project root for this MCP instance; pass an explicit project path"
+        )
     }
 
     fn map_daemon_indexing_progress(
@@ -444,6 +501,9 @@ impl SkeleSearchServer {
             total_chunks: response.total_chunks,
             last_indexed: response.last_indexed,
             estimated_stale: response.estimated_stale,
+            freshness_state: Self::map_daemon_freshness_state(response.freshness_state),
+            freshness_checked_at: response.freshness_checked_at,
+            freshness_error: response.freshness_error,
             watching: response.watching,
             indexing: response.indexing.map(Self::map_daemon_indexing_progress),
         })
@@ -452,20 +512,39 @@ impl SkeleSearchServer {
     /// Resolve a backend for the given path. If `path` is None, returns the
     /// default (cwd) backend. Otherwise, finds the project root for the path,
     /// opens a CozoBackend on first use, and caches it for the session.
-    async fn resolve_backend(&self, path: Option<&str>) -> anyhow::Result<(Arc<CozoBackend>, PathBuf)> {
+    async fn resolve_backend(
+        &self,
+        path: Option<&str>,
+    ) -> anyhow::Result<(Arc<CozoBackend>, PathBuf)> {
         let target = match path {
-            None => return Ok((Arc::clone(&self.backend), self.manifest_path.as_ref().clone())),
+            None => match self.default_project_root.as_ref() {
+                Some(root) => root.clone(),
+                None => {
+                    return Ok((
+                        Arc::clone(&self.backend),
+                        self.manifest_path.as_ref().clone(),
+                    ))
+                }
+            },
             Some(p) => PathBuf::from(p),
         };
 
         // Walk up to find .git (same logic as main.rs find_project_root)
         let project_root = {
-            let abs = if target.is_absolute() { target.clone() } else {
+            let abs = if target.is_absolute() {
+                target.clone()
+            } else {
                 std::env::current_dir().unwrap_or_default().join(&target)
             };
-            let mut dir = if abs.is_dir() { abs.clone() } else { abs.parent().unwrap_or(&abs).to_path_buf() };
+            let mut dir = if abs.is_dir() {
+                abs.clone()
+            } else {
+                abs.parent().unwrap_or(&abs).to_path_buf()
+            };
             loop {
-                if dir.join(".git").exists() { break dir; }
+                if dir.join(".git").exists() {
+                    break dir;
+                }
                 match dir.parent() {
                     Some(p) => dir = p.to_path_buf(),
                     None => break abs,
@@ -473,20 +552,19 @@ impl SkeleSearchServer {
             }
         };
 
+        let (backend_path, manifest_path) = Self::resolve_index_paths_for_project_root(&project_root)?;
+
         // Check cache first
         {
             let cache = self.backend_cache.read().await;
             if let Some((backend, manifest)) = cache.get(&project_root) {
-                return Ok((Arc::clone(backend), manifest.clone()));
+                if *manifest == manifest_path {
+                    return Ok((Arc::clone(backend), manifest.clone()));
+                }
             }
         }
 
-        // Open new backend
-        let skele_dir = project_root.join(".skelesearch");
-        std::fs::create_dir_all(&skele_dir)
-            .with_context(|| format!("create .skelesearch at {}", skele_dir.display()))?;
-        let backend = Arc::new(CozoBackend::open(skele_dir.join("index.db"))?);
-        let manifest_path = skele_dir.join("manifest.db");
+        let backend = Arc::new(CozoBackend::open(&backend_path)?);
 
         tracing::info!(instance_id = %self.instance_id, project = %project_root.display(), manifest_path = %manifest_path.display(), "opened backend for new project");
 
@@ -498,10 +576,130 @@ impl SkeleSearchServer {
     }
 
     fn storage_dir_from_manifest_path(manifest_path: &std::path::Path) -> anyhow::Result<PathBuf> {
-        manifest_path
+        let manifest_dir = manifest_path
+            .parent()
+            .with_context(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
+        let generations_dir = manifest_dir.parent();
+        if generations_dir
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            == Some("generations")
+        {
+            generations_dir
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf)
+                .with_context(|| {
+                    format!(
+                        "generation manifest path has no storage dir parent: {}",
+                        manifest_path.display()
+                    )
+                })
+        } else {
+            Ok(manifest_dir.to_path_buf())
+        }
+    }
+
+    fn project_root_from_manifest_path(manifest_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+        Self::storage_dir_from_manifest_path(manifest_path)?
             .parent()
             .map(std::path::Path::to_path_buf)
-            .with_context(|| format!("manifest path has no parent: {}", manifest_path.display()))
+            .with_context(|| {
+                format!(
+                    "manifest path has no project root parent: {}",
+                    manifest_path.display()
+                )
+            })
+    }
+
+    fn resolve_index_paths_for_project_root(project_root: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let storage_dir = project_root.join(".skelesearch");
+        std::fs::create_dir_all(&storage_dir)
+            .with_context(|| format!("create .skelesearch at {}", storage_dir.display()))?;
+
+        let pointer_path = storage_dir.join("active-generation");
+        if let Ok(pointer) = std::fs::read_to_string(&pointer_path) {
+            let generation_id = pointer.trim();
+            if !generation_id.is_empty() {
+                let generation_dir = storage_dir.join("generations").join(generation_id);
+                let (backend_path, manifest_path) = generation_db_paths(&generation_dir);
+                if backend_path.exists() && manifest_path.exists() {
+                    return Ok((backend_path, manifest_path));
+                }
+            }
+        }
+
+        Ok((storage_dir.join(INDEX_DB_FILE), storage_dir.join(MANIFEST_DB_FILE)))
+    }
+
+    fn persisted_provider_name_from_manifest(
+        manifest_path: &std::path::Path,
+    ) -> anyhow::Result<Option<String>> {
+        let manifest = ManifestStore::open(manifest_path)
+            .with_context(|| format!("open manifest at {}", manifest_path.display()))?;
+        manifest
+            .get_meta("provider")
+            .context("read provider metadata from manifest")
+    }
+
+    fn startup_default_provider() -> &'static str {
+        if std::env::var("VOYAGE_API_KEY").map_or(false, |k| !k.is_empty()) {
+            "voyage"
+        } else if std::env::var("OPENAI_API_KEY").map_or(false, |k| !k.is_empty()) {
+            "openai"
+        } else {
+            "fastembed"
+        }
+    }
+
+    fn map_freshness_state(state: FreshnessState) -> IndexFreshnessState {
+        match state {
+            FreshnessState::Fresh => IndexFreshnessState::Fresh,
+            FreshnessState::Stale => IndexFreshnessState::Stale,
+            FreshnessState::Refreshing => IndexFreshnessState::Refreshing,
+            FreshnessState::Unknown => IndexFreshnessState::Unknown,
+        }
+    }
+
+    fn map_daemon_freshness_state(state: DaemonIndexFreshnessState) -> IndexFreshnessState {
+        match state {
+            DaemonIndexFreshnessState::Fresh => IndexFreshnessState::Fresh,
+            DaemonIndexFreshnessState::Stale => IndexFreshnessState::Stale,
+            DaemonIndexFreshnessState::Refreshing => IndexFreshnessState::Refreshing,
+            DaemonIndexFreshnessState::Unknown => IndexFreshnessState::Unknown,
+        }
+    }
+
+    fn compute_freshness_snapshot(
+        manifest_path: &std::path::Path,
+        refreshing: bool,
+    ) -> FreshnessSnapshot {
+        let stale_count_result = (|| -> anyhow::Result<usize> {
+            let project_root = Self::project_root_from_manifest_path(manifest_path)?;
+            let manifest = ManifestStore::open(manifest_path)?;
+            manifest.count_stale(&project_root)
+        })();
+
+        FreshnessSnapshot::from_stale_count_result(stale_count_result).with_refreshing(refreshing)
+    }
+
+    fn repo_map_warning_prefix(freshness: &FreshnessSnapshot) -> Option<String> {
+        match freshness.state {
+            FreshnessState::Fresh => None,
+            FreshnessState::Stale => Some(format!(
+                "⚠ {} file(s) changed since last index. Run index to update.\n\n",
+                freshness.estimated_stale
+            )),
+            FreshnessState::Refreshing => Some(
+                "⚠ Index refresh is in progress. Repo map may be temporarily outdated.\n\n"
+                    .to_string(),
+            ),
+            FreshnessState::Unknown => Some(match &freshness.freshness_error {
+                Some(err) => {
+                    format!("⚠ Index freshness is unknown ({err}). Repo map may be outdated.\n\n")
+                }
+                None => "⚠ Index freshness is unknown. Repo map may be outdated.\n\n".to_string(),
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -543,7 +741,6 @@ impl SkeleSearchServer {
     /// - `SKELESEARCH_NO_AUTO_INDEX` env var disables auto-indexing entirely.
     /// - Skips if indexing is already running (prevents double-start on reconnect).
     /// - Skips if cwd does not look like a code project (no project markers found).
-    /// - Provider is auto-detected: Voyage → OpenAI → FastEmbed (zero-config fallback).
     async fn auto_index_if_needed(&self) {
         tracing::info!(instance_id = %self.instance_id, "auto_index_if_needed: entry");
         if self.inert_mode {
@@ -564,40 +761,6 @@ impl SkeleSearchServer {
                 tracing::info!(instance_id = %self.instance_id, path = %state.path, "auto_index_if_needed: indexing already in progress, skipping");
                 return;
             }
-        }
-
-        // Check if the index already has data.
-        // Treat any error as "needs index": a fresh or corrupt DB should trigger
-        // re-indexing rather than silently leaving the user with no search.
-        let needs_index = match self.backend.stats().await {
-            Ok(s) => {
-                tracing::info!(
-                    instance_id = %self.instance_id,
-                    indexed_files = s.indexed_files,
-                    total_chunks = s.total_chunks,
-                    "auto_index_if_needed: backend stats OK"
-                );
-                s.total_chunks == 0
-            }
-            Err(ref e) if is_uninitialized_index_error(e) => {
-                tracing::info!("auto_index_if_needed: index not yet initialized (expected on first run)");
-                true
-            }
-            Err(ref e) => {
-                // Unexpected error — CozoDB may return something outside our known
-                // "stored relation not found" pattern (locked file, partial schema,
-                // new CozoDB version).  Treat it as needs-index: the worst outcome
-                // is a redundant re-index; the alternative is permanent silence.
-                tracing::warn!(
-                    error = %e,
-                    "auto_index_if_needed: unexpected stats error — treating as needs-index"
-                );
-                true
-            }
-        };
-        if !needs_index {
-            tracing::info!(instance_id = %self.instance_id, "auto_index_if_needed: index already populated, skipping");
-            return;
         }
 
         let cwd = match std::env::current_dir() {
@@ -628,29 +791,94 @@ impl SkeleSearchServer {
             return;
         }
 
-        // Prefer cloud providers when API keys are present; FastEmbed is the
-        // zero-config default that works offline.
-        let provider_name = if std::env::var("VOYAGE_API_KEY").map_or(false, |k| !k.is_empty()) {
-            "voyage"
-        } else if std::env::var("OPENAI_API_KEY").map_or(false, |k| !k.is_empty()) {
-            "openai"
+        let index_status = match self
+            .proxy_index_status_via_daemon(IndexStatusInput {
+                path: Some(cwd.to_string_lossy().to_string()),
+            })
+            .await
+        {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!(
+                    error = %self.daemon_proxy_error("index_status", err),
+                    path = %cwd.display(),
+                    "auto_index_if_needed: failed to query daemon index status, skipping"
+                );
+                return;
+            }
+        };
+
+        let initial_build_needed = index_status.total_chunks == 0;
+        let stale_refresh_needed = index_status.total_chunks > 0
+            && index_status.freshness_state == IndexFreshnessState::Stale;
+
+        if !initial_build_needed && !stale_refresh_needed {
+            tracing::info!(
+                path = %cwd.display(),
+                freshness_state = ?index_status.freshness_state,
+                total_chunks = index_status.total_chunks,
+                "auto_index_if_needed: index is current enough for startup, skipping"
+            );
+            return;
+        }
+
+        let (_backend_for_target, manifest_path) = match self.resolve_backend(Some(cwd.to_string_lossy().as_ref())).await {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %cwd.display(),
+                    "auto_index_if_needed: failed resolving target manifest path, skipping"
+                );
+                return;
+            }
+        };
+
+        let provider_name = if stale_refresh_needed {
+            match Self::persisted_provider_name_from_manifest(&manifest_path) {
+                Ok(Some(provider)) => provider,
+                Ok(None) => {
+                    tracing::warn!(
+                        path = %cwd.display(),
+                        manifest_path = %manifest_path.display(),
+                        "auto_index_if_needed: stale refresh skipped because manifest provider metadata is missing"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %cwd.display(),
+                        manifest_path = %manifest_path.display(),
+                        error = %err,
+                        "auto_index_if_needed: stale refresh skipped because manifest provider metadata could not be read"
+                    );
+                    return;
+                }
+            }
         } else {
-            "fastembed"
+            match Self::persisted_provider_name_from_manifest(&manifest_path) {
+                Ok(Some(provider)) => provider,
+                _ => Self::startup_default_provider().to_string(),
+            }
         };
 
         tracing::info!(
             path = %cwd.display(),
             provider = provider_name,
+            trigger = if stale_refresh_needed { "startup_stale_refresh" } else { "startup_initial_build" },
             "auto_index_if_needed: triggering index_codebase"
         );
 
         // Surface auto-index failures so the user can act on them.
         // A failed auto-index must not crash the server, but silence is worse —
         // the user needs to know why search tools are returning errors.
-        match self.proxy_index_codebase_via_daemon(IndexCodebaseInput {
-            path: cwd.to_string_lossy().to_string(),
-            provider: Some(provider_name.to_string()),
-        }).await {
+        match self
+            .proxy_index_codebase_via_daemon(IndexCodebaseInput {
+                path: cwd.to_string_lossy().to_string(),
+                provider: Some(provider_name),
+            })
+            .await
+        {
             Ok(_) => {
                 tracing::info!("auto_index_if_needed: index_codebase started successfully");
             }
@@ -674,8 +902,12 @@ impl SkeleSearchServer {
     /// `NoopProvider` (dim == 1) but a persistent index exists, lazily
     /// initializes the correct provider (read from the manifest) and promotes
     /// it for future calls.
-    async fn prepare_search_provider(&self) -> anyhow::Result<ArcProvider> {
-        let stats = match self.backend.stats().await {
+    async fn prepare_search_provider(
+        &self,
+        backend: &Arc<CozoBackend>,
+        manifest_path: &Path,
+    ) -> anyhow::Result<ArcProvider> {
+        let stats = match backend.stats().await {
             Ok(s) => s,
             Err(ref e) if is_uninitialized_index_error(e) => {
                 return Err(self.empty_index_error().await);
@@ -687,16 +919,20 @@ impl SkeleSearchServer {
         }
 
         let provider_name = {
-            let manifest = ManifestStore::open(self.manifest_path.as_path())
+            let manifest = ManifestStore::open(manifest_path)
                 .context("failed to open manifest")?;
-            manifest.get_meta("provider")
+            manifest
+                .get_meta("provider")
                 .context("failed to read provider from manifest")?
                 .unwrap_or_else(|| "fastembed".to_string())
         };
 
         // Fast path: current provider already matches the persisted index provider.
         {
-            let guard = self.provider.read().map_err(|_| anyhow::anyhow!("provider lock poisoned"))?;
+            let guard = self
+                .provider
+                .read()
+                .map_err(|_| anyhow::anyhow!("provider lock poisoned"))?;
             if guard.dim() > 1 && guard.name() == provider_name {
                 return Ok(guard.clone());
             }
@@ -708,7 +944,10 @@ impl SkeleSearchServer {
         let real = provider_from_name(&provider_name)
             .with_context(|| format!("failed to initialize provider '{provider_name}'"))?;
         let arc_provider = ArcProvider::new(real);
-        *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = arc_provider.clone();
+        *self
+            .provider
+            .write()
+            .map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = arc_provider.clone();
         Ok(arc_provider)
     }
 
@@ -716,26 +955,28 @@ impl SkeleSearchServer {
     // Session dedup helpers
     // -----------------------------------------------------------------------
 
-
     /// Configure the search pipeline from project config and env vars.
     /// Expansion is opt-in (SKELESEARCH_EXPANSION=1 or config); rerankers auto-detect API keys.
-    fn auto_configure_pipeline(&self, config: &Config) -> (Option<Box<dyn QueryExpander>>, Option<Box<dyn Reranker>>) {
+    fn auto_configure_pipeline(
+        &self,
+        config: &Config,
+    ) -> (Option<Box<dyn QueryExpander>>, Option<Box<dyn Reranker>>) {
         // Expansion requires explicit opt-in: either config.search.expansion.enabled = true
         // or SKELESEARCH_EXPANSION=1|true|yes.  Having OPENAI_API_KEY alone is not enough —
         // many devs have it set for other tools and should not pay 1s+ latency per query.
         let expansion_enabled = match config.search.expansion.enabled {
             Some(true) => true,
             Some(false) => false,
-            None => std::env::var("SKELESEARCH_EXPANSION").ok()
+            None => std::env::var("SKELESEARCH_EXPANSION")
+                .ok()
                 .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
         };
         let expander: Option<Box<dyn QueryExpander>> = if expansion_enabled {
-            std::env::var("OPENAI_API_KEY").ok()
+            std::env::var("OPENAI_API_KEY")
+                .ok()
                 .filter(|k| !k.is_empty())
-                .map(|key| -> Box<dyn QueryExpander> {
-                    Box::new(LLMExpander::new(key))
-                })
+                .map(|key| -> Box<dyn QueryExpander> { Box::new(LLMExpander::new(key)) })
         } else {
             None
         };
@@ -743,19 +984,22 @@ impl SkeleSearchServer {
         // Try reranker keys in order: JINA_API_KEY, COHERE_API_KEY, VOYAGE_API_KEY.
         let reranker: Option<Box<dyn Reranker>> = None
             .or_else(|| {
-                std::env::var("JINA_API_KEY").ok()
+                std::env::var("JINA_API_KEY")
+                    .ok()
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("jina", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
             })
             .or_else(|| {
-                std::env::var("COHERE_API_KEY").ok()
+                std::env::var("COHERE_API_KEY")
+                    .ok()
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("cohere", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
             })
             .or_else(|| {
-                std::env::var("VOYAGE_API_KEY").ok()
+                std::env::var("VOYAGE_API_KEY")
+                    .ok()
                     .filter(|k| !k.is_empty())
                     .and_then(|key| skelesearch_rerank_api::reranker_from_name("voyage", key).ok())
                     .map(|r| -> Box<dyn Reranker> { Box::new(r) })
@@ -763,23 +1007,39 @@ impl SkeleSearchServer {
             .or_else(|| {
                 // SKELESEARCH_RERANKER=local enables the local ONNX reranker.
                 // SKELESEARCH_RERANKER_MODEL_DIR overrides the default cache path.
-                // Best with CoreML (--features coreml) on Apple Silicon — model stays warm.
-                let local = std::env::var("SKELESEARCH_RERANKER").ok()
+                // Requires the `local-reranker` cargo feature; CoreML/CUDA builds
+                // continue to opt in via their feature flags.
+                let local = std::env::var("SKELESEARCH_RERANKER")
+                    .ok()
                     .filter(|v| v == "local");
-                if local.is_none() { return None; }
-                let result = if let Ok(dir) = std::env::var("SKELESEARCH_RERANKER_MODEL_DIR") {
-                    let expanded = if dir.starts_with("~/") {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                        std::path::PathBuf::from(home).join(&dir[2..])
+                if local.is_none() {
+                    return None;
+                }
+                #[cfg(feature = "local-reranker")]
+                {
+                    let result = if let Ok(dir) = std::env::var("SKELESEARCH_RERANKER_MODEL_DIR") {
+                        let expanded = if dir.starts_with("~/") {
+                            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                            std::path::PathBuf::from(home).join(&dir[2..])
+                        } else {
+                            std::path::PathBuf::from(&dir)
+                        };
+                        skelesearch_rerank_local::LocalReranker::new(&expanded)
                     } else {
-                        std::path::PathBuf::from(&dir)
+                        skelesearch_rerank_local::LocalReranker::default_model()
                     };
-                    skelesearch_rerank_local::LocalReranker::new(&expanded)
-                } else {
-                    skelesearch_rerank_local::LocalReranker::default_model()
-                };
-                result.ok().map(|r| -> Box<dyn Reranker> { Box::new(r) })
+                    return result.ok().map(|r| -> Box<dyn Reranker> { Box::new(r) });
+                }
+                #[cfg(not(feature = "local-reranker"))]
+                {
+                    tracing::warn!(
+                        "SKELESEARCH_RERANKER=local set but the `local-reranker` feature is not enabled; \
+                         rebuild with --features local-reranker (or coreml/cuda)"
+                    );
+                    None
+                }
             });
+
 
         // SKELESEARCH_RERANKER=qwen3 enables the Qwen3-Reranker-0.6B.
         // Requires the `qwen3` cargo feature; emits a warning when the env
@@ -816,14 +1076,13 @@ impl SkeleSearchServer {
             let source = match std::env::var("SKELESEARCH_RERANKER").ok().as_deref() {
                 Some("local") => "local ONNX model",
                 Some("qwen3") => "Qwen3-Reranker-0.6B (ONNX)",
-                _             => "cloud API key",
+                _ => "cloud API key",
             };
             tracing::info!(source, "reranking enabled");
         }
 
         (expander, reranker)
     }
-
 
     /// Return a cached Searcher or build one on the first call.
     ///
@@ -840,40 +1099,69 @@ impl SkeleSearchServer {
     /// timeout.  Callers MUST check `is_indexing_active` before calling
     /// this function and return a fast error when indexing is in progress.
     async fn get_or_build_searcher(&self) -> anyhow::Result<Arc<CachedSearcher>> {
+        let (backend, manifest_path) = self.resolve_backend(None).await?;
+
         // Fast path: cached searcher exists.
         {
             let guard = self.cached_searcher.read().await;
-            if let Some(ref s) = *guard {
-                return Ok(Arc::clone(s));
+            let path_guard = self.cached_searcher_manifest_path.read().await;
+            if let (Some(s), Some(cached_manifest_path)) = (guard.as_ref(), path_guard.as_ref()) {
+                if *cached_manifest_path == manifest_path {
+                    return Ok(Arc::clone(s));
+                }
             }
         }
 
         // Slow path: build and cache.
         let build_start = std::time::Instant::now();
         let mut guard = self.cached_searcher.write().await;
+        let mut path_guard = self.cached_searcher_manifest_path.write().await;
         // Double-check after acquiring write lock.
-        if let Some(ref s) = *guard {
-            return Ok(Arc::clone(s));
+        if let (Some(s), Some(cached_manifest_path)) = (guard.as_ref(), path_guard.as_ref()) {
+            if *cached_manifest_path == manifest_path {
+                return Ok(Arc::clone(s));
+            }
         }
 
         tracing::info!("searcher cache miss — building searcher");
         let t0 = std::time::Instant::now();
-        let provider = self.prepare_search_provider().await?;
-        tracing::info!(elapsed_ms = t0.elapsed().as_millis() as u64, "prepare_search_provider done");
+        let provider = self.prepare_search_provider(&backend, &manifest_path).await?;
+        tracing::info!(
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "prepare_search_provider done"
+        );
 
-        let searcher = Searcher::new(Arc::clone(&self.backend), provider);
+        let searcher = Searcher::new(Arc::clone(&backend), provider);
         // Load config early so pipeline auto-configuration can read expansion/sparse settings.
         let t1 = std::time::Instant::now();
-        let root = self.backend.list_indexed_paths().await
+        let indexed_root = backend
+            .list_indexed_paths()
+            .await
             .ok()
-            .and_then(|p| common_ancestor(&p))
+            .and_then(|p| common_ancestor(&p));
+        let root = ManifestStore::open(&manifest_path)
+            .ok()
+            .and_then(|m| m.get_meta("index_root").ok().flatten())
+            .map(PathBuf::from)
+            .or(indexed_root)
             .unwrap_or_else(|| PathBuf::from("/"));
-        tracing::info!(elapsed_ms = t1.elapsed().as_millis() as u64, "list_indexed_paths done");
+        tracing::info!(
+            elapsed_ms = t1.elapsed().as_millis() as u64,
+            "list_indexed_paths done"
+        );
 
         let config = Config::load(&root).unwrap_or_default();
         let (expander, reranker) = self.auto_configure_pipeline(&config);
-        let searcher = if let Some(e) = expander { searcher.with_expander(e) } else { searcher };
-        let searcher = if let Some(r) = reranker { searcher.with_reranker(r) } else { searcher };
+        let searcher = if let Some(e) = expander {
+            searcher.with_expander(e)
+        } else {
+            searcher
+        };
+        let searcher = if let Some(r) = reranker {
+            searcher.with_reranker(r)
+        } else {
+            searcher
+        };
         // Apply pagerank_boost and tuning from project config.
         let searcher = {
             let searcher = searcher.with_search_tuning(&config);
@@ -896,9 +1184,13 @@ impl SkeleSearchServer {
         };
 
         let total_build_ms = build_start.elapsed().as_millis() as u64;
-        tracing::info!(total_build_ms, "searcher built and cached (LRU + connection pool will be reused)");
+        tracing::info!(
+            total_build_ms,
+            "searcher built and cached (LRU + connection pool will be reused)"
+        );
         let arc = Arc::new(searcher);
         *guard = Some(Arc::clone(&arc));
+        *path_guard = Some(manifest_path);
         Ok(arc)
     }
 
@@ -906,6 +1198,8 @@ impl SkeleSearchServer {
     async fn invalidate_searcher_cache(&self) {
         let mut guard = self.cached_searcher.write().await;
         *guard = None;
+        let mut path_guard = self.cached_searcher_manifest_path.write().await;
+        *path_guard = None;
         tracing::info!("searcher cache invalidated");
     }
 
@@ -915,10 +1209,7 @@ impl SkeleSearchServer {
     /// Returns a fast error when background indexing is active to avoid blocking
     /// on CozoDB's internal write lock (ShardedLock) held by the indexer.
     #[tracing::instrument(skip_all, fields(query = %input.query, top_k = input.top_k))]
-    pub async fn search_code(
-        &self,
-        input: SearchCodeInput,
-    ) -> anyhow::Result<SearchCodeResponse> {
+    pub async fn search_code(&self, input: SearchCodeInput) -> anyhow::Result<SearchCodeResponse> {
         let target = self.daemon_target_for_status(None)?;
         let response = self
             .daemon_client
@@ -994,7 +1285,11 @@ impl SkeleSearchServer {
         let provider_name = input.provider.as_deref().unwrap_or("fastembed");
         match provider_name {
             "fastembed" | "voyage" | "openai" => {}
-            unknown => return Err(anyhow::anyhow!("unknown provider: '{unknown}'. Valid: fastembed, voyage, openai")),
+            unknown => {
+                return Err(anyhow::anyhow!(
+                    "unknown provider: '{unknown}'. Valid: fastembed, voyage, openai"
+                ))
+            }
         }
         let provider_name_owned = provider_name.to_string();
 
@@ -1129,7 +1424,12 @@ impl SkeleSearchServer {
                 rt.block_on(async {
                     let provider = provider_from_name(&provider_name_for_closure)
                         .map(ArcProvider::new)
-                        .with_context(|| format!("failed to initialize provider '{}'", provider_name_for_closure))?;
+                        .with_context(|| {
+                            format!(
+                                "failed to initialize provider '{}'",
+                                provider_name_for_closure
+                            )
+                        })?;
                     let manifest = Arc::new(ManifestStore::open(manifest_path2.as_path())?);
                     let config = Config::load(&path2).context("load .skelesearch.toml")?;
                     let indexer = Indexer::new(backend2, manifest, provider.clone())
@@ -1140,7 +1440,9 @@ impl SkeleSearchServer {
                         match FastEmbedSparseProvider::bgem3() {
                             Ok(sp) => indexer.with_sparse_provider(Arc::new(sp)),
                             Err(e) => {
-                                tracing::warn!("sparse provider init failed: {e}, skipping sparse indexing");
+                                tracing::warn!(
+                                    "sparse provider init failed: {e}, skipping sparse indexing"
+                                );
                                 indexer
                             }
                         }
@@ -1184,7 +1486,9 @@ impl SkeleSearchServer {
                 Ok(Err(index_err)) => {
                     let err_str = index_err.to_string();
                     let err_lower = err_str.to_lowercase();
-                    if err_lower.contains("dimension mismatch") || err_lower.contains("arity mismatch") {
+                    if err_lower.contains("dimension mismatch")
+                        || err_lower.contains("arity mismatch")
+                    {
                         tracing::error!(
                             error = %index_err,
                             "Auto-index failed: index was built with a different provider \
@@ -1211,7 +1515,8 @@ impl SkeleSearchServer {
             status: "indexing_started".to_string(),
             path: input.path,
             files_queued,
-            message: "Indexing started in the background. Use index_status to check progress.".to_string(),
+            message: "Indexing started in the background. Use index_status to check progress."
+                .to_string(),
         })
     }
 
@@ -1248,7 +1553,9 @@ impl SkeleSearchServer {
                     match FastEmbedSparseProvider::bgem3() {
                         Ok(sp) => indexer.with_sparse_provider(Arc::new(sp)),
                         Err(e) => {
-                            tracing::warn!("sparse provider init failed: {e}, skipping sparse indexing");
+                            tracing::warn!(
+                                "sparse provider init failed: {e}, skipping sparse indexing"
+                            );
                             indexer
                         }
                     }
@@ -1262,49 +1569,76 @@ impl SkeleSearchServer {
         .context("indexer task panicked")?
         .context("indexer.index_path")?;
 
-        *self.provider.write().map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = provider;
+        *self
+            .provider
+            .write()
+            .map_err(|_| anyhow::anyhow!("provider lock poisoned"))? = provider;
         self.invalidate_searcher_cache().await;
 
         Ok(result)
     }
 
     /// Return current index statistics, including live background-indexing progress.
-    pub async fn index_status(
-        &self,
-        input: IndexStatusInput,
-    ) -> anyhow::Result<IndexStatusOutput> {
+    pub async fn index_status(&self, input: IndexStatusInput) -> anyhow::Result<IndexStatusOutput> {
         let (backend, manifest_path) = self.resolve_backend(input.path.as_deref()).await?;
         let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
         let indexing = self.current_indexing_progress(&storage_dir).await;
-        if matches!(indexing.as_ref().map(|p| p.status.as_str()), Some("running")) {
+        let refreshing = matches!(indexing.as_ref().map(|p| p.status.as_str()), Some("running"));
+        let freshness = Self::compute_freshness_snapshot(&manifest_path, refreshing);
+        let stats = match backend.stats().await {
+            Ok(s) => Some(s),
+            Err(ref e) if is_uninitialized_index_error(e) => None,
+            Err(e) => return Err(e),
+        };
+
+        if refreshing {
             return Ok(IndexStatusOutput {
-                indexed_files: indexing.as_ref().map(|p| p.files_done).unwrap_or(0),
-                total_chunks: indexing.as_ref().map(|p| p.chunks_done).unwrap_or(0),
-                last_indexed: None,
-                estimated_stale: 0,
+                indexed_files: stats
+                    .as_ref()
+                    .map(|s| s.indexed_files)
+                    .unwrap_or_else(|| indexing.as_ref().map(|p| p.files_done).unwrap_or(0)),
+                total_chunks: stats
+                    .as_ref()
+                    .map(|s| s.total_chunks)
+                    .unwrap_or_else(|| indexing.as_ref().map(|p| p.chunks_done).unwrap_or(0)),
+                last_indexed: stats
+                    .as_ref()
+                    .and_then(|s| s.last_indexed)
+                    .map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
+                estimated_stale: freshness.estimated_stale,
+                freshness_state: Self::map_freshness_state(freshness.state),
+                freshness_checked_at: freshness.freshness_checked_at.map(|dt| dt.to_rfc3339()),
+                freshness_error: freshness.freshness_error,
                 watching: self.watcher_started.load(Ordering::Relaxed),
                 indexing,
             });
         }
-        let stats = match backend.stats().await {
-            Ok(s) => s,
-            Err(ref e) if is_uninitialized_index_error(e) => {
+        let stats = match stats {
+            Some(s) => s,
+            None => {
                 return Ok(IndexStatusOutput {
                     indexed_files: 0,
                     total_chunks: 0,
                     last_indexed: None,
-                    estimated_stale: 0,
+                    estimated_stale: freshness.estimated_stale,
+                    freshness_state: Self::map_freshness_state(freshness.state),
+                    freshness_checked_at: freshness.freshness_checked_at.map(|dt| dt.to_rfc3339()),
+                    freshness_error: freshness.freshness_error,
                     watching: self.watcher_started.load(Ordering::Relaxed),
                     indexing,
                 });
             }
-            Err(e) => return Err(e),
         };
         Ok(IndexStatusOutput {
             indexed_files: stats.indexed_files,
             total_chunks: stats.total_chunks,
-            last_indexed: stats.last_indexed.map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
-            estimated_stale: 0,
+            last_indexed: stats
+                .last_indexed
+                .map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
+            estimated_stale: freshness.estimated_stale,
+            freshness_state: Self::map_freshness_state(freshness.state),
+            freshness_checked_at: freshness.freshness_checked_at.map(|dt| dt.to_rfc3339()),
+            freshness_error: freshness.freshness_error,
             watching: self.watcher_started.load(Ordering::Relaxed),
             indexing,
         })
@@ -1312,7 +1646,10 @@ impl SkeleSearchServer {
 
     /// Snapshot the current background indexing progress for inclusion in `IndexStatusOutput`.
     /// Returns `None` when neither local nor shared cross-process indexing is active.
-    async fn current_indexing_progress(&self, storage_dir: &std::path::Path) -> Option<IndexingProgress> {
+    async fn current_indexing_progress(
+        &self,
+        storage_dir: &std::path::Path,
+    ) -> Option<IndexingProgress> {
         let storage_dir_str = storage_dir.display().to_string();
         let local = {
             let state = self.index_state.read().await;
@@ -1405,7 +1742,11 @@ impl SkeleSearchServer {
         let ctx = match searcher.file_context(&input.file_path).await {
             Ok(c) => c,
             Err(ref e) if is_uninitialized_index_error(e) => {
-                return Ok(FileContextOutput { chunks: vec![], imports: vec![], imported_by: vec![] });
+                return Ok(FileContextOutput {
+                    chunks: vec![],
+                    imports: vec![],
+                    imported_by: vec![],
+                });
             }
             Err(e) => return Err(e),
         };
@@ -1434,17 +1775,17 @@ impl SkeleSearchServer {
     /// and calls [`grep_codebase`] with `top_k` as the result cap.
     /// Semantic path: delegates to [`Self::search_code`].
     #[tracing::instrument(skip_all, fields(query = %input.query))]
-    pub async fn smart_search(
-        &self,
-        input: SmartSearchInput,
-    ) -> anyhow::Result<SmartSearchOutput> {
+    pub async fn smart_search(&self, input: SmartSearchInput) -> anyhow::Result<SmartSearchOutput> {
         // If a non-default project is specified and search_code doesn't support
         // cross-project yet, resolve the backend and build a temporary searcher.
         if let Some(ref project) = input.project {
             let (backend, manifest_path) = self.resolve_backend(Some(project.as_str())).await?;
             let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
             if matches!(
-                self.current_indexing_progress(&storage_dir).await.as_ref().map(|p| p.status.as_str()),
+                self.current_indexing_progress(&storage_dir)
+                    .await
+                    .as_ref()
+                    .map(|p| p.status.as_str()),
                 Some("running")
             ) {
                 anyhow::bail!(
@@ -1457,25 +1798,37 @@ impl SkeleSearchServer {
                 .ok()
                 .and_then(|m| m.get_meta("provider").ok().flatten())
                 .unwrap_or_else(|| "fastembed".to_string());
-            let real = provider_from_name(&provider_name)
-                .with_context(|| format!("init provider '{}' for project {}", provider_name, project))?;
+            let real = provider_from_name(&provider_name).with_context(|| {
+                format!("init provider '{}' for project {}", provider_name, project)
+            })?;
             let provider = ArcProvider::new(real);
             let searcher = Searcher::new(backend, provider);
             // Delegate to a simplified search path for cross-project queries.
             let (mut results, _timings) = searcher
                 .search_with_timings(
-                    &input.query, input.top_k.max(1), input.include_graph,
+                    &input.query,
+                    input.top_k.max(1),
+                    input.include_graph,
                     if input.include_graph { 2 } else { 0 },
-                    input.diversity, input.max_tokens.or(Some(8192)),
+                    input.diversity,
+                    input.max_tokens.or(Some(8192)),
                 )
                 .await?;
             if let Some(ref scope) = input.scope {
                 results.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
             }
-            let rows = results.into_iter().map(|r| SearchCodeRow {
-                file_path: r.file_path, start_line: r.start_line, end_line: r.end_line,
-                content: r.content, score: r.score, match_quality: r.match_quality, why: r.why,
-            }).collect();
+            let rows = results
+                .into_iter()
+                .map(|r| SearchCodeRow {
+                    file_path: r.file_path,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    content: r.content,
+                    score: r.score,
+                    match_quality: r.match_quality,
+                    why: r.why,
+                })
+                .collect();
             return Ok(SmartSearchOutput {
                 strategy: input.intent.as_deref().unwrap_or("semantic").to_string(),
                 results: SmartSearchResults::Semantic(rows),
@@ -1499,7 +1852,8 @@ impl SkeleSearchServer {
         let strategy = classify_query(&query);
         let results = match &strategy {
             QueryStrategy::Grep => {
-                let paths = match self.backend.list_indexed_paths().await {
+                let (backend, manifest_path) = self.resolve_backend(None).await?;
+                let paths = match backend.list_indexed_paths().await {
                     Ok(p) => p,
                     Err(ref e) if is_uninitialized_index_error(e) => vec![],
                     Err(e) => return Err(e),
@@ -1510,19 +1864,27 @@ impl SkeleSearchServer {
                     // Resolve grep root from explicit scope, manifest index_root, or indexed paths.
                     let root = if let Some(ref scope) = input.scope {
                         let p = PathBuf::from(scope);
-                        if p.is_absolute() { p } else {
-                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join(p)
                         }
                     } else {
-                        let manifest_root = ManifestStore::open(self.manifest_path.as_path())
+                        let manifest_root = ManifestStore::open(&manifest_path)
                             .ok()
                             .and_then(|m| m.get_meta("index_root").ok().flatten())
                             .map(PathBuf::from);
                         manifest_root
                             .or_else(|| {
                                 common_ancestor(&paths).map(|p| {
-                                    if p.is_absolute() { p } else {
-                                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+                                    if p.is_absolute() {
+                                        p
+                                    } else {
+                                        std::env::current_dir()
+                                            .unwrap_or_else(|_| PathBuf::from("."))
+                                            .join(p)
                                     }
                                 })
                             })
@@ -1548,14 +1910,19 @@ impl SkeleSearchServer {
                             .await?;
                         let mut rows = response.results;
                         if let Some(ref scope) = input.scope {
-                            rows.retain(|r| std::path::Path::new(&r.file_path).starts_with(scope.as_str()));
+                            rows.retain(|r| {
+                                std::path::Path::new(&r.file_path).starts_with(scope.as_str())
+                            });
                         }
                         return Ok(SmartSearchOutput {
                             strategy: "semantic".to_string(),
                             results: SmartSearchResults::Semantic(rows),
                         });
                     }
-                    let opts = GrepOptions { max_results: input.top_k.max(1), case_insensitive: false };
+                    let opts = GrepOptions {
+                        max_results: input.top_k.max(1),
+                        case_insensitive: false,
+                    };
                     let matches = grep_codebase(&root, &query, &opts)?;
                     let mut rows: Vec<GrepSearchRow> = matches
                         .into_iter()
@@ -1567,13 +1934,18 @@ impl SkeleSearchServer {
                         .collect();
                     // Filter grep results to branch-changed files if requested.
                     if input.branch_scope {
-                        let proj_root = self.manifest_path
+                        let proj_root = self
+                            .manifest_path
                             .parent()
                             .and_then(|p| p.parent())
                             .unwrap_or_else(|| std::path::Path::new("."));
                         let changed = skelesearch_core::git::changed_files_on_branch(proj_root)?;
                         if !changed.is_empty() {
-                            rows.retain(|r| changed.iter().any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)));
+                            rows.retain(|r| {
+                                changed.iter().any(|c| {
+                                    r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)
+                                })
+                            });
                         }
                     }
                     SmartSearchResults::Grep(rows)
@@ -1600,7 +1972,10 @@ impl SkeleSearchServer {
                 SmartSearchResults::Semantic(rows)
             }
         };
-        Ok(SmartSearchOutput { strategy: strategy.to_string(), results })
+        Ok(SmartSearchOutput {
+            strategy: strategy.to_string(),
+            results,
+        })
     }
 
     /// Intent-based dispatch for explicit `intent` values.
@@ -1675,12 +2050,25 @@ impl SkeleSearchServer {
                 let end_name = input.symbols[1].clone();
 
                 let (trace_backend, _) = self.resolve_backend(input.project.as_deref()).await?;
-                let start_syms = trace_backend.find_symbols(&start_name, None).await.unwrap_or_default();
-                let end_syms = trace_backend.find_symbols(&end_name, None).await.unwrap_or_default();
+                let start_syms = trace_backend
+                    .find_symbols(&start_name, None)
+                    .await
+                    .unwrap_or_default();
+                let end_syms = trace_backend
+                    .find_symbols(&end_name, None)
+                    .await
+                    .unwrap_or_default();
 
-                let trace_info = if let (Some(s), Some(e)) = (start_syms.first(), end_syms.first()) {
-                    let start_callees = trace_backend.get_callees(&s.file_path, &s.name).await.unwrap_or_default();
-                    let end_callers = trace_backend.get_callers(&e.file_path, &e.name).await.unwrap_or_default();
+                let trace_info = if let (Some(s), Some(e)) = (start_syms.first(), end_syms.first())
+                {
+                    let start_callees = trace_backend
+                        .get_callees(&s.file_path, &s.name)
+                        .await
+                        .unwrap_or_default();
+                    let end_callers = trace_backend
+                        .get_callers(&e.file_path, &e.name)
+                        .await
+                        .unwrap_or_default();
 
                     // Direct connection: does start directly call end?
                     let direct = start_callees.iter().any(|c| {
@@ -1691,24 +2079,41 @@ impl SkeleSearchServer {
                         format!("{} directly calls {}", start_name, end_name)
                     } else {
                         // One-hop: start calls X, X calls end?
-                        let start_callee_keys: std::collections::HashSet<(String, String)> = start_callees
-                            .iter()
-                            .filter_map(|c| Some((c.callee_file.clone()?, c.callee_symbol.clone()?)))
-                            .collect();
+                        let start_callee_keys: std::collections::HashSet<(String, String)> =
+                            start_callees
+                                .iter()
+                                .filter_map(|c| {
+                                    Some((c.callee_file.clone()?, c.callee_symbol.clone()?))
+                                })
+                                .collect();
                         let intermediaries: Vec<String> = end_callers
                             .iter()
-                            .filter(|c| start_callee_keys.contains(&(c.caller_file.clone(), c.caller_symbol.clone())))
+                            .filter(|c| {
+                                start_callee_keys
+                                    .contains(&(c.caller_file.clone(), c.caller_symbol.clone()))
+                            })
                             .take(5)
                             .map(|c| format!("{}::{}", c.caller_file, c.caller_symbol))
                             .collect();
                         if !intermediaries.is_empty() {
-                            format!("{} -> [{}] -> {}", start_name, intermediaries.join(", "), end_name)
+                            format!(
+                                "{} -> [{}] -> {}",
+                                start_name,
+                                intermediaries.join(", "),
+                                end_name
+                            )
                         } else {
-                            format!("No direct or 1-hop call path found between {} and {}", start_name, end_name)
+                            format!(
+                                "No direct or 1-hop call path found between {} and {}",
+                                start_name, end_name
+                            )
                         }
                     }
                 } else {
-                    format!("Could not resolve symbols: '{}' and/or '{}'", start_name, end_name)
+                    format!(
+                        "Could not resolve symbols: '{}' and/or '{}'",
+                        start_name, end_name
+                    )
                 };
 
                 Ok(SmartSearchOutput {
@@ -1724,23 +2129,20 @@ impl SkeleSearchServer {
                     }]),
                 })
             }
-            other => {
-                Err(anyhow::anyhow!(
-                    "unknown intent {:?}; valid values are: find, understand, impact, trace",
-                    other
-                ))
-            }
+            other => Err(anyhow::anyhow!(
+                "unknown intent {:?}; valid values are: find, understand, impact, trace",
+                other
+            )),
         }
     }
 
-
     /// Find symbol definitions by name, optionally filtered by kind.
-    pub async fn find_symbol(
-        &self,
-        input: FindSymbolInput,
-    ) -> anyhow::Result<Vec<SymbolRow>> {
+    pub async fn find_symbol(&self, input: FindSymbolInput) -> anyhow::Result<Vec<SymbolRow>> {
         let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
-        let results = match backend.find_symbols(&input.name, input.kind.as_deref()).await {
+        let results = match backend
+            .find_symbols(&input.name, input.kind.as_deref())
+            .await
+        {
             Ok(r) => r,
             Err(ref e) if is_uninitialized_index_error(e) => return Ok(vec![]),
             Err(e) => return Err(e),
@@ -1769,7 +2171,10 @@ impl SkeleSearchServer {
         // Resolve backend for the target project.
         let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
         // Step 1: resolve the symbol.
-        let symbols = match backend.find_symbols(&input.name, input.kind.as_deref()).await {
+        let symbols = match backend
+            .find_symbols(&input.name, input.kind.as_deref())
+            .await
+        {
             Ok(r) => r,
             Err(ref e) if is_uninitialized_index_error(e) => {
                 return Ok(SymbolContextOutput {
@@ -1825,7 +2230,8 @@ impl SkeleSearchServer {
             .await
             .ok() // source is best-effort — don't fail the whole call on a missing chunk
             .and_then(|chunks| {
-                chunks.into_iter()
+                chunks
+                    .into_iter()
                     .find(|c| c.start_line <= sym.start_line && sym.start_line <= c.end_line)
                     .map(|c| c.content)
             });
@@ -1841,24 +2247,45 @@ impl SkeleSearchServer {
             .unwrap_or_default();
 
         // Step 3b: function-level call graph edges.
-        let callers_raw = backend.get_callers(&sym.file_path, &sym.name).await.unwrap_or_default();
-        let callees_raw = backend.get_callees(&sym.file_path, &sym.name).await.unwrap_or_default();
-        let callers: Vec<CallEdgeInfo> = callers_raw.iter().take(20).map(|e| CallEdgeInfo {
-            file_path: e.caller_file.clone(),
-            symbol: e.caller_symbol.clone(),
-            confidence: e.confidence,
-        }).collect();
-        let callees: Vec<CallEdgeInfo> = callees_raw.iter().take(20).filter_map(|e| {
-            // Only include resolved callees (callee_file + callee_symbol must be present).
-            let file_path = e.callee_file.clone()?;
-            let symbol = e.callee_symbol.clone()?;
-            if file_path.is_empty() { return None; }
-            Some(CallEdgeInfo { file_path, symbol, confidence: e.confidence })
-        }).collect();
+        let callers_raw = backend
+            .get_callers(&sym.file_path, &sym.name)
+            .await
+            .unwrap_or_default();
+        let callees_raw = backend
+            .get_callees(&sym.file_path, &sym.name)
+            .await
+            .unwrap_or_default();
+        let callers: Vec<CallEdgeInfo> = callers_raw
+            .iter()
+            .take(20)
+            .map(|e| CallEdgeInfo {
+                file_path: e.caller_file.clone(),
+                symbol: e.caller_symbol.clone(),
+                confidence: e.confidence,
+            })
+            .collect();
+        let callees: Vec<CallEdgeInfo> = callees_raw
+            .iter()
+            .take(20)
+            .filter_map(|e| {
+                // Only include resolved callees (callee_file + callee_symbol must be present).
+                let file_path = e.callee_file.clone()?;
+                let symbol = e.callee_symbol.clone()?;
+                if file_path.is_empty() {
+                    return None;
+                }
+                Some(CallEdgeInfo {
+                    file_path,
+                    symbol,
+                    confidence: e.confidence,
+                })
+            })
+            .collect();
 
         // Step 4: filter importers to test files when requested and cap lists for token efficiency.
         let test_files_raw: Vec<String> = if input.include_tests {
-            all_importers.iter()
+            all_importers
+                .iter()
                 .filter(|f| is_test_file_path(f))
                 .cloned()
                 .collect()
@@ -1880,10 +2307,11 @@ impl SkeleSearchServer {
             .get_symbol_roles(&[sym.file_path.as_str()])
             .await
             .ok()
-            .and_then(|mut m| m.remove(sym.file_path.as_str())) {
-                Some(r) => Some(r),
-                None => Some(infer_file_role(&imports, &imported_by)),
-            };
+            .and_then(|mut m| m.remove(sym.file_path.as_str()))
+        {
+            Some(r) => Some(r),
+            None => Some(infer_file_role(&imports, &imported_by)),
+        };
 
         Ok(SymbolContextOutput {
             symbol: Some(symbol_row),
@@ -1901,30 +2329,38 @@ impl SkeleSearchServer {
         })
     }
 
-
     pub async fn find_impact_set(
         &self,
         input: FindImpactSetInput,
     ) -> anyhow::Result<ImpactSetOutput> {
         let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
         let max_depth = input.max_depth.unwrap_or(3).min(5);
-        let all_importers = match backend.traverse_importers(&input.file_path, max_depth, None).await {
+        let all_importers = match backend
+            .traverse_importers(&input.file_path, max_depth, None)
+            .await
+        {
             Ok(v) => v,
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
         };
 
-        let direct: Vec<String> = all_importers.iter()
+        let direct: Vec<String> = all_importers
+            .iter()
             .filter(|(_, d)| *d == 1)
             .map(|(f, _)| f.clone())
             .collect();
 
-        let transitive: Vec<ImpactEntry> = all_importers.iter()
+        let transitive: Vec<ImpactEntry> = all_importers
+            .iter()
             .filter(|(_, d)| *d > 1)
-            .map(|(f, d)| ImpactEntry { file_path: f.clone(), depth: *d })
+            .map(|(f, d)| ImpactEntry {
+                file_path: f.clone(),
+                depth: *d,
+            })
             .collect();
 
-        let tests: Vec<String> = all_importers.iter()
+        let tests: Vec<String> = all_importers
+            .iter()
             .filter(|(f, _)| is_test_file_path(f))
             .map(|(f, _)| f.clone())
             .collect();
@@ -1948,7 +2384,8 @@ impl SkeleSearchServer {
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
         };
-        let test_importers: Vec<String> = importers.into_iter()
+        let test_importers: Vec<String> = importers
+            .into_iter()
             .filter(|f| is_test_file_path(f))
             .collect();
 
@@ -1966,7 +2403,8 @@ impl SkeleSearchServer {
             Err(ref e) if is_uninitialized_index_error(e) => vec![],
             Err(e) => return Err(e),
         };
-        let colocated: Vec<String> = all_files.into_iter()
+        let colocated: Vec<String> = all_files
+            .into_iter()
             .filter(|f| {
                 is_test_file_path(f)
                     && (std::path::Path::new(f).starts_with(&dir)
@@ -2005,8 +2443,7 @@ impl SkeleSearchServer {
     /// clients).
     pub async fn serve_http(self, addr: std::net::SocketAddr) -> anyhow::Result<()> {
         use rmcp::transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
-            session::local::LocalSessionManager,
+            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
         };
 
         let config = StreamableHttpServerConfig::default();
@@ -2019,11 +2456,13 @@ impl SkeleSearchServer {
         );
 
         let router = axum::Router::new().nest_service("/mcp", service);
-        let listener = tokio::net::TcpListener::bind(addr).await
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
             .with_context(|| format!("bind to {addr}"))?;
         tracing::info!("skelesearch-mcp HTTP listening on {addr}");
 
-        axum::serve(listener, router).await
+        axum::serve(listener, router)
+            .await
             .context("HTTP server error")?;
         Ok(())
     }
@@ -2031,16 +2470,15 @@ impl SkeleSearchServer {
     /// Build a compact repo map from indexed data. Renders a tree with file
     /// roles, symbols, and import edges, respecting the token budget.
     pub async fn get_repo_map(&self, input: GetRepoMapInput) -> anyhow::Result<String> {
-        let (backend, _) = self.resolve_backend(input.project.as_deref()).await?;
+        let (backend, manifest_path) = self.resolve_backend(input.project.as_deref()).await?;
         let data = backend.get_repo_map_data().await?;
-        let stats = backend.stats().await.ok();
-        let stale = stats.as_ref().map(|s| s.estimated_stale).unwrap_or(0);
+        let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
+        let indexing = self.current_indexing_progress(&storage_dir).await;
+        let refreshing = matches!(indexing.as_ref().map(|p| p.status.as_str()), Some("running"));
+        let freshness = Self::compute_freshness_snapshot(&manifest_path, refreshing);
         let mut out = render_repo_map(&data, &input);
-        if stale > 0 {
-            out.insert_str(0, &format!(
-                "⚠ {} file(s) changed since last index. Run index to update.\n\n",
-                stale
-            ));
+        if let Some(warning) = Self::repo_map_warning_prefix(&freshness) {
+            out.insert_str(0, &warning);
         }
         Ok(out)
     }
@@ -2065,7 +2503,12 @@ fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
         files: Vec<usize>,
     }
     impl DirNode {
-        fn new() -> Self { Self { children: BTreeMap::new(), files: Vec::new() } }
+        fn new() -> Self {
+            Self {
+                children: BTreeMap::new(),
+                files: Vec::new(),
+            }
+        }
     }
 
     let mut root = DirNode::new();
@@ -2074,7 +2517,10 @@ fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
         let (dir_parts, _file_name) = parts.split_at(parts.len().saturating_sub(1));
         let mut node = &mut root;
         for part in dir_parts {
-            node = node.children.entry(part.to_string()).or_insert_with(DirNode::new);
+            node = node
+                .children
+                .entry(part.to_string())
+                .or_insert_with(DirNode::new);
         }
         node.files.push(i);
     }
@@ -2082,8 +2528,11 @@ fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
     let mut out = String::new();
     let max_chars = input.max_tokens * 4;
 
-    out.push_str(&format!("# Repo Map ({} files, {} import edges)\n\n",
-        data.files.len(), data.import_edges.len()));
+    out.push_str(&format!(
+        "# Repo Map ({} files, {} import edges)\n\n",
+        data.files.len(),
+        data.import_edges.len()
+    ));
 
     fn render_dir(
         out: &mut String,
@@ -2094,27 +2543,48 @@ fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
         max_chars: usize,
     ) {
         for &idx in &node.files {
-            if out.len() > max_chars { return; }
+            if out.len() > max_chars {
+                return;
+            }
             let f = &files[idx];
             let basename = f.path.rsplit('/').next().unwrap_or(&f.path);
-            let role_tag = if f.role.is_empty() { String::new() } else { format!(" [{}]", f.role) };
-            out.push_str(&format!("{}{}{} ({} chunks, {})\n",
-                prefix, basename, role_tag, f.chunk_count, f.language));
+            let role_tag = if f.role.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", f.role)
+            };
+            out.push_str(&format!(
+                "{}{}{} ({} chunks, {})\n",
+                prefix, basename, role_tag, f.chunk_count, f.language
+            ));
             if include_symbols {
                 let limit = 15.min(f.symbols.len());
                 for sym in &f.symbols[..limit] {
                     out.push_str(&format!("{}  {} {}\n", prefix, sym.kind, sym.name));
                 }
                 if f.symbols.len() > limit {
-                    out.push_str(&format!("{}  ... +{} more\n", prefix, f.symbols.len() - limit));
+                    out.push_str(&format!(
+                        "{}  ... +{} more\n",
+                        prefix,
+                        f.symbols.len() - limit
+                    ));
                 }
             }
         }
         for (name, child) in &node.children {
-            if out.len() > max_chars { return; }
+            if out.len() > max_chars {
+                return;
+            }
             let file_count = count_files(child);
             out.push_str(&format!("{}{}/  ({} files)\n", prefix, name, file_count));
-            render_dir(out, child, files, &format!("{}  ", prefix), include_symbols, max_chars);
+            render_dir(
+                out,
+                child,
+                files,
+                &format!("{}  ", prefix),
+                include_symbols,
+                max_chars,
+            );
         }
     }
 
@@ -2122,10 +2592,20 @@ fn render_repo_map(data: &RepoMapData, input: &GetRepoMapInput) -> String {
         node.files.len() + node.children.values().map(count_files).sum::<usize>()
     }
 
-    render_dir(&mut out, &root, &data.files, "", input.include_symbols, max_chars);
+    render_dir(
+        &mut out,
+        &root,
+        &data.files,
+        "",
+        input.include_symbols,
+        max_chars,
+    );
 
     if input.include_edges && !data.import_edges.is_empty() && out.len() < max_chars {
-        out.push_str(&format!("\n## Import Graph ({} edges)\n\n", data.import_edges.len()));
+        out.push_str(&format!(
+            "\n## Import Graph ({} edges)\n\n",
+            data.import_edges.len()
+        ));
         for (from, to) in &data.import_edges {
             if out.len() > max_chars {
                 out.push_str("... truncated\n");
@@ -2167,9 +2647,9 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<IndexStatusInput>,
     ) -> Result<String, String> {
-        match self.proxy_index_status_via_daemon(input).await {
+        match self.index_status(input).await {
             Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
-            Err(err) => Err(self.daemon_proxy_error("index_status", err)),
+            Err(err) => Err(err.to_string()),
         }
     }
 
@@ -2180,9 +2660,9 @@ impl SkeleSearchServer {
         Parameters(input): Parameters<SmartSearchInput>,
     ) -> Result<String, String> {
         match self.smart_search(input).await {
-                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
+            Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+            Err(e) => Err(self.friendly_err(e).await),
+        }
     }
 
     /// Look up a symbol definition by exact name. Returns file path, line range, and kind. Use for 'where is X defined' questions.
@@ -2192,9 +2672,9 @@ impl SkeleSearchServer {
         Parameters(input): Parameters<FindSymbolInput>,
     ) -> Result<String, String> {
         match self.find_symbol(input).await {
-                    Ok(rows) => serde_json::to_string(&rows).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
+            Ok(rows) => serde_json::to_string(&rows).map_err(|e| e.to_string()),
+            Err(e) => Err(self.friendly_err(e).await),
+        }
     }
 
     /// Find all files affected by changes to a given file. Returns direct importers,
@@ -2205,9 +2685,9 @@ impl SkeleSearchServer {
         Parameters(input): Parameters<FindImpactSetInput>,
     ) -> Result<String, String> {
         match self.find_impact_set(input).await {
-                    Ok(r) => serde_json::to_string(&r).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
+            Ok(r) => serde_json::to_string(&r).map_err(|e| e.to_string()),
+            Err(e) => Err(self.friendly_err(e).await),
+        }
     }
 
     /// Find test files covering a source file. Returns test files that import it
@@ -2218,9 +2698,9 @@ impl SkeleSearchServer {
         Parameters(input): Parameters<FindTestContextInput>,
     ) -> Result<String, String> {
         match self.find_test_context(input).await {
-                    Ok(r) => serde_json::to_string(&r).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
+            Ok(r) => serde_json::to_string(&r).map_err(|e| e.to_string()),
+            Err(e) => Err(self.friendly_err(e).await),
+        }
     }
 
     /// Return source code, import graph edges, and test files for a named symbol.
@@ -2231,9 +2711,9 @@ impl SkeleSearchServer {
         Parameters(input): Parameters<GetSymbolContextInput>,
     ) -> Result<String, String> {
         match self.get_symbol_context(input).await {
-                    Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
-                    Err(e) => Err(self.friendly_err(e).await),
-                }
+            Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
+            Err(e) => Err(self.friendly_err(e).await),
+        }
     }
 
     /// Get a compact structural overview of the indexed codebase.
@@ -2296,7 +2776,103 @@ impl SkeleSearchServer {
         let server_clone = self.clone();
         tokio::spawn(run_file_watcher(server_clone, root));
     }
+}
 
+async fn maintain_daemon_session(
+    daemon_client: Arc<DaemonClient<TokioDaemonConnector>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    instance_id: Arc<str>,
+) {
+    let client_name = Some("skelesearch-mcp".to_string());
+    let client_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    let mut active_session: Option<String> = None;
+    let mut heartbeat_interval = Duration::from_secs(20);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        if active_session.is_none() {
+            match daemon_client
+                .register_client(client_name.clone(), client_version.clone())
+                .await
+            {
+                Ok(registered) => {
+                    heartbeat_interval =
+                        Duration::from_secs(registered.heartbeat_interval_seconds.max(1));
+                    tracing::info!(
+                    instance_id = %instance_id,
+                    session_id = %registered.session_id,
+                    heartbeat_interval_s = registered.heartbeat_interval_seconds,
+                    lease_ttl_s = registered.lease_ttl_seconds,
+                    "registered daemon client session"
+                                        );
+                    active_session = Some(registered.session_id);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                    instance_id = %instance_id,
+                    error = %err,
+                    "failed to register daemon client session; retrying"
+                                        );
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let session_id = active_session
+            .clone()
+            .expect("session is active before heartbeat loop");
+        tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(heartbeat_interval) => {
+                        match daemon_client.heartbeat(session_id.clone()).await {
+                            Ok(response) if response.acknowledged => {}
+                            Ok(_) => {
+                                tracing::warn!(
+        instance_id = %instance_id,
+        session_id = %session_id,
+        "daemon heartbeat was not acknowledged; re-registering session"
+                                );
+                                active_session = None;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+        instance_id = %instance_id,
+        session_id = %session_id,
+        error = %err,
+        "daemon heartbeat failed; re-registering session"
+                                );
+                                active_session = None;
+                            }
+                        }
+                    }
+                }
+    }
+
+    if let Some(session_id) = active_session {
+        if let Err(err) = daemon_client.unregister_client(session_id.clone()).await {
+            tracing::warn!(
+            instance_id = %instance_id,
+            session_id = %session_id,
+            error = %err,
+            "failed to unregister daemon client session during shutdown"
+                        );
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -2330,32 +2906,42 @@ impl ServerHandler for SkeleSearchServer {
         _context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
-            tracing::info!("on_initialized: called — triggering auto-index check");
+            tracing::info!("on_initialized: called — triggering daemon session / auto-index check");
+            self.ensure_daemon_session().await;
             if self.inert_mode {
                 tracing::info!(instance_id = %self.instance_id, "on_initialized: inert mode, skipping auto-index, watcher, and health check");
                 return;
             }
             self.auto_index_if_needed().await;
             self.start_file_watcher_if_enabled().await;
-            match self.backend.stats().await {
-                Ok(stats) => {
+            let health_result = match self.resolve_backend(None).await {
+                Ok((backend, _)) => Some(backend.stats().await),
+                Err(err) => {
+                    tracing::warn!(error = %err, "index health check: failed to resolve active backend");
+                    None
+                }
+            };
+            match health_result {
+                Some(Ok(stats)) => {
                     tracing::info!(
                         indexed_files = stats.indexed_files,
                         total_chunks = stats.total_chunks,
                         "index health check passed"
                     );
                 }
-                Err(ref e) if is_uninitialized_index_error(e) => {
-                    tracing::info!("index health check: not yet initialized (auto-indexing will handle this)");
+                Some(Err(ref e)) if is_uninitialized_index_error(e) => {
+                    tracing::info!(
+                        "index health check: not yet initialized (auto-indexing will handle this)"
+                    );
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     let friendly = friendly_index_error(&e);
                     tracing::error!(error = %friendly, "index health check FAILED — search tools will return errors until resolved");
                 }
+                None => {}
             }
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -2372,8 +2958,67 @@ impl ServerHandler for SkeleSearchServer {
 ///   so the main loop can be written as a clean async select.
 /// - Changes inside `.skelesearch/` and `.git/` are ignored: they are written
 ///   by the indexer and VCS machinery, not by the user.
-/// - If indexing is already in progress when a change arrives, the re-index is
-///   skipped (not queued); the next batch of changes will trigger a fresh run.
+/// - If changes arrive while indexing is in progress, they are coalesced into
+///   one queued follow-up refresh that runs after the active pass completes.
+#[derive(Debug, Default, Clone, Copy)]
+struct WatchRefreshQueue {
+    refresh_in_flight: bool,
+    followup_queued: bool,
+}
+
+impl WatchRefreshQueue {
+    fn on_change_detected(&mut self) -> bool {
+        if self.refresh_in_flight {
+            self.followup_queued = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn mark_refresh_triggered(&mut self) {
+        self.refresh_in_flight = true;
+    }
+
+    fn mark_refresh_finished(&mut self) -> bool {
+        if self.followup_queued {
+            self.followup_queued = false;
+            self.refresh_in_flight = true;
+            true
+        } else {
+            self.refresh_in_flight = false;
+            false
+        }
+    }
+
+    fn refresh_in_flight(&self) -> bool {
+        self.refresh_in_flight
+    }
+}
+
+async fn trigger_watcher_refresh(
+    server: &SkeleSearchServer,
+    root: &std::path::Path,
+) -> anyhow::Result<IndexCodebaseOutput> {
+    // Determine the provider name from the persisted manifest so the
+    // re-index uses the same embedding model as the original index.
+    let (_backend, manifest_path) = server.resolve_backend(Some(root.to_string_lossy().as_ref())).await?;
+    let provider_name = SkeleSearchServer::persisted_provider_name_from_manifest(&manifest_path)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "watcher: cannot determine provider from active manifest at {}",
+                manifest_path.display()
+            )
+        })?;
+
+    server
+        .proxy_index_codebase_via_daemon(IndexCodebaseInput {
+            path: root.to_string_lossy().to_string(),
+            provider: Some(provider_name),
+        })
+        .await
+}
+
 async fn run_file_watcher(server: SkeleSearchServer, root: PathBuf) {
     let skele_dir = root.join(".skelesearch");
     let git_dir = root.join(".git");
@@ -2393,7 +3038,10 @@ async fn run_file_watcher(server: SkeleSearchServer, root: PathBuf) {
         }
     };
 
-    if let Err(e) = debouncer.watcher().watch(&root, notify::RecursiveMode::Recursive) {
+    if let Err(e) = debouncer
+        .watcher()
+        .watch(&root, notify::RecursiveMode::Recursive)
+    {
         tracing::error!(error = %e, path = %root.display(), "watcher: failed to set watch path — watching disabled");
         server.watcher_started.store(false, Ordering::Release);
         return;
@@ -2415,61 +3063,107 @@ async fn run_file_watcher(server: SkeleSearchServer, root: PathBuf) {
     // Keep the debouncer alive for the loop's duration.
     let _debouncer = debouncer;
 
-    loop {
-        match async_rx.recv().await {
-            None => break, // sender dropped; watcher gone
-            Some(Err(errs)) => {
-                for e in errs {
-                    tracing::warn!(error = %e, "watcher: filesystem event error");
-                }
-            }
-            Some(Ok(events)) => {
-                let relevant = events
-                    .iter()
-                    .flat_map(|e| &e.paths)
-                    .filter(|p| !p.starts_with(&skele_dir) && !p.starts_with(&git_dir))
-                    .count();
+    let mut refresh_queue = WatchRefreshQueue::default();
+    let mut status_poll = tokio::time::interval(Duration::from_millis(400));
+    status_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-                if relevant == 0 {
+    loop {
+        tokio::select! {
+            _ = status_poll.tick() => {
+                if !refresh_queue.refresh_in_flight() {
                     continue;
                 }
 
-                // Skip if a re-index is already in flight.
-                {
-                    let state = server.index_state.read().await;
-                    if state.status == IndexingStatus::Running {
-                        tracing::debug!(
-                            changed_files = relevant,
-                            "watcher: re-index skipped — indexing already running"
+                let status = server
+                    .proxy_index_status_via_daemon(IndexStatusInput {
+                        path: Some(root.to_string_lossy().to_string()),
+                    })
+                    .await;
+
+                match status {
+                    Ok(status) => {
+                        let running = matches!(
+                            status.indexing.as_ref().map(|p| p.status.as_str()),
+                            Some("running")
                         );
-                        continue;
+
+                        if running {
+                            continue;
+                        }
+
+                        if refresh_queue.mark_refresh_finished() {
+                            tracing::info!("watcher: running queued follow-up refresh");
+                            match trigger_watcher_refresh(&server, &root).await {
+                                Ok(out) => {
+                                    refresh_queue.mark_refresh_triggered();
+                                    tracing::info!(
+                                        status = %out.status,
+                                        "watcher: follow-up refresh triggered"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %server.daemon_proxy_error("index_codebase", e),
+                                        "watcher: failed to trigger queued follow-up refresh"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %server.daemon_proxy_error("index_status", e),
+                            "watcher: failed to poll indexing status"
+                        );
                     }
                 }
+            }
+            event = async_rx.recv() => {
+                match event {
+                    None => break, // sender dropped; watcher gone
+                    Some(Err(errs)) => {
+                        for e in errs {
+                            tracing::warn!(error = %e, "watcher: filesystem event error");
+                        }
+                    }
+                    Some(Ok(events)) => {
+                        let relevant = events
+                            .iter()
+                            .flat_map(|e| &e.paths)
+                            .filter(|p| !p.starts_with(&skele_dir) && !p.starts_with(&git_dir))
+                            .count();
 
-                tracing::info!(changed_files = relevant, "watcher: triggering incremental re-index");
+                        if relevant == 0 {
+                            continue;
+                        }
 
-                // Determine the provider name from the persisted manifest so the
-                // re-index uses the same embedding model as the original index.
-                let provider_name = ManifestStore::open(server.manifest_path.as_path())
-                    .ok()
-                    .and_then(|m| m.get_meta("provider").ok().flatten())
-                    .unwrap_or_else(|| "fastembed".to_string());
+                        if !refresh_queue.on_change_detected() {
+                            tracing::debug!(
+                                changed_files = relevant,
+                                "watcher: re-index in flight; queued one follow-up refresh"
+                            );
+                            continue;
+                        }
 
-                match server
-                    .proxy_index_codebase_via_daemon(IndexCodebaseInput {
-                        path: root.to_string_lossy().to_string(),
-                        provider: Some(provider_name),
-                    })
-                    .await
-                {
-                    Ok(out) => tracing::info!(
-                        status = %out.status,
-                        "watcher: re-index triggered"
-                    ),
-                    Err(e) => tracing::error!(
-                        error = %server.daemon_proxy_error("index_codebase", e),
-                        "watcher: failed to trigger re-index"
-                    ),
+                        tracing::info!(
+                            changed_files = relevant,
+                            "watcher: triggering incremental re-index"
+                        );
+
+                        match trigger_watcher_refresh(&server, &root).await {
+                            Ok(out) => {
+                                refresh_queue.mark_refresh_triggered();
+                                tracing::info!(
+                                    status = %out.status,
+                                    "watcher: re-index triggered"
+                                );
+                            }
+                            Err(e) => tracing::error!(
+                                error = %server.daemon_proxy_error("index_codebase", e),
+                                "watcher: failed to trigger re-index"
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -2477,7 +3171,6 @@ async fn run_file_watcher(server: SkeleSearchServer, root: PathBuf) {
 
     tracing::info!(path = %root.display(), "watcher: stopped");
 }
-
 
 // ---------------------------------------------------------------------------
 // Path utilities
@@ -2567,14 +3260,13 @@ fn truncate_vec(mut items: Vec<String>, limit: usize) -> (Vec<String>, bool) {
     (items, truncated)
 }
 
-
 /// Return the deepest common ancestor directory for a slice of absolute file paths.
 ///
 /// Walks upward from the first path's parent, popping components until every
 /// remaining path starts with the candidate.  Returns `None` when `paths` is
 /// empty or when the candidates collapse to `/` with no common prefix.
 fn common_ancestor(paths: &[String]) -> Option<PathBuf> {
-    let first = PathBuf::from(paths.first()?);	
+    let first = PathBuf::from(paths.first()?);
     let mut common = first.parent()?.to_path_buf();
     for p in &paths[1..] {
         let path = PathBuf::from(p);
@@ -2608,4 +3300,384 @@ fn count_files_recursive(path: &std::path::Path) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    use skelesearch_service::{
+        protocol::IndexCodebaseStatus, DaemonCapabilities, DaemonErrorCode, DaemonErrorResponse,
+        DaemonRequest, DaemonResponse, HandshakeResponse, IndexCodebaseResponse,
+        IndexFreshnessState, IndexStatusResponse, ProjectKey, ProtocolFrame,
+    };
+    use tempfile::TempDir;
+    use tokio::{
+        io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+        net::UnixListener,
+        sync::Mutex,
+    };
+
+    #[derive(Clone)]
+    struct TestProvider;
+
+    #[async_trait]
+    impl EmbedProvider for TestProvider {
+        fn dim(&self) -> usize {
+            8
+        }
+
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.into_iter().map(|_| vec![0.1_f32; 8]).collect())
+        }
+
+        async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.embed_batch(texts).await
+        }
+    }
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    async fn spawn_startup_stub_daemon(
+        socket_path: &std::path::Path,
+        index_status: IndexStatusResponse,
+        index_requests: Arc<Mutex<Vec<Option<String>>>>,
+    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+        let listener = UnixListener::bind(socket_path)?;
+        Ok(tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            while let Some(line) = lines.next_line().await? {
+                let frame: ProtocolFrame = serde_json::from_str(&line)?;
+                let response = match frame {
+                    ProtocolFrame::Request { id, request } => match request {
+                        DaemonRequest::Handshake(_) => ProtocolFrame::Response {
+                            id,
+                            response: DaemonResponse::Handshake(HandshakeResponse {
+                                protocol_version: skelesearch_service::DAEMON_PROTOCOL_VERSION
+                                    .to_string(),
+                                server_name: "startup-stub".to_string(),
+                                server_version: "0.1.0".to_string(),
+                                capabilities: DaemonCapabilities {
+                                    info: true,
+                                    index_codebase: true,
+                                    index_status: true,
+                                    search_code: true,
+                                    smart_search: false,
+                                    register_client: true,
+                                    heartbeat: true,
+                                    unregister_client: true,
+                                },
+                            }),
+                        },
+                        DaemonRequest::IndexStatus(_) => ProtocolFrame::Response {
+                            id,
+                            response: DaemonResponse::IndexStatus(index_status.clone()),
+                        },
+                        DaemonRequest::IndexCodebase(req) => {
+                            index_requests.lock().await.push(req.provider);
+                            ProtocolFrame::Response {
+                                id,
+                                response: DaemonResponse::IndexCodebase(IndexCodebaseResponse {
+                                    status: IndexCodebaseStatus::IndexingStarted,
+                                    project_key: ProjectKey {
+                                        canonical_root: "/tmp/repo".to_string(),
+                                        logical_id: None,
+                                    },
+                                    files_queued: 0,
+                                    message: "started".to_string(),
+                                }),
+                            }
+                        }
+                        other => ProtocolFrame::Response {
+                            id,
+                            response: DaemonResponse::Error(DaemonErrorResponse {
+                                code: DaemonErrorCode::BadRequest,
+                                message: format!("unexpected request in startup stub: {other:?}"),
+                                details: None,
+                                retryable: false,
+                            }),
+                        },
+                    },
+                    _ => continue,
+                };
+                write_half
+                    .write_all(serde_json::to_string(&response)?.as_bytes())
+                    .await?;
+                write_half.write_all(b"\n").await?;
+                write_half.flush().await?;
+            }
+            Ok(())
+        }))
+    }
+
+    async fn startup_test_server(
+        project_root: &std::path::Path,
+        manifest_path: &std::path::Path,
+    ) -> anyhow::Result<SkeleSearchServer> {
+        std::fs::create_dir_all(project_root.join(".git"))?;
+        std::fs::create_dir_all(
+            manifest_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("manifest path missing parent"))?,
+        )?;
+        let backend = Arc::new(CozoBackend::open(
+            manifest_path
+                .parent()
+                .expect("manifest parent")
+                .join("index.db"),
+        )?);
+        Ok(SkeleSearchServer::new(
+            backend,
+            manifest_path,
+            ArcProvider::new(TestProvider),
+        ))
+    }
+
+    fn write_active_generation_fixture(
+        project_root: &std::path::Path,
+        generation_id: &str,
+        provider_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let storage_dir = project_root.join(".skelesearch");
+        let generation_dir = storage_dir.join("generations").join(generation_id);
+        std::fs::create_dir_all(&generation_dir)?;
+        let (backend_path, manifest_path) = generation_db_paths(&generation_dir);
+        let _backend = CozoBackend::open(&backend_path)?;
+        let manifest = ManifestStore::open(&manifest_path)?;
+        manifest.set_meta("provider", provider_name)?;
+        std::fs::write(storage_dir.join("active-generation"), generation_id)?;
+        Ok(manifest_path)
+    }
+
+    fn stale_status() -> IndexStatusResponse {
+        IndexStatusResponse {
+            project_key: ProjectKey {
+                canonical_root: "/tmp/repo".to_string(),
+                logical_id: None,
+            },
+            indexed_files: 3,
+            total_chunks: 8,
+            last_indexed: Some(chrono::Utc::now().to_rfc3339()),
+            estimated_stale: 1,
+            freshness_state: IndexFreshnessState::Stale,
+            freshness_checked_at: Some(chrono::Utc::now().to_rfc3339()),
+            freshness_error: None,
+            watching: false,
+            indexing: None,
+        }
+    }
+
+    fn fresh_status() -> IndexStatusResponse {
+        IndexStatusResponse {
+            freshness_state: IndexFreshnessState::Fresh,
+            estimated_stale: 0,
+            ..stale_status()
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_stale_refresh_uses_manifest_provider_metadata() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::remove_var("SKELESEARCH_NO_AUTO_INDEX");
+
+        let temp = TempDir::new()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let manifest_path = root.join(".skelesearch/manifest.db");
+
+        let socket_path = temp.path().join("daemon.sock");
+        let index_requests = Arc::new(Mutex::new(Vec::new()));
+        let daemon =
+            spawn_startup_stub_daemon(&socket_path, stale_status(), Arc::clone(&index_requests))
+                .await?;
+
+        std::env::set_var("SKELESEARCH_DAEMON_SOCKET", &socket_path);
+        let server = startup_test_server(&root, &manifest_path).await?;
+        ManifestStore::open(&manifest_path)?.set_meta("provider", "openai")?;
+
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&root)?;
+        server.auto_index_if_needed().await;
+        std::env::set_current_dir(original_dir)?;
+
+        let requests = index_requests.lock().await;
+        assert_eq!(requests.len(), 1, "expected stale startup refresh to queue one indexing run");
+        assert_eq!(requests[0].as_deref(), Some("openai"));
+
+        std::env::remove_var("SKELESEARCH_DAEMON_SOCKET");
+        daemon.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_stale_refresh_fresh_index_is_noop() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::remove_var("SKELESEARCH_NO_AUTO_INDEX");
+
+        let temp = TempDir::new()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let manifest_path = root.join(".skelesearch/manifest.db");
+
+        let socket_path = temp.path().join("daemon.sock");
+        let index_requests = Arc::new(Mutex::new(Vec::new()));
+        let daemon =
+            spawn_startup_stub_daemon(&socket_path, fresh_status(), Arc::clone(&index_requests))
+                .await?;
+
+        std::env::set_var("SKELESEARCH_DAEMON_SOCKET", &socket_path);
+        let server = startup_test_server(&root, &manifest_path).await?;
+        ManifestStore::open(&manifest_path)?.set_meta("provider", "openai")?;
+
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&root)?;
+        server.auto_index_if_needed().await;
+        std::env::set_current_dir(original_dir)?;
+
+        let requests = index_requests.lock().await;
+        assert!(requests.is_empty(), "fresh startup should not queue indexing");
+
+        std::env::remove_var("SKELESEARCH_DAEMON_SOCKET");
+        daemon.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_backend_tracks_active_generation_pointer_changes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let manifest_path = root.join(".skelesearch/manifest.db");
+        let server = startup_test_server(&root, &manifest_path).await?;
+
+        let manifest_a = write_active_generation_fixture(&root, "gen-a", "openai")?;
+        let (_backend_a, resolved_a) = server.resolve_backend(Some(root.to_string_lossy().as_ref())).await?;
+        assert_eq!(resolved_a, manifest_a);
+
+        let manifest_b = write_active_generation_fixture(&root, "gen-b", "voyage")?;
+        let (_backend_b, resolved_b) = server.resolve_backend(Some(root.to_string_lossy().as_ref())).await?;
+        assert_eq!(resolved_b, manifest_b);
+        assert_eq!(
+            ManifestStore::open(&resolved_b)?.get_meta("provider")?.as_deref(),
+            Some("voyage")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_refresh_uses_active_generation_manifest_provider() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock");
+        let temp = TempDir::new()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let manifest_path = root.join(".skelesearch/manifest.db");
+
+        let socket_path = temp.path().join("daemon.sock");
+        let index_requests = Arc::new(Mutex::new(Vec::new()));
+        let daemon =
+            spawn_startup_stub_daemon(&socket_path, stale_status(), Arc::clone(&index_requests))
+                .await?;
+
+        std::env::set_var("SKELESEARCH_DAEMON_SOCKET", &socket_path);
+        let server = startup_test_server(&root, &manifest_path).await?;
+        let _active_manifest = write_active_generation_fixture(&root, "gen-a", "openai")?;
+
+        trigger_watcher_refresh(&server, &root).await?;
+
+        let requests = index_requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].as_deref(), Some("openai"));
+
+        std::env::remove_var("SKELESEARCH_DAEMON_SOCKET");
+        daemon.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_status_refreshing_preserves_last_good_stats() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let manifest_path = root.join(".skelesearch/manifest.db");
+        let server = startup_test_server(&root, &manifest_path).await?;
+
+        let provider = ArcProvider::new(TestProvider);
+        server.run_index(&root, provider).await?;
+
+        let baseline = server.index_status(IndexStatusInput { path: None }).await?;
+        let storage_dir = SkeleSearchServer::storage_dir_from_manifest_path(&manifest_path)?;
+        {
+            let mut state = server.index_state.write().await;
+            state.path = root.display().to_string();
+            state.storage_dir = storage_dir.display().to_string();
+            state.status = IndexingStatus::Running;
+            state.files_done = 1;
+            state.chunks_done = 1;
+            state.started_at = std::time::Instant::now();
+            state.error = None;
+        }
+
+        let refreshing = server.index_status(IndexStatusInput { path: None }).await?;
+        assert_eq!(
+            refreshing.freshness_state,
+            SkeleSearchServer::map_freshness_state(FreshnessState::Refreshing)
+        );
+        assert_eq!(refreshing.indexed_files, baseline.indexed_files);
+        assert_eq!(refreshing.total_chunks, baseline.total_chunks);
+        assert_eq!(refreshing.last_indexed, baseline.last_indexed);
+        assert!(refreshing.indexing.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_index_status_reports_local_watcher_state() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let manifest_path = root.join(".skelesearch/manifest.db");
+        let server = startup_test_server(&root, &manifest_path).await?;
+        server.backend.initialize(8).await?;
+        server.watcher_started.store(true, Ordering::Release);
+
+        let output = server
+            .mcp_index_status(Parameters(IndexStatusInput { path: None }))
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let status: serde_json::Value = serde_json::from_str(&output)?;
+        assert_eq!(status["watching"], true);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WatchRefreshQueue;
+
+    #[test]
+    fn watcher_followup_refresh_coalesces_mid_run_edits() {
+        let mut queue = WatchRefreshQueue::default();
+        assert!(queue.on_change_detected());
+        queue.mark_refresh_triggered();
+        assert!(queue.refresh_in_flight());
+        assert!(!queue.on_change_detected());
+        assert!(!queue.on_change_detected());
+        assert!(queue.mark_refresh_finished());
+        assert!(queue.refresh_in_flight());
+        assert!(!queue.mark_refresh_finished());
+        assert!(!queue.refresh_in_flight());
+    }
 }

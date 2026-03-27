@@ -127,13 +127,32 @@ pub struct IndexStatusOutput {
     pub total_chunks: usize,
     /// RFC 3339 timestamp of the most recent indexing run, if any.
     pub last_indexed: Option<String>,
-    /// Number of files that appear to have changed since last indexing (v1: always 0).
+    /// Best-effort manifest-based count of files that may be out of date.
+    /// This is not forced to zero just because indexing is currently idle.
     pub estimated_stale: usize,
-    /// Whether a watch process is running (v1: always false).
+    /// Freshness state derived from manifest truth plus the live refresh overlay.
+    /// `refreshing` means a refresh is in flight, `unknown` means the check failed,
+    /// and watcher state is reported separately via `watching`.
+    pub freshness_state: IndexFreshnessState,
+    /// RFC 3339 timestamp when freshness was checked, when available.
+    pub freshness_checked_at: Option<String>,
+    /// Error string when freshness could not be determined.
+    pub freshness_error: Option<String>,
+    /// Whether a background watcher is active for this server instance.
+    /// This does not imply the index is fresh.
     pub watching: bool,
     /// Live progress for an active or recently-completed background index.
     /// `null` when `index_codebase` has never been called on this server instance.
     pub indexing: Option<IndexingProgress>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessState {
+    Fresh,
+    Stale,
+    Refreshing,
+    Unknown,
 }
 
 /// Progress snapshot for a background `index_codebase` operation.
@@ -175,7 +194,6 @@ pub struct FileContextOutput {
     pub imports: Vec<String>,
     pub imported_by: Vec<String>,
 }
-
 
 /// Input for the `smart_search` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -414,4 +432,6 @@ pub struct GetRepoMapInput {
     pub project: Option<String>,
 }
 
-fn default_map_tokens() -> usize { 8192 }
+fn default_map_tokens() -> usize {
+    8192
+}

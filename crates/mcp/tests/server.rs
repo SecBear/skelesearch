@@ -16,23 +16,27 @@ use std::{
 };
 
 use async_trait::async_trait;
-use skelesearch_service::{
-    DaemonCapabilities, DaemonRequest, DaemonResponse, HandshakeResponse, ProjectKey, ProtocolFrame,
-    SearchCodeResponse as DaemonSearchCodeResponse, SearchResultRow as DaemonSearchResultRow,
+use skelesearch_core::{
+    try_acquire_indexing_lease, CozoBackend, EmbedProvider, Indexer, ManifestStore,
+    SharedIndexingStatus,
 };
+use skelesearch_mcp::{
+    server::{ArcProvider, SkeleSearchServer},
+    tools::{
+        GetFileContextInput, GetRepoMapInput, GetSymbolContextInput, IndexCodebaseInput,
+        IndexFreshnessState, IndexStatusInput, SearchCodeInput, SmartSearchInput,
+    },
+};
+use skelesearch_service::{
+    DaemonCapabilities, DaemonRequest, DaemonResponse, HandshakeResponse, ProjectKey,
+    ProtocolFrame, SearchCodeResponse as DaemonSearchCodeResponse,
+    SearchResultRow as DaemonSearchResultRow,
+};
+use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
     net::UnixListener,
 };
-use skelesearch_core::{CozoBackend, EmbedProvider, Indexer, ManifestStore};
-use skelesearch_mcp::{
-    server::{ArcProvider, SkeleSearchServer},
-    tools::{
-        GetFileContextInput, GetSymbolContextInput, IndexCodebaseInput, IndexStatusInput, SearchCodeInput,
-        SmartSearchInput,
-    },
-};
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // DeterministicTestProvider
@@ -96,10 +100,24 @@ fn env_lock() -> &'static StdMutex<()> {
     LOCK.get_or_init(|| StdMutex::new(()))
 }
 
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn spawn_stub_search_daemon(
     socket_path: &std::path::Path,
- ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
     let listener = UnixListener::bind(socket_path)?;
     Ok(tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
@@ -112,7 +130,8 @@ async fn spawn_stub_search_daemon(
                     DaemonRequest::Handshake(_) => ProtocolFrame::Response {
                         id,
                         response: DaemonResponse::Handshake(HandshakeResponse {
-                            protocol_version: skelesearch_service::DAEMON_PROTOCOL_VERSION.to_string(),
+                            protocol_version: skelesearch_service::DAEMON_PROTOCOL_VERSION
+                                .to_string(),
                             server_name: "stub-daemon".to_string(),
                             server_version: "0.1.0".to_string(),
                             capabilities: DaemonCapabilities {
@@ -121,6 +140,9 @@ async fn spawn_stub_search_daemon(
                                 index_status: true,
                                 search_code: true,
                                 smart_search: false,
+                                register_client: true,
+                                heartbeat: true,
+                                unregister_client: true,
                             },
                         }),
                     },
@@ -168,29 +190,60 @@ async fn spawn_stub_search_daemon(
 /// Uses `DeterministicTestProvider` so no network access is needed.
 /// Temp dirs are leaked; the test process cleans them up on exit.
 async fn test_server() -> anyhow::Result<SkeleSearchServer> {
-    let backend_dir = TempDir::new()?;
-    let manifest_dir = TempDir::new()?;
+    let project_dir = TempDir::new()?;
+    copy_dir_all(&fixture_repo_path()?, project_dir.path())?;
+    let storage_dir = project_dir.path().join(".skelesearch");
+    std::fs::create_dir_all(&storage_dir)?;
 
-    let backend_path = backend_dir.path().join("index.db");
-    let manifest_path = manifest_dir.path().join("manifest.db");
+    let backend_path = storage_dir.join("index.db");
+    let manifest_path = storage_dir.join("manifest.db");
 
     let backend = Arc::new(CozoBackend::open(&backend_path)?);
     let provider = det_provider();
 
-    // Pre-index the fixture so `search_code` tests have real results.
     {
         let manifest = Arc::new(ManifestStore::open(&manifest_path)?);
         let indexer = Indexer::new(Arc::clone(&backend), manifest, provider.clone());
-        indexer.index_path(&fixture_repo_path()?).await?;
+        indexer.index_path(project_dir.path()).await?;
     }
 
     let server = SkeleSearchServer::new(backend, &manifest_path, provider);
 
-    // Leak temp dirs — cleaned when the test process exits.
-    std::mem::forget(backend_dir);
-    std::mem::forget(manifest_dir);
+    std::mem::forget(project_dir);
 
     Ok(server)
+}
+
+async fn test_server_with_manifest_path() -> anyhow::Result<(SkeleSearchServer, PathBuf)> {
+    let project_dir = TempDir::new()?;
+    copy_dir_all(&fixture_repo_path()?, project_dir.path())?;
+    let storage_dir = project_dir.path().join(".skelesearch");
+    std::fs::create_dir_all(&storage_dir)?;
+
+    let backend_path = storage_dir.join("index.db");
+    let manifest_path = storage_dir.join("manifest.db");
+
+    let backend = Arc::new(CozoBackend::open(&backend_path)?);
+    let provider = det_provider();
+
+    {
+        let manifest = Arc::new(ManifestStore::open(&manifest_path)?);
+        let indexer = Indexer::new(Arc::clone(&backend), manifest, provider.clone());
+        indexer.index_path(project_dir.path()).await?;
+    }
+
+    let server = SkeleSearchServer::new(backend, &manifest_path, provider);
+
+    std::mem::forget(project_dir);
+
+    Ok((server, manifest_path))
+}
+
+fn mark_manifest_stale(manifest_path: &std::path::Path) {
+    let manifest = ManifestStore::open(manifest_path).expect("open manifest");
+    manifest
+        .upsert("src/deleted.rs", 1, 1, "fixture-hash")
+        .expect("insert stale manifest row");
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +370,10 @@ async fn search_code_output_exposes_spec_fields() -> anyhow::Result<()> {
                 session_id: None,
             })
             .await?;
-        assert!(!response.results.is_empty(), "expected at least one result from daemon-backed search");
+        assert!(
+            !response.results.is_empty(),
+            "expected at least one result from daemon-backed search"
+        );
         let row = &response.results[0];
         assert!(!row.file_path.is_empty());
         assert!(row.end_line >= row.start_line);
@@ -368,8 +424,16 @@ async fn index_codebase_returns_status_indexed_and_chunk_counts() -> anyhow::Res
     let out = server
         .run_index(&fixture_repo_path()?, det_provider())
         .await?;
-    assert!(out.indexed_files > 0, "expected indexed_files > 0 on first run, got {}", out.indexed_files);
-    assert!(out.total_chunks > 0, "expected total_chunks > 0, got {}", out.total_chunks);
+    assert!(
+        out.indexed_files > 0,
+        "expected indexed_files > 0 on first run, got {}",
+        out.indexed_files
+    );
+    assert!(
+        out.total_chunks > 0,
+        "expected total_chunks > 0, got {}",
+        out.total_chunks
+    );
     Ok(())
 }
 
@@ -392,10 +456,12 @@ async fn index_codebase_rejects_unknown_provider() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn index_status_exposes_estimated_stale_and_watching() -> anyhow::Result<()> {
-    // test_server() pre-indexed with DeterministicTestProvider; last_indexed should be set.
     let server = test_server().await?;
     let status = server.index_status(IndexStatusInput { path: None }).await?;
     assert_eq!(status.estimated_stale, 0);
+    assert_eq!(status.freshness_state, IndexFreshnessState::Fresh);
+    assert!(status.freshness_checked_at.is_some());
+    assert_eq!(status.freshness_error, None);
     assert!(!status.watching);
     assert!(
         status
@@ -406,6 +472,107 @@ async fn index_status_exposes_estimated_stale_and_watching() -> anyhow::Result<(
         "last_indexed should be RFC 3339, got: {:?}",
         status.last_indexed
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn index_status_reports_stale_freshness_for_missing_manifest_file() -> anyhow::Result<()> {
+    let (server, manifest_path) = test_server_with_manifest_path().await?;
+    mark_manifest_stale(&manifest_path);
+
+    let status = server.index_status(IndexStatusInput { path: None }).await?;
+    assert!(status.estimated_stale > 0);
+    assert_eq!(status.freshness_state, IndexFreshnessState::Stale);
+    assert!(status.freshness_checked_at.is_some());
+    assert_eq!(status.freshness_error, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_repo_map_prepends_warning_for_unknown_freshness() -> anyhow::Result<()> {
+    let (server, manifest_path) = test_server_with_manifest_path().await?;
+
+    let _ = std::fs::remove_file(&manifest_path);
+    std::fs::create_dir_all(&manifest_path)?;
+
+    let repo_map = server
+        .get_repo_map(GetRepoMapInput {
+            max_tokens: 4096,
+            include_symbols: true,
+            include_edges: true,
+            project: None,
+        })
+        .await?;
+    assert!(
+        repo_map.starts_with("⚠ Index freshness is unknown"),
+        "expected unknown freshness warning, got:\n{repo_map}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_repo_map_prepends_warning_for_stale_freshness() -> anyhow::Result<()> {
+    let (server, manifest_path) = test_server_with_manifest_path().await?;
+    mark_manifest_stale(&manifest_path);
+
+    let repo_map = server
+        .get_repo_map(GetRepoMapInput {
+            max_tokens: 4096,
+            include_symbols: true,
+            include_edges: true,
+            project: None,
+        })
+        .await?;
+    assert!(
+        repo_map.starts_with("⚠ ") && repo_map.contains("file(s) changed since last index"),
+        "expected stale freshness warning, got:\n{repo_map}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_repo_map_prepends_warning_for_refreshing_freshness() -> anyhow::Result<()> {
+    let (server, manifest_path) = test_server_with_manifest_path().await?;
+    let storage_dir = manifest_path
+        .parent()
+        .expect("manifest has storage dir")
+        .to_path_buf();
+
+    let now = chrono::Utc::now();
+    let status = SharedIndexingStatus {
+        instance_id: "test-instance".to_string(),
+        pid: std::process::id(),
+        path: fixture_repo_path()?.display().to_string(),
+        provider: "fastembed".to_string(),
+        trigger: "test".to_string(),
+        status: "running".to_string(),
+        started_at: now,
+        updated_at: now,
+        files_total: 10,
+        files_done: 1,
+        chunks_done: 2,
+        cache_hits: 0,
+        error: None,
+    };
+    let _lease = try_acquire_indexing_lease(&storage_dir, &status)?
+        .expect("acquire lease for refreshing repo-map test");
+
+    let repo_map = server
+        .get_repo_map(GetRepoMapInput {
+            max_tokens: 4096,
+            include_symbols: true,
+            include_edges: true,
+            project: None,
+        })
+        .await?;
+    assert!(
+        repo_map.starts_with("⚠ Index refresh is in progress"),
+        "expected refreshing warning, got:\n{repo_map}"
+    );
+
     Ok(())
 }
 
@@ -430,8 +597,13 @@ async fn smart_search_exact_symbol_prefers_grep() -> anyhow::Result<()> {
     assert_eq!(out.strategy, "grep");
     match out.results {
         skelesearch_mcp::tools::SmartSearchResults::Grep(rows) => {
-            assert!(!rows.is_empty(), "expected grep rows for exact symbol query");
-            assert!(rows.iter().any(|r| r.file_path.ends_with("src/old.rs") || r.file_path.ends_with("src/lib.rs")));
+            assert!(
+                !rows.is_empty(),
+                "expected grep rows for exact symbol query"
+            );
+            assert!(rows.iter().any(
+                |r| r.file_path.ends_with("src/old.rs") || r.file_path.ends_with("src/lib.rs")
+            ));
         }
         other => panic!("expected grep results, got {other:?}"),
     }
@@ -452,7 +624,11 @@ async fn get_symbol_context_returns_role_and_context() -> anyhow::Result<()> {
     assert!(ctx.symbol.is_some(), "expected symbol match");
     assert_eq!(ctx.match_count, 1);
     assert!(!ctx.ambiguous);
-    assert!(ctx.source.as_deref().unwrap_or("").contains("pub fn helper"));
+    assert!(ctx
+        .source
+        .as_deref()
+        .unwrap_or("")
+        .contains("pub fn helper"));
     assert!(ctx.role.is_some(), "expected non-null role");
     Ok(())
 }
