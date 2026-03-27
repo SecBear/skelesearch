@@ -84,11 +84,14 @@ async fn async_main() -> anyhow::Result<()> {
     let manifest_path = skelesearch_dir.join("manifest.db");
 
     let server = SkeleSearchServer::new(backend, &manifest_path, NoopProvider)
-        .with_default_project_root(if is_project { Some(project_root.clone()) } else { None });
+        .with_default_project_root(if is_project {
+            Some(project_root.clone())
+        } else {
+            None
+        });
 
     if let Some(addr_str) = args.http {
-        let addr: std::net::SocketAddr = addr_str.parse()
-            .context("invalid --http address")?;
+        let addr: std::net::SocketAddr = addr_str.parse().context("invalid --http address")?;
         tracing::info!(
             pid,
             cwd = %cwd.display(),
@@ -167,7 +170,9 @@ fn resolve_storage_dir(project_root: &std::path::Path) -> PathBuf {
 }
 
 fn env_flag(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn default_mcp_log_path() -> PathBuf {
@@ -183,7 +188,14 @@ fn looks_like_project_root(dir: &std::path::Path) -> bool {
     if dir.to_string_lossy() == "/" {
         return false;
     }
-    [".git", "Cargo.toml", "package.json", "pyproject.toml", "go.mod", ".skelesearch.toml"]
-        .iter()
-        .any(|marker| dir.join(marker).exists())
+    [
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        ".skelesearch.toml",
+    ]
+    .iter()
+    .any(|marker| dir.join(marker).exists())
 }

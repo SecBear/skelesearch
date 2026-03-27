@@ -265,7 +265,8 @@ fn write_pid_file(path: &Path, pid: u32) -> anyhow::Result<()> {
         .truncate(true)
         .open(path)
         .with_context(|| format!("open daemon pid file '{}'", path.display()))?;
-    writeln!(&mut file, "{pid}").with_context(|| format!("write daemon pid file '{}'", path.display()))?;
+    writeln!(&mut file, "{pid}")
+        .with_context(|| format!("write daemon pid file '{}'", path.display()))?;
     file.sync_all()
         .with_context(|| format!("sync daemon pid file '{}'", path.display()))?;
     Ok(())

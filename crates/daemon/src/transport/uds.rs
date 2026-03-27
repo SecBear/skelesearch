@@ -25,8 +25,9 @@ pub struct UdsListener {
 impl UdsListener {
     pub fn bind(socket_path: PathBuf, service: DaemonService) -> anyhow::Result<Self> {
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create daemon socket directory '{}'", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create daemon socket directory '{}'", parent.display())
+            })?;
         }
 
         #[cfg(unix)]
@@ -124,7 +125,10 @@ async fn handle_client(stream: UnixStream, service: DaemonService) -> anyhow::Re
 }
 
 #[cfg(unix)]
-async fn handle_incoming_frame(frame: ProtocolFrame, service: &DaemonService) -> Vec<ProtocolFrame> {
+async fn handle_incoming_frame(
+    frame: ProtocolFrame,
+    service: &DaemonService,
+) -> Vec<ProtocolFrame> {
     match frame {
         request @ ProtocolFrame::Request { .. } => {
             let (request_id, method) = match &request {
@@ -132,7 +136,11 @@ async fn handle_incoming_frame(frame: ProtocolFrame, service: &DaemonService) ->
                 _ => unreachable!(),
             };
             tracing::info!(request_id = request_id.0, method, "daemon request received");
-            service.handle_request_frame(request).await.into_frames().collect()
+            service
+                .handle_request_frame(request)
+                .await
+                .into_frames()
+                .collect()
         }
         ProtocolFrame::Ping => vec![ProtocolFrame::Pong],
         ProtocolFrame::Cancel { id } => {
@@ -178,7 +186,10 @@ where
     Ok(())
 }
 
-fn protocol_error_frame(message: impl Into<String>, request_id: Option<RequestId>) -> ProtocolFrame {
+fn protocol_error_frame(
+    message: impl Into<String>,
+    request_id: Option<RequestId>,
+) -> ProtocolFrame {
     ProtocolFrame::Event {
         stream_id: StreamId(0),
         event: DaemonEvent::ProtocolError(ProtocolErrorEvent {
@@ -208,6 +219,9 @@ fn request_method_name(request: &DaemonRequest) -> &'static str {
     match request {
         DaemonRequest::Handshake(_) => "handshake",
         DaemonRequest::Info(_) => "info",
+        DaemonRequest::RegisterClient(_) => "register_client",
+        DaemonRequest::Heartbeat(_) => "heartbeat",
+        DaemonRequest::UnregisterClient(_) => "unregister_client",
         DaemonRequest::IndexCodebase(_) => "index_codebase",
         DaemonRequest::IndexStatus(_) => "index_status",
         DaemonRequest::SearchCode(_) => "search_code",
@@ -220,8 +234,8 @@ mod tests {
     use super::*;
 
     use skelesearch_service::{
-        DAEMON_PROTOCOL_VERSION, DaemonRequest, DaemonResponse, HandshakeRequest, IndexStatusRequest,
-        InfoRequest, ProjectTarget, ProtocolFrame, RequestId,
+        DaemonRequest, DaemonResponse, HandshakeRequest, IndexStatusRequest, InfoRequest,
+        ProjectTarget, ProtocolFrame, RequestId, DAEMON_PROTOCOL_VERSION,
     };
     use tempfile::tempdir;
     use tokio::net::UnixStream;
@@ -338,6 +352,9 @@ mod tests {
                 assert_eq!(status.total_chunks, 0);
                 assert_eq!(status.last_indexed, None);
                 assert_eq!(status.estimated_stale, 0);
+                assert_eq!(status.freshness_state, skelesearch_service::IndexFreshnessState::Fresh);
+                assert!(status.freshness_checked_at.is_some());
+                assert_eq!(status.freshness_error, None);
                 assert!(!status.watching);
                 assert!(status.indexing.is_none());
             }
@@ -363,10 +380,7 @@ mod tests {
             .write_all(encoded.as_bytes())
             .await
             .expect("write frame");
-        write
-            .write_all(b"\n")
-            .await
-            .expect("write frame delimiter");
+        write.write_all(b"\n").await.expect("write frame delimiter");
         write.flush().await.expect("flush frame");
     }
 

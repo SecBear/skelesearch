@@ -155,7 +155,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time went backwards")
             .as_nanos();
-        std::env::temp_dir().join(format!("skelesearch-service-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "skelesearch-service-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -195,7 +198,8 @@ mod tests {
 
     #[test]
     fn relative_path_without_base_is_rejected() {
-        let err = ProjectKey::from_root_path("relative/path").expect_err("must reject relative path");
+        let err =
+            ProjectKey::from_root_path("relative/path").expect_err("must reject relative path");
         assert!(matches!(err, ProjectKeyError::RelativePathWithoutBase(_)));
     }
 }

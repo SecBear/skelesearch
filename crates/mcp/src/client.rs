@@ -6,10 +6,11 @@ use std::{
 use anyhow::Context as _;
 use async_trait::async_trait;
 use skelesearch_service::{
-    DAEMON_PROTOCOL_VERSION, DaemonErrorResponse, DaemonEvent, DaemonRequest, DaemonResponse,
-    HandshakeRequest, HandshakeResponse, IndexCodebaseRequest, IndexCodebaseResponse,
-    IndexStatusRequest, IndexStatusResponse, ProtocolFrame, ProjectTarget, RequestId,
-    SearchCodeRequest, SearchCodeResponse,
+    DaemonErrorResponse, DaemonEvent, DaemonRequest, DaemonResponse, HandshakeRequest,
+    HandshakeResponse, HeartbeatRequest, HeartbeatResponse, IndexCodebaseRequest,
+    IndexCodebaseResponse, IndexStatusRequest, IndexStatusResponse, ProjectTarget, ProtocolFrame,
+    RegisterClientRequest, RegisterClientResponse, RequestId, SearchCodeRequest,
+    SearchCodeResponse, UnregisterClientRequest, UnregisterClientResponse, DAEMON_PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use skelesearch_service::{InfoRequest, InfoResponse};
@@ -80,6 +81,10 @@ impl std::fmt::Display for DaemonEndpoint {
 #[async_trait]
 pub(super) trait DaemonConnector: Send + Sync + 'static {
     async fn connect(&self, endpoint: &DaemonEndpoint) -> anyhow::Result<BoxedIo>;
+    async fn start_daemon(&self, endpoint: &DaemonEndpoint) -> anyhow::Result<()> {
+        let _ = endpoint;
+        anyhow::bail!("daemon auto-start is not supported by this connector")
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,9 +97,12 @@ impl DaemonConnector for TokioDaemonConnector {
             DaemonEndpoint::UnixSocket(path) => {
                 #[cfg(unix)]
                 {
-                    let stream = tokio::net::UnixStream::connect(path)
-                        .await
-                        .with_context(|| format!("connect to daemon unix socket '{}'", path.display()))?;
+                    let stream =
+                        tokio::net::UnixStream::connect(path)
+                            .await
+                            .with_context(|| {
+                                format!("connect to daemon unix socket '{}'", path.display())
+                            })?;
                     Ok(Box::new(stream))
                 }
 
@@ -111,6 +119,28 @@ impl DaemonConnector for TokioDaemonConnector {
                 Ok(Box::new(stream))
             }
         }
+    }
+
+    async fn start_daemon(&self, endpoint: &DaemonEndpoint) -> anyhow::Result<()> {
+        let program = daemon_program_for_endpoint(endpoint)?;
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .arg("--managed")
+            .arg("--idle-timeout-seconds")
+            .arg("300");
+
+        if let DaemonEndpoint::UnixSocket(path) = endpoint {
+            command.arg("--socket").arg(path);
+        }
+
+        command
+            .spawn()
+            .with_context(|| format!("spawn skelesearch daemon via '{}'", program.display()))?;
+
+        Ok(())
     }
 }
 
@@ -174,6 +204,91 @@ where
         }
     }
 
+    pub async fn register_client(
+        &self,
+        client_name: Option<String>,
+        client_version: Option<String>,
+    ) -> anyhow::Result<RegisterClientResponse> {
+        let handshake = self.handshake().await?;
+        if !handshake.capabilities.register_client {
+            anyhow::bail!(
+                "daemon at {} does not advertise register_client capability",
+                self.endpoint
+            );
+        }
+
+        let response = self
+            .request_response(DaemonRequest::RegisterClient(RegisterClientRequest {
+                client_name,
+                client_version,
+            }))
+            .await?;
+
+        match response {
+            DaemonResponse::RegisterClient(response) => Ok(response),
+            DaemonResponse::Error(err) => Err(daemon_method_error("register_client", &err)),
+            other => anyhow::bail!(
+                "daemon protocol violation: expected register_client response, got {}",
+                response_kind(&other)
+            ),
+        }
+    }
+
+    pub async fn heartbeat(
+        &self,
+        session_id: impl Into<String>,
+    ) -> anyhow::Result<HeartbeatResponse> {
+        let handshake = self.handshake().await?;
+        if !handshake.capabilities.heartbeat {
+            anyhow::bail!(
+                "daemon at {} does not advertise heartbeat capability",
+                self.endpoint
+            );
+        }
+
+        let response = self
+            .request_response(DaemonRequest::Heartbeat(HeartbeatRequest {
+                session_id: session_id.into(),
+            }))
+            .await?;
+
+        match response {
+            DaemonResponse::Heartbeat(response) => Ok(response),
+            DaemonResponse::Error(err) => Err(daemon_method_error("heartbeat", &err)),
+            other => anyhow::bail!(
+                "daemon protocol violation: expected heartbeat response, got {}",
+                response_kind(&other)
+            ),
+        }
+    }
+
+    pub async fn unregister_client(
+        &self,
+        session_id: impl Into<String>,
+    ) -> anyhow::Result<UnregisterClientResponse> {
+        let handshake = self.handshake().await?;
+        if !handshake.capabilities.unregister_client {
+            anyhow::bail!(
+                "daemon at {} does not advertise unregister_client capability",
+                self.endpoint
+            );
+        }
+
+        let response = self
+            .request_response(DaemonRequest::UnregisterClient(UnregisterClientRequest {
+                session_id: session_id.into(),
+            }))
+            .await?;
+
+        match response {
+            DaemonResponse::UnregisterClient(response) => Ok(response),
+            DaemonResponse::Error(err) => Err(daemon_method_error("unregister_client", &err)),
+            other => anyhow::bail!(
+                "daemon protocol violation: expected unregister_client response, got {}",
+                response_kind(&other)
+            ),
+        }
+    }
 
     pub async fn index_codebase(
         &self,
@@ -228,7 +343,10 @@ where
         }
     }
 
-    pub async fn search_code(&self, request: SearchCodeRequest) -> anyhow::Result<SearchCodeResponse> {
+    pub async fn search_code(
+        &self,
+        request: SearchCodeRequest,
+    ) -> anyhow::Result<SearchCodeResponse> {
         let handshake = self.handshake().await?;
         if !handshake.capabilities.search_code {
             anyhow::bail!(
@@ -328,12 +446,45 @@ where
     }
 
     async fn connect(&self) -> anyhow::Result<ClientConnection> {
-        let stream = self.connector.connect(&self.endpoint).await.with_context(|| {
-            format!(
-                "unable to reach skelesearch daemon at {}. Start it with `skelesearchd` or set {}",
-                self.endpoint, DAEMON_SOCKET_ENV
-            )
-        })?;
+        match self.connect_once().await {
+            Ok(connection) => Ok(connection),
+            Err(first_err) => {
+                self.connector
+                    .start_daemon(&self.endpoint)
+                    .await
+                    .with_context(|| {
+                        format!(
+"unable to reach skelesearch daemon at {}. attempted auto-start via `skelesearchd`"
+ , self.endpoint)
+                    })?;
+
+                for _ in 0..30 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if let Ok(connection) = self.connect_once().await {
+                        return Ok(connection);
+                    }
+                }
+
+                Err(first_err).with_context(|| {
+                    format!(
+                        "unable to reach skelesearch daemon at {} after auto-start attempt",
+                        self.endpoint
+                    )
+                })
+            }
+        }
+    }
+
+    async fn connect_once(&self) -> anyhow::Result<ClientConnection> {
+        let stream = self
+            .connector
+            .connect(&self.endpoint)
+            .await
+            .with_context(|| {
+                format!(
+"unable to reach skelesearch daemon at {}. Start it with `skelesearchd` or set {}"
+ , self.endpoint, DAEMON_SOCKET_ENV)
+            })?;
         let (read_half, write_half) = tokio::io::split(stream);
         let lines = BufReader::new(read_half).lines();
 
@@ -343,7 +494,6 @@ where
             handshake: None,
         })
     }
-
     async fn send_request_locked(
         &self,
         guard: &mut Option<ClientConnection>,
@@ -370,7 +520,9 @@ where
                 .next_line()
                 .await
                 .context("read daemon response frame")?
-                .ok_or_else(|| anyhow::anyhow!("daemon connection closed while waiting for response"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("daemon connection closed while waiting for response")
+                })?;
 
             if line.trim().is_empty() {
                 continue;
@@ -380,7 +532,9 @@ where
                 .with_context(|| format!("decode daemon response frame '{line}'"))?;
 
             match incoming {
-                ProtocolFrame::Response { id, response } if id == request_id => return Ok(response),
+                ProtocolFrame::Response { id, response } if id == request_id => {
+                    return Ok(response)
+                }
                 ProtocolFrame::Response { id, .. } => {
                     anyhow::bail!(
                         "daemon protocol violation: received response id {} while waiting for {}",
@@ -445,6 +599,9 @@ fn response_kind(response: &DaemonResponse) -> &'static str {
     match response {
         DaemonResponse::Handshake(_) => "handshake",
         DaemonResponse::Info(_) => "info",
+        DaemonResponse::RegisterClient(_) => "register_client",
+        DaemonResponse::Heartbeat(_) => "heartbeat",
+        DaemonResponse::UnregisterClient(_) => "unregister_client",
         DaemonResponse::IndexCodebase(_) => "index_codebase",
         DaemonResponse::IndexStatus(_) => "index_status",
         DaemonResponse::SearchCode(_) => "search_code",
@@ -499,18 +656,185 @@ fn absolutize(path: PathBuf) -> PathBuf {
         .join(path)
 }
 
+fn daemon_program_for_endpoint(endpoint: &DaemonEndpoint) -> anyhow::Result<PathBuf> {
+    let _ = endpoint;
+    let current_exe = std::env::current_exe().context("resolve current executable path")?;
+    let current_dir = current_exe
+        .parent()
+        .map(PathBuf::from)
+        .context("resolve current executable directory")?;
+
+    let sibling_name = if cfg!(windows) {
+        "skelesearchd.exe"
+    } else {
+        "skelesearchd"
+    };
+    let sibling = current_dir.join(sibling_name);
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+
+    Ok(PathBuf::from("skelesearchd"))
+}
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    use skelesearch_service::protocol::{IndexFreshnessState, IndexingState};
     use skelesearch_service::{
-        DaemonCapabilities, DaemonRequest, DaemonResponse, HandshakeResponse,
-        IndexStatusResponse,
+        DaemonCapabilities, DaemonRequest, DaemonResponse, HandshakeResponse, IndexStatusResponse,
     };
-    use skelesearch_service::protocol::IndexingState;
     use tempfile::tempdir;
     use tokio::{io::BufReader, net::UnixListener};
+
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    #[derive(Clone)]
+    struct AutoStartConnector {
+        socket_path: PathBuf,
+        state: Arc<AsyncMutex<AutoStartState>>,
+    }
+
+    struct AutoStartState {
+        started: bool,
+        start_calls: usize,
+        server_task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl AutoStartConnector {
+        fn new(socket_path: PathBuf) -> Self {
+            Self {
+                socket_path,
+                state: Arc::new(AsyncMutex::new(AutoStartState {
+                    started: false,
+                    start_calls: 0,
+                    server_task: None,
+                })),
+            }
+        }
+
+        async fn start_calls(&self) -> usize {
+            self.state.lock().await.start_calls
+        }
+
+        async fn join_server(&self) {
+            if let Some(task) = self.state.lock().await.server_task.take() {
+                task.await.expect("server task join");
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DaemonConnector for AutoStartConnector {
+        async fn connect(&self, endpoint: &DaemonEndpoint) -> anyhow::Result<BoxedIo> {
+            assert_eq!(endpoint, &DaemonEndpoint::unix(self.socket_path.clone()));
+            if !self.state.lock().await.started {
+                anyhow::bail!("daemon not started")
+            }
+            let stream = tokio::net::UnixStream::connect(&self.socket_path)
+                .await
+                .expect("connect to auto-started daemon");
+            Ok(Box::new(stream))
+        }
+
+        async fn start_daemon(&self, endpoint: &DaemonEndpoint) -> anyhow::Result<()> {
+            assert_eq!(endpoint, &DaemonEndpoint::unix(self.socket_path.clone()));
+            let mut state = self.state.lock().await;
+            state.start_calls += 1;
+            if state.started {
+                return Ok(());
+            }
+            state.started = true;
+
+            let listener = UnixListener::bind(&self.socket_path).expect("bind test listener");
+            state.server_task = Some(tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let (read_half, mut write_half) = stream.into_split();
+                let mut lines = BufReader::new(read_half).lines();
+
+                let mut handled = 0usize;
+                while let Some(line) = lines.next_line().await.expect("read line") {
+                    let frame: ProtocolFrame = serde_json::from_str(&line).expect("decode frame");
+                    let ProtocolFrame::Request { id, request } = frame else {
+                        panic!("expected request frame");
+                    };
+
+                    let response = match request {
+                        DaemonRequest::Handshake(_) => ProtocolFrame::Response {
+                            id,
+                            response: DaemonResponse::Handshake(HandshakeResponse {
+                                protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+                                server_name: "auto-start-daemon".to_string(),
+                                server_version: "0.1.0".to_string(),
+                                capabilities: DaemonCapabilities {
+                                    info: true,
+                                    index_codebase: true,
+                                    index_status: true,
+                                    search_code: false,
+                                    smart_search: false,
+                                    register_client: true,
+                                    heartbeat: true,
+                                    unregister_client: true,
+                                },
+                            }),
+                        },
+                        DaemonRequest::Info(_) => ProtocolFrame::Response {
+                            id,
+                            response: DaemonResponse::Info(InfoResponse {
+                                protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+                                server_name: "auto-start-daemon".to_string(),
+                                server_version: "0.1.0".to_string(),
+                                capabilities: DaemonCapabilities {
+                                    info: true,
+                                    index_codebase: true,
+                                    index_status: true,
+                                    search_code: false,
+                                    smart_search: false,
+                                    register_client: true,
+                                    heartbeat: true,
+                                    unregister_client: true,
+                                },
+                            }),
+                        },
+                        other => panic!("unexpected request: {other:?}"),
+                    };
+
+                    let encoded = serde_json::to_string(&response).expect("encode response");
+                    write_half
+                        .write_all(encoded.as_bytes())
+                        .await
+                        .expect("write response");
+                    write_half
+                        .write_all(b"\n")
+                        .await
+                        .expect("write response delimiter");
+                    write_half.flush().await.expect("flush response");
+
+                    handled += 1;
+                    if handled >= 2 {
+                        break;
+                    }
+                }
+            }));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_client_auto_starts_daemon_when_socket_is_missing() {
+        let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let connector = AutoStartConnector::new(socket_path.clone());
+        let client = DaemonClient::new(DaemonEndpoint::unix(socket_path), connector.clone());
+
+        let info = client.info().await.expect("info response");
+
+        assert_eq!(info.server_name, "auto-start-daemon");
+        assert_eq!(connector.start_calls().await, 1);
+        connector.join_server().await;
+    }
 
     #[tokio::test]
     async fn daemon_client_reuses_connection_for_handshake_info_and_index_status() {
@@ -543,6 +867,9 @@ mod tests {
                                 index_status: true,
                                 search_code: false,
                                 smart_search: false,
+                                register_client: true,
+                                heartbeat: true,
+                                unregister_client: true,
                             },
                         }),
                     },
@@ -558,6 +885,9 @@ mod tests {
                                 index_status: true,
                                 search_code: false,
                                 smart_search: false,
+                                register_client: true,
+                                heartbeat: true,
+                                unregister_client: true,
                             },
                         }),
                     },
@@ -565,18 +895,22 @@ mod tests {
                         id,
                         response: DaemonResponse::IndexStatus(IndexStatusResponse {
                             project_key: match request.target {
-                                ProjectTarget::RootPath { root_path, logical_id } => {
-                                    skelesearch_service::ProjectKey {
-                                        canonical_root: root_path,
-                                        logical_id,
-                                    }
-                                }
+                                ProjectTarget::RootPath {
+                                    root_path,
+                                    logical_id,
+                                } => skelesearch_service::ProjectKey {
+                                    canonical_root: root_path,
+                                    logical_id,
+                                },
                                 ProjectTarget::ProjectKey { project_key } => project_key,
                             },
                             indexed_files: 7,
                             total_chunks: 14,
                             last_indexed: Some("2026-01-01T00:00:00Z".to_string()),
                             estimated_stale: 0,
+                            freshness_state: IndexFreshnessState::Fresh,
+                            freshness_checked_at: Some("2026-01-01T00:00:00Z".to_string()),
+                            freshness_error: None,
                             watching: false,
                             indexing: Some(skelesearch_service::IndexingProgress {
                                 status: IndexingState::Running,

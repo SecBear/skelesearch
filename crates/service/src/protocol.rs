@@ -21,10 +21,21 @@ pub struct StreamId(pub u64);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum ProtocolFrame {
-    Request { id: RequestId, request: DaemonRequest },
-    Response { id: RequestId, response: DaemonResponse },
-    Event { stream_id: StreamId, event: DaemonEvent },
-    Cancel { id: RequestId },
+    Request {
+        id: RequestId,
+        request: DaemonRequest,
+    },
+    Response {
+        id: RequestId,
+        response: DaemonResponse,
+    },
+    Event {
+        stream_id: StreamId,
+        event: DaemonEvent,
+    },
+    Cancel {
+        id: RequestId,
+    },
     Ping,
     Pong,
 }
@@ -75,6 +86,9 @@ pub struct ProtocolErrorEvent {
 pub enum DaemonRequest {
     Handshake(HandshakeRequest),
     Info(InfoRequest),
+    RegisterClient(RegisterClientRequest),
+    Heartbeat(HeartbeatRequest),
+    UnregisterClient(UnregisterClientRequest),
     IndexCodebase(IndexCodebaseRequest),
     IndexStatus(IndexStatusRequest),
     SearchCode(SearchCodeRequest),
@@ -86,6 +100,9 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Handshake(HandshakeResponse),
     Info(InfoResponse),
+    RegisterClient(RegisterClientResponse),
+    Heartbeat(HeartbeatResponse),
+    UnregisterClient(UnregisterClientResponse),
     IndexCodebase(IndexCodebaseResponse),
     IndexStatus(IndexStatusResponse),
     SearchCode(SearchCodeResponse),
@@ -97,7 +114,9 @@ pub enum DaemonResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum ProjectTarget {
-    ProjectKey { project_key: ProjectKey },
+    ProjectKey {
+        project_key: ProjectKey,
+    },
     RootPath {
         /// Absolute path on the daemon host.
         root_path: String,
@@ -157,6 +176,12 @@ pub struct DaemonCapabilities {
     pub search_code: bool,
     #[serde(default)]
     pub smart_search: bool,
+    #[serde(default)]
+    pub register_client: bool,
+    #[serde(default)]
+    pub heartbeat: bool,
+    #[serde(default)]
+    pub unregister_client: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -169,6 +194,43 @@ pub struct InfoResponse {
     pub server_version: String,
     #[serde(default)]
     pub capabilities: DaemonCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterClientRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterClientResponse {
+    pub session_id: String,
+    pub heartbeat_interval_seconds: u64,
+    pub lease_ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeartbeatRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeartbeatResponse {
+    pub session_id: String,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnregisterClientRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnregisterClientResponse {
+    pub session_id: String,
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,8 +268,24 @@ pub struct IndexStatusResponse {
     pub total_chunks: usize,
     pub last_indexed: Option<String>,
     pub estimated_stale: usize,
+    #[serde(default)]
+    pub freshness_state: IndexFreshnessState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_checked_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_error: Option<String>,
     pub watching: bool,
     pub indexing: Option<IndexingProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessState {
+    Fresh,
+    Stale,
+    Refreshing,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -343,6 +421,7 @@ const fn default_diversity() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn fixture_project_key() -> ProjectKey {
         ProjectKey {
@@ -437,8 +516,10 @@ mod tests {
 
         let decoded_cancel: ProtocolFrame =
             serde_json::from_str(&encoded_cancel).expect("deserialize cancel");
-        let decoded_ping: ProtocolFrame = serde_json::from_str(&encoded_ping).expect("deserialize ping");
-        let decoded_pong: ProtocolFrame = serde_json::from_str(&encoded_pong).expect("deserialize pong");
+        let decoded_ping: ProtocolFrame =
+            serde_json::from_str(&encoded_ping).expect("deserialize ping");
+        let decoded_pong: ProtocolFrame =
+            serde_json::from_str(&encoded_pong).expect("deserialize pong");
 
         assert_eq!(decoded_cancel, cancel);
         assert_eq!(decoded_ping, ping);
@@ -452,5 +533,67 @@ mod tests {
 
         assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
         assert_eq!(response.protocol_version, DAEMON_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn protocol_client_session_frames_round_trip() {
+        let register = ProtocolFrame::Request {
+            id: RequestId(77),
+            request: DaemonRequest::RegisterClient(RegisterClientRequest {
+                client_name: Some("skelesearch-mcp".to_string()),
+                client_version: Some("0.1.0".to_string()),
+            }),
+        };
+        let heartbeat = ProtocolFrame::Request {
+            id: RequestId(78),
+            request: DaemonRequest::Heartbeat(HeartbeatRequest {
+                session_id: "session-123".to_string(),
+            }),
+        };
+        let unregister = ProtocolFrame::Response {
+            id: RequestId(79),
+            response: DaemonResponse::UnregisterClient(UnregisterClientResponse {
+                session_id: "session-123".to_string(),
+                removed: true,
+            }),
+        };
+
+        let encoded_register = serde_json::to_string(&register).expect("serialize register");
+        let encoded_heartbeat = serde_json::to_string(&heartbeat).expect("serialize heartbeat");
+        let encoded_unregister = serde_json::to_string(&unregister).expect("serialize unregister");
+
+        let decoded_register: ProtocolFrame =
+            serde_json::from_str(&encoded_register).expect("deserialize register");
+        let decoded_heartbeat: ProtocolFrame =
+            serde_json::from_str(&encoded_heartbeat).expect("deserialize heartbeat");
+        let decoded_unregister: ProtocolFrame =
+            serde_json::from_str(&encoded_unregister).expect("deserialize unregister");
+
+        assert_eq!(decoded_register, register);
+        assert_eq!(decoded_heartbeat, heartbeat);
+        assert_eq!(decoded_unregister, unregister);
+    }
+
+    #[test]
+    fn index_status_response_deserializes_legacy_payload_without_freshness_fields() {
+        let payload = json!({
+            "project_key": {
+                "canonical_root": "/tmp/example",
+                "logical_id": null
+            },
+            "indexed_files": 0,
+            "total_chunks": 0,
+            "last_indexed": null,
+            "estimated_stale": 0,
+            "watching": false,
+            "indexing": null
+        });
+
+        let decoded: IndexStatusResponse =
+            serde_json::from_value(payload).expect("legacy index status should deserialize");
+
+        assert_eq!(decoded.freshness_state, IndexFreshnessState::Unknown);
+        assert_eq!(decoded.freshness_checked_at, None);
+        assert_eq!(decoded.freshness_error, None);
     }
 }
