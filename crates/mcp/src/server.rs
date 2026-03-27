@@ -333,7 +333,8 @@ impl SkeleSearchServer {
         let manifest_path = Arc::new(manifest_path.into());
         let instance_id = new_instance_id();
         let daemon_client = Arc::new(DaemonClient::from_env());
-        let default_project_root = Self::project_root_from_manifest_path(manifest_path.as_ref()).ok();
+        let default_project_root =
+            Self::project_root_from_manifest_path(manifest_path.as_ref()).ok();
         tracing::info!(
             instance_id = %instance_id,
             pid = std::process::id(),
@@ -552,7 +553,8 @@ impl SkeleSearchServer {
             }
         };
 
-        let (backend_path, manifest_path) = Self::resolve_index_paths_for_project_root(&project_root)?;
+        let (backend_path, manifest_path) =
+            Self::resolve_index_paths_for_project_root(&project_root)?;
 
         // Check cache first
         {
@@ -611,7 +613,9 @@ impl SkeleSearchServer {
             })
     }
 
-    fn resolve_index_paths_for_project_root(project_root: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    fn resolve_index_paths_for_project_root(
+        project_root: &Path,
+    ) -> anyhow::Result<(PathBuf, PathBuf)> {
         let storage_dir = project_root.join(".skelesearch");
         std::fs::create_dir_all(&storage_dir)
             .with_context(|| format!("create .skelesearch at {}", storage_dir.display()))?;
@@ -628,7 +632,10 @@ impl SkeleSearchServer {
             }
         }
 
-        Ok((storage_dir.join(INDEX_DB_FILE), storage_dir.join(MANIFEST_DB_FILE)))
+        Ok((
+            storage_dir.join(INDEX_DB_FILE),
+            storage_dir.join(MANIFEST_DB_FILE),
+        ))
     }
 
     fn persisted_provider_name_from_manifest(
@@ -822,7 +829,10 @@ impl SkeleSearchServer {
             return;
         }
 
-        let (_backend_for_target, manifest_path) = match self.resolve_backend(Some(cwd.to_string_lossy().as_ref())).await {
+        let (_backend_for_target, manifest_path) = match self
+            .resolve_backend(Some(cwd.to_string_lossy().as_ref()))
+            .await
+        {
             Ok(resolved) => resolved,
             Err(err) => {
                 tracing::warn!(
@@ -919,8 +929,7 @@ impl SkeleSearchServer {
         }
 
         let provider_name = {
-            let manifest = ManifestStore::open(manifest_path)
-                .context("failed to open manifest")?;
+            let manifest = ManifestStore::open(manifest_path).context("failed to open manifest")?;
             manifest
                 .get_meta("provider")
                 .context("failed to read provider from manifest")?
@@ -1040,7 +1049,6 @@ impl SkeleSearchServer {
                 }
             });
 
-
         // SKELESEARCH_RERANKER=qwen3 enables the Qwen3-Reranker-0.6B.
         // Requires the `qwen3` cargo feature; emits a warning when the env
         // var is set but the feature is absent so operators get clear feedback.
@@ -1125,7 +1133,9 @@ impl SkeleSearchServer {
 
         tracing::info!("searcher cache miss — building searcher");
         let t0 = std::time::Instant::now();
-        let provider = self.prepare_search_provider(&backend, &manifest_path).await?;
+        let provider = self
+            .prepare_search_provider(&backend, &manifest_path)
+            .await?;
         tracing::info!(
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "prepare_search_provider done"
@@ -1583,7 +1593,10 @@ impl SkeleSearchServer {
         let (backend, manifest_path) = self.resolve_backend(input.path.as_deref()).await?;
         let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
         let indexing = self.current_indexing_progress(&storage_dir).await;
-        let refreshing = matches!(indexing.as_ref().map(|p| p.status.as_str()), Some("running"));
+        let refreshing = matches!(
+            indexing.as_ref().map(|p| p.status.as_str()),
+            Some("running")
+        );
         let freshness = Self::compute_freshness_snapshot(&manifest_path, refreshing);
         let stats = match backend.stats().await {
             Ok(s) => Some(s),
@@ -2474,7 +2487,10 @@ impl SkeleSearchServer {
         let data = backend.get_repo_map_data().await?;
         let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
         let indexing = self.current_indexing_progress(&storage_dir).await;
-        let refreshing = matches!(indexing.as_ref().map(|p| p.status.as_str()), Some("running"));
+        let refreshing = matches!(
+            indexing.as_ref().map(|p| p.status.as_str()),
+            Some("running")
+        );
         let freshness = Self::compute_freshness_snapshot(&manifest_path, refreshing);
         let mut out = render_repo_map(&data, &input);
         if let Some(warning) = Self::repo_map_warning_prefix(&freshness) {
@@ -2787,6 +2803,7 @@ async fn maintain_daemon_session(
     let client_version = Some(env!("CARGO_PKG_VERSION").to_string());
     let mut active_session: Option<String> = None;
     let mut heartbeat_interval = Duration::from_secs(20);
+    let mut registration_backoff = Duration::from_secs(1);
 
     loop {
         if *shutdown_rx.borrow() {
@@ -2808,21 +2825,25 @@ async fn maintain_daemon_session(
                     lease_ttl_s = registered.lease_ttl_seconds,
                     "registered daemon client session"
                                         );
+                    registration_backoff = Duration::from_secs(1);
                     active_session = Some(registered.session_id);
                 }
                 Err(err) => {
+                    let next_backoff = (registration_backoff * 2).min(Duration::from_secs(30));
                     tracing::warn!(
                     instance_id = %instance_id,
                     error = %err,
+                    retry_in_s = next_backoff.as_secs(),
                     "failed to register daemon client session; retrying"
                                         );
+                    registration_backoff = next_backoff;
                     tokio::select! {
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 break;
                             }
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = tokio::time::sleep(registration_backoff) => {}
                     }
                     continue;
                 }
@@ -2906,12 +2927,12 @@ impl ServerHandler for SkeleSearchServer {
         _context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
-            tracing::info!("on_initialized: called — triggering daemon session / auto-index check");
-            self.ensure_daemon_session().await;
+            tracing::info!("on_initialized: called");
             if self.inert_mode {
-                tracing::info!(instance_id = %self.instance_id, "on_initialized: inert mode, skipping auto-index, watcher, and health check");
+                tracing::info!(instance_id = %self.instance_id, "on_initialized: inert mode, skipping daemon session, auto-index, watcher, and health check");
                 return;
             }
+            self.ensure_daemon_session().await;
             self.auto_index_if_needed().await;
             self.start_file_watcher_if_enabled().await;
             let health_result = match self.resolve_backend(None).await {
@@ -3002,14 +3023,16 @@ async fn trigger_watcher_refresh(
 ) -> anyhow::Result<IndexCodebaseOutput> {
     // Determine the provider name from the persisted manifest so the
     // re-index uses the same embedding model as the original index.
-    let (_backend, manifest_path) = server.resolve_backend(Some(root.to_string_lossy().as_ref())).await?;
+    let (_backend, manifest_path) = server
+        .resolve_backend(Some(root.to_string_lossy().as_ref()))
+        .await?;
     let provider_name = SkeleSearchServer::persisted_provider_name_from_manifest(&manifest_path)?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "watcher: cannot determine provider from active manifest at {}",
-                manifest_path.display()
-            )
-        })?;
+        anyhow::anyhow!(
+            "watcher: cannot determine provider from active manifest at {}",
+            manifest_path.display()
+        )
+    })?;
 
     server
         .proxy_index_codebase_via_daemon(IndexCodebaseInput {
@@ -3512,7 +3535,11 @@ mod startup_tests {
         std::env::set_current_dir(original_dir)?;
 
         let requests = index_requests.lock().await;
-        assert_eq!(requests.len(), 1, "expected stale startup refresh to queue one indexing run");
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected stale startup refresh to queue one indexing run"
+        );
         assert_eq!(requests[0].as_deref(), Some("openai"));
 
         std::env::remove_var("SKELESEARCH_DAEMON_SOCKET");
@@ -3546,7 +3573,10 @@ mod startup_tests {
         std::env::set_current_dir(original_dir)?;
 
         let requests = index_requests.lock().await;
-        assert!(requests.is_empty(), "fresh startup should not queue indexing");
+        assert!(
+            requests.is_empty(),
+            "fresh startup should not queue indexing"
+        );
 
         std::env::remove_var("SKELESEARCH_DAEMON_SOCKET");
         daemon.abort();
@@ -3562,14 +3592,20 @@ mod startup_tests {
         let server = startup_test_server(&root, &manifest_path).await?;
 
         let manifest_a = write_active_generation_fixture(&root, "gen-a", "openai")?;
-        let (_backend_a, resolved_a) = server.resolve_backend(Some(root.to_string_lossy().as_ref())).await?;
+        let (_backend_a, resolved_a) = server
+            .resolve_backend(Some(root.to_string_lossy().as_ref()))
+            .await?;
         assert_eq!(resolved_a, manifest_a);
 
         let manifest_b = write_active_generation_fixture(&root, "gen-b", "voyage")?;
-        let (_backend_b, resolved_b) = server.resolve_backend(Some(root.to_string_lossy().as_ref())).await?;
+        let (_backend_b, resolved_b) = server
+            .resolve_backend(Some(root.to_string_lossy().as_ref()))
+            .await?;
         assert_eq!(resolved_b, manifest_b);
         assert_eq!(
-            ManifestStore::open(&resolved_b)?.get_meta("provider")?.as_deref(),
+            ManifestStore::open(&resolved_b)?
+                .get_meta("provider")?
+                .as_deref(),
             Some("voyage")
         );
 

@@ -449,16 +449,35 @@ where
         match self.connect_once().await {
             Ok(connection) => Ok(connection),
             Err(first_err) => {
+                // Derive a short jitter from the low bits of the current wall clock
+                // to decohere concurrent MCP sessions that all detect a dead daemon
+                // at the same instant. No `rand` dependency needed.
+                let jitter_ms = u64::from(
+                    (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos()
+                        % 400) as u16,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+
+                // Re-probe after jitter: a sibling session may have already
+                // started the daemon during our sleep.
+                if let Ok(connection) = self.connect_once().await {
+                    return Ok(connection);
+                }
+
                 self.connector
                     .start_daemon(&self.endpoint)
                     .await
                     .with_context(|| {
                         format!(
 "unable to reach skelesearch daemon at {}. attempted auto-start via `skelesearchd`"
- , self.endpoint)
+, self.endpoint)
                     })?;
 
-                for _ in 0..30 {
+                // Poll for socket readiness; 50×100ms = 5 s.
+                for _ in 0..50 {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     if let Ok(connection) = self.connect_once().await {
                         return Ok(connection);
