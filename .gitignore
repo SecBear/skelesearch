@@ -3,9 +3,6 @@
 # Reproducible builds require pinned dependencies across machines.
 crates/cli/.fastembed_cache/
 
-.brain/
-.fastembed_cache/
-.skelesearch/
 .env*
 !.envrc
 benchmarks/repos/
@@ -25,3 +22,7 @@ swebench-repos/
 /skills/
 /docs/superpowers/
 /.omp/*.log
+.sisyphus/
+.brain/
+.fastembed_cache/
+.skelesearch/

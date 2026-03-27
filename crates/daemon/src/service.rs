@@ -919,6 +919,21 @@ async fn run_real_index(
                     }
                 }
             }
+            // Test bypass: use TestProvider when SKELESEARCH_TEST_PROVIDER_DIM is set.
+            // This prevents tests from requiring the real fastembed model download.
+            #[cfg(test)]
+            if let Ok(dim_str) = std::env::var("SKELESEARCH_TEST_PROVIDER_DIM") {
+                if let Ok(dim) = dim_str.parse::<usize>() {
+                    let backend = Arc::new(CozoBackend::open(&backend_path)?);
+                    let manifest = Arc::new(ManifestStore::open(&manifest_path)?);
+                    let config = Config::load(&root).context("load .skelesearch.toml")?;
+                    let indexer = Indexer::new(backend, manifest, TestProvider { name: "test", dim })
+                        .with_excludes(config.index.exclude.clone())
+                        .with_include_extensions(config.index.include_extensions.clone())
+                        .with_scope_prefix(config.index.scope_prefix);
+                    return indexer.index_path(&root).await;
+                }
+            }
             let backend = Arc::new(CozoBackend::open(&backend_path)?);
             let manifest = Arc::new(ManifestStore::open(&manifest_path)?);
             let provider = build_arc_provider(&provider_name)?;
@@ -1456,46 +1471,49 @@ fn frame_kind(frame: &ProtocolFrame) -> &'static str {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct TestProvider {
+    name: &'static str,
+    dim: usize,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl EmbedProvider for TestProvider {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .into_iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let mut v = vec![0.05_f32; self.dim];
+                if !v.is_empty() {
+                    v[0] = (idx as f32 + 1.0) * 0.1;
+                }
+                v
+            })
+            .collect())
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_batch(texts).await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Mutex as StdMutex, OnceLock};
 
     use async_trait::async_trait;
 
-    #[derive(Clone)]
-    struct TestProvider {
-        name: &'static str,
-        dim: usize,
-    }
-
-    #[async_trait]
-    impl EmbedProvider for TestProvider {
-        fn dim(&self) -> usize {
-            self.dim
-        }
-
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-            Ok(texts
-                .into_iter()
-                .enumerate()
-                .map(|(idx, _)| {
-                    let mut v = vec![0.05_f32; self.dim];
-                    if !v.is_empty() {
-                        v[0] = (idx as f32 + 1.0) * 0.1;
-                    }
-                    v
-                })
-                .collect())
-        }
-
-        async fn embed_queries(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-            self.embed_batch(texts).await
-        }
-    }
 
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -1851,6 +1869,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         std::env::set_var("SKELESEARCH_NO_AUTO_INDEX", "1");
         std::env::set_var("SKELESEARCH_TEST_INDEX_DELAY_MS", "300");
+        std::env::set_var("SKELESEARCH_TEST_PROVIDER_DIM", "8");
 
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("repo");
@@ -1933,6 +1952,7 @@ mod tests {
         assert_eq!(status.freshness_state, IndexFreshnessState::Fresh);
 
         std::env::remove_var("SKELESEARCH_TEST_INDEX_DELAY_MS");
+        std::env::remove_var("SKELESEARCH_TEST_PROVIDER_DIM");
         std::env::remove_var("SKELESEARCH_NO_AUTO_INDEX");
     }
 
