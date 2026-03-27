@@ -112,8 +112,12 @@ pub fn all_import_edges() -> Vec<Edge> {
     .unwrap();
 }
 
-fn build_index<P: EmbedProvider + 'static>(dir: &std::path::Path, provider: P, dim: usize) {
-    let index_dir = dir.join(".skelesearch");
+fn build_index_in<P: EmbedProvider + 'static>(
+    repo_root: &std::path::Path,
+    index_dir: &std::path::Path,
+    provider: P,
+    dim: usize,
+) {
     std::fs::create_dir_all(&index_dir).unwrap();
 
     let backend = Arc::new(
@@ -127,8 +131,12 @@ fn build_index<P: EmbedProvider + 'static>(dir: &std::path::Path, provider: P, d
     rt.block_on(async {
         backend.initialize(dim).await.expect("initialize backend");
         let indexer = Indexer::new(backend, manifest, provider);
-        indexer.index_path(dir).await.expect("index fixture");
+        indexer.index_path(repo_root).await.expect("index fixture");
     });
+}
+
+fn build_index<P: EmbedProvider + 'static>(dir: &std::path::Path, provider: P, dim: usize) {
+    build_index_in(dir, &dir.join(".skelesearch"), provider, dim)
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +175,33 @@ fn indexed_cli_fixture_with_model() -> Option<TempDir> {
     write_fixture_files(dir.path());
     build_index(dir.path(), provider, dim);
     Some(dir)
+}
+
+fn mark_fixture_stale(repo_root: &std::path::Path) {
+    let manifest_path = repo_root.join(".skelesearch").join("manifest.db");
+    let manifest = ManifestStore::open(&manifest_path).expect("open manifest for stale fixture");
+    manifest
+        .upsert("src/deleted.rs", 1, 1, "fixture-hash")
+        .expect("insert stale manifest row");
+}
+
+fn indexed_cli_generation_fixture() -> TempDir {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    write_fixture_files(dir.path());
+    let generation_dir = dir
+        .path()
+        .join(".skelesearch")
+        .join("generations")
+        .join("gen-1");
+    build_index_in(
+        dir.path(),
+        &generation_dir,
+        DeterministicTestProvider::new(768),
+        768,
+    );
+    std::fs::write(dir.path().join(".skelesearch").join("active-generation"), "gen-1")
+        .expect("write active generation pointer");
+    dir
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +260,65 @@ fn status_json_contains_hook_facing_fields() {
 
     let status: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout is valid JSON");
-    for key in ["indexed_files", "total_chunks", "last_indexed", "estimated_stale", "watching"] {
+    for key in [
+        "indexed_files",
+        "total_chunks",
+        "last_indexed",
+        "estimated_stale",
+        "freshness_state",
+        "freshness_checked_at",
+        "freshness_error",
+        "watching",
+    ] {
         assert!(status.get(key).is_some(), "missing field: {key}");
     }
+}
+
+#[test]
+fn status_json_reports_stale_freshness_for_missing_manifest_file() {
+    let repo = indexed_cli_fixture();
+    mark_fixture_stale(repo.path());
+
+    let output = assert_cmd::Command::cargo_bin("skelesearch")
+        .unwrap()
+        .current_dir(repo.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is valid JSON");
+    assert_eq!(status["freshness_state"], "stale");
+    assert_eq!(status["estimated_stale"], 1);
+    assert!(status["freshness_checked_at"].is_string());
+    assert!(status["freshness_error"].is_null());
+}
+
+#[test]
+fn status_json_reads_active_generation_index() {
+    let repo = indexed_cli_generation_fixture();
+
+    let output = assert_cmd::Command::cargo_bin("skelesearch")
+        .unwrap()
+        .current_dir(repo.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is valid JSON");
+    assert_eq!(status["indexed_files"], 2);
+    assert_eq!(status["freshness_state"], "fresh");
 }
 
 #[test]
@@ -287,9 +378,8 @@ fn watch_command_sets_watching_state() {
         .spawn()
         .unwrap();
 
-    // Poll until the watcher reports itself as active (max 5 s).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut watching = false;
+    let mut watching_and_idle = false;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let output = assert_cmd::Command::cargo_bin("skelesearch")
@@ -299,8 +389,8 @@ fn watch_command_sets_watching_state() {
             .output()
             .unwrap();
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-            if json["watching"] == true {
-                watching = true;
+            if json["watching"] == true && json["freshness_state"] != "refreshing" {
+                watching_and_idle = true;
                 break;
             }
         }
@@ -309,7 +399,10 @@ fn watch_command_sets_watching_state() {
     let _ = child.kill();
     let _ = child.wait();
 
-    assert!(watching, "watcher did not become active within 5 seconds");
+    assert!(
+        watching_and_idle,
+        "watcher did not report watching=true with non-refreshing freshness_state within 5 seconds"
+    );
 }
 
 #[test]

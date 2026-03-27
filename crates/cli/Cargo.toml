@@ -11,8 +11,9 @@ path = "src/main.rs"
 
 [features]
 watch = ["skelesearch-core/watch"]
-coreml = ["skelesearch-rerank-local/coreml"]
-cuda = ["skelesearch-rerank-local/cuda"]
+local-reranker = ["dep:skelesearch-rerank-local"]
+coreml = ["local-reranker", "skelesearch-rerank-local/coreml"]
+cuda = ["local-reranker", "skelesearch-rerank-local/cuda"]
 qwen3 = ["dep:skelesearch-rerank-qwen3"]
 
 [dependencies]
@@ -20,7 +21,7 @@ skelesearch-core = { path = "../core" }
 skelesearch-embed-fastembed = { path = "../embed-fastembed" }
 skelesearch-embed-openai = { path = "../embed-openai" }
 skelesearch-rerank-api = { path = "../rerank-api" }
-skelesearch-rerank-local = { path = "../rerank-local" }
+skelesearch-rerank-local = { path = "../rerank-local", optional = true }
 skelesearch-rerank-qwen3 = { path = "../rerank-qwen3", optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }

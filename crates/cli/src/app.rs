@@ -7,7 +7,9 @@ use fs2::FileExt;
 use notify::Watcher as _;
 use serde_json::json;
 use skelesearch_core::{
-    CozoBackend, Config, EmbedProvider, IndexStats, Indexer, ManifestStore, Searcher, StorageBackend,
+    generation_db_paths, is_indexing_active_elsewhere, CozoBackend, Config, EmbedProvider,
+    FreshnessSnapshot, FreshnessState, IndexStats, Indexer, ManifestStore, Searcher,
+    StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 
@@ -57,6 +59,27 @@ fn index_dir(root: &Path) -> PathBuf {
     root.join(".skelesearch")
 }
 
+fn active_index_paths(dir: &Path) -> (PathBuf, PathBuf) {
+    let pointer_path = dir.join("active-generation");
+    if let Ok(pointer) = std::fs::read_to_string(&pointer_path) {
+        let generation_id = pointer.trim();
+        if !generation_id.is_empty() {
+            let generation_dir = dir.join("generations").join(generation_id);
+            let (backend_path, manifest_path) = generation_db_paths(&generation_dir);
+            if backend_path.exists() && manifest_path.exists() {
+                return (backend_path, manifest_path);
+            }
+        }
+    }
+
+    (dir.join(INDEX_DB_FILE), dir.join(MANIFEST_DB_FILE))
+}
+
+fn active_backend_exists(dir: &Path) -> bool {
+    let (backend_path, _) = active_index_paths(dir);
+    backend_path.exists()
+}
+
 /// Resolve the project root: explicit `path` argument or current directory.
 fn resolve_root(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     match path {
@@ -68,7 +91,7 @@ fn resolve_root(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 /// Open the CozoBackend at `dir/index.db`.
 fn open_backend(dir: &Path) -> anyhow::Result<Arc<CozoBackend>> {
-    let db_path = dir.join("index.db");
+    let (db_path, _) = active_index_paths(dir);
     let backend = CozoBackend::open(&db_path)
         .with_context(|| format!("failed to open index at {}", db_path.display()))?;
     Ok(Arc::new(backend))
@@ -76,7 +99,7 @@ fn open_backend(dir: &Path) -> anyhow::Result<Arc<CozoBackend>> {
 
 /// Open the ManifestStore at `dir/manifest.db`.
 fn open_manifest(dir: &Path) -> anyhow::Result<Arc<ManifestStore>> {
-    let db_path = dir.join("manifest.db");
+    let (_, db_path) = active_index_paths(dir);
     let store = ManifestStore::open(&db_path)
         .with_context(|| format!("failed to open manifest at {}", db_path.display()))?;
     Ok(Arc::new(store))
@@ -215,27 +238,39 @@ where
     if let Some(ref provider_name) = config.search.reranker.provider {
         if provider_name == "local" {
             // Explicit local reranker via config.
-            let result = if let Some(ref dir) = config.search.reranker.model_dir {
-                // Expand ~ to home directory
-                let expanded = if dir.starts_with("~/") {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    std::path::PathBuf::from(home).join(&dir[2..])
+            // Requires the `local-reranker` cargo feature.
+            #[cfg(feature = "local-reranker")]
+            {
+                let result = if let Some(ref dir) = config.search.reranker.model_dir {
+                    // Expand ~ to home directory
+                    let expanded = if dir.starts_with("~/") {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                        std::path::PathBuf::from(home).join(&dir[2..])
+                    } else {
+                        std::path::PathBuf::from(dir)
+                    };
+                    skelesearch_rerank_local::LocalReranker::new(&expanded)
                 } else {
-                    std::path::PathBuf::from(dir)
+                    skelesearch_rerank_local::LocalReranker::default_model()
                 };
-                skelesearch_rerank_local::LocalReranker::new(&expanded)
-            } else {
-                skelesearch_rerank_local::LocalReranker::default_model()
-            };
-            match result {
-                Ok(r) => {
-                    tracing::info!("local reranker enabled");
-                    searcher.with_reranker(Box::new(r))
+                match result {
+                    Ok(r) => {
+                        tracing::info!("local reranker enabled");
+                        searcher.with_reranker(Box::new(r))
+                    }
+                    Err(e) => {
+                        tracing::warn!("local reranker failed to load: {e}");
+                        searcher
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("local reranker failed to load: {e}");
-                    searcher
-                }
+            }
+            #[cfg(not(feature = "local-reranker"))]
+            {
+                tracing::warn!(
+                    "reranker = 'local' in config but the `local-reranker` feature is not enabled; \
+                     rebuild with --features local-reranker (or coreml/cuda)"
+                );
+                searcher
             }
         } else if provider_name == "qwen3" {
             // Explicit Qwen3-Reranker-0.6B via config.
@@ -402,7 +437,7 @@ async fn run_search(
     let dir = index_dir(&root);
 
     // Short-circuit: no index at all.
-    if !dir.join("index.db").exists() {
+    if !active_backend_exists(&dir) {
         if json_output {
             eprintln!("{}", serde_json::json!({"error": "No index found. Run `skelesearch index <path>` first."}));
             std::process::exit(1);
@@ -517,7 +552,7 @@ async fn run_context(file: PathBuf) -> anyhow::Result<()> {
         file.to_string_lossy().to_string()
     };
 
-    if !dir.join("index.db").exists() {
+    if !active_backend_exists(&dir) {
         println!("No index found. Run `skelesearch index <path>` first.");
         return Ok(());
     }
@@ -567,7 +602,7 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
     let root = resolve_root(path)?;
     let dir = index_dir(&root);
 
-    let stats = if dir.join("index.db").exists() {
+    let stats = if active_backend_exists(&dir) {
         let backend = open_backend(&dir)?;
         // stats() queries `files` and `chunks` relations.  On an uninitialised
         // db those don't exist yet — return zeros rather than propagating the
@@ -585,6 +620,7 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
 
     // Overlay the watching flag from the PID sentinel.
     let watching = stats.watching || is_process_watching(&dir);
+    let freshness = status_freshness_snapshot(&dir, &root);
 
     let last_indexed_str = stats
         .last_indexed
@@ -598,22 +634,66 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
             "indexed_files":    stats.indexed_files,
             "total_chunks":     stats.total_chunks,
             "last_indexed":     stats.last_indexed.map(|dt: DateTime<Utc>| dt.to_rfc3339()),
-            "estimated_stale":  open_manifest(&dir).map(|m| m.count_stale(&root).unwrap_or(0)).unwrap_or(0),
+            "estimated_stale":  freshness.estimated_stale,
+            "freshness_state":  freshness_state_label(freshness.state),
+            "freshness_checked_at": freshness.freshness_checked_at.map(|dt| dt.to_rfc3339()),
+            "freshness_error":  freshness.freshness_error,
             "watching":         watching,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
-        let stale = open_manifest(&dir).map(|m| m.count_stale(&root).unwrap_or(0)).unwrap_or(0);
         println!("indexed_files:  {}", stats.indexed_files);
         println!("total_chunks:   {}", stats.total_chunks);
         println!("last_indexed:   {last_indexed_str}");
-        println!("estimated_stale: {stale}");
+        println!("estimated_stale: {}", freshness.estimated_stale);
+        println!("freshness_state: {}", freshness_state_label(freshness.state));
+        println!(
+            "freshness_checked_at: {}",
+            freshness
+                .freshness_checked_at
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| "null".to_string())
+        );
+        println!(
+            "freshness_error: {}",
+            freshness
+                .freshness_error
+                .as_deref()
+                .unwrap_or("null")
+        );
         println!("watching:       {watching}");
-        if stale > 0 {
-            println!("hint: {} file(s) may be out of date; run `skelesearch index <path>` to refresh.", stale);
+        match freshness.state {
+            FreshnessState::Stale => {
+                println!(
+                    "hint: {} file(s) may be out of date; run `skelesearch index <path>` to refresh.",
+                    freshness.estimated_stale
+                );
+            }
+            FreshnessState::Refreshing => {
+                println!("hint: index refresh in progress; poll `skelesearch status` for completion.");
+            }
+            FreshnessState::Unknown => {
+                println!("hint: freshness could not be determined; inspect freshness_error.");
+            }
+            FreshnessState::Fresh => {}
         }
     }
     Ok(())
+}
+
+fn freshness_state_label(state: FreshnessState) -> &'static str {
+    match state {
+        FreshnessState::Fresh => "fresh",
+        FreshnessState::Stale => "stale",
+        FreshnessState::Refreshing => "refreshing",
+        FreshnessState::Unknown => "unknown",
+    }
+}
+
+fn status_freshness_snapshot(dir: &Path, root: &Path) -> FreshnessSnapshot {
+    let stale_count_result = open_manifest(dir).and_then(|manifest| manifest.count_stale(root));
+    let refreshing = is_indexing_active_elsewhere(dir).unwrap_or(false);
+    FreshnessSnapshot::from_stale_count_result(stale_count_result).with_refreshing(refreshing)
 }
 
 async fn run_clear(path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -644,52 +724,10 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     // Write PID sentinel so concurrent `status --json` calls see watching=true
     // immediately, before any slow model initialisation.
     std::fs::create_dir_all(&dir)?;
-    let _lock = acquire_lock(&dir)?;
     std::fs::write(pid_file(&dir), std::process::id().to_string())
         .context("failed to write watch PID file")?;
 
-    // Best-effort initial indexing pass: if the provider is unavailable
-    // (no model, no network), log a warning and continue watching without
-    // an initial index rather than failing the whole command.
-    match provider_from_name(&provider_name) {
-        Ok(provider) => {
-            let dim = provider.dim();
-            let backend = open_backend(&dir)?;
-            let manifest = open_manifest(&dir)?;
-            if let Err(e) = backend.initialize(dim).await {
-                eprintln!("skelesearch watch: backend init failed: {e}");
-            } else {
-                let indexer = Indexer::new(backend, manifest, provider)
-                    .with_excludes(config.index.exclude.clone())
-                    .with_include_extensions(config.index.include_extensions.clone())
-                    .with_symbol_enrichment(config.index.symbol_enrichment)
-                    .with_scope_prefix(config.index.scope_prefix);
-                let indexer = if config.index.summarize {
-                    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-                        indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
-                    } else {
-                        tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
-                        indexer
-                    }
-                } else {
-                    indexer
-                };
-                match indexer.index_path(&root).await {
-                    Ok(r) => eprintln!(
-                        "skelesearch watch: indexed {} file(s) in {}",
-                        r.indexed_files,
-                        root.display()
-                    ),
-                    Err(e) => eprintln!("skelesearch watch: initial index failed: {e}"),
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "skelesearch watch: provider unavailable ({e}), watching without initial index"
-            );
-        }
-    }
+    let _ = run_watch_index_pass(&root, &dir, &config, &provider_name, WatchPassKind::Initial).await?;
 
     eprintln!("skelesearch watch: watching {} (Ctrl-C to stop)", root.display());
 
@@ -718,12 +756,27 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     // Sentinel directories: events here are internal write-back and must be
     // ignored to avoid re-index storms triggered by our own index writes.
     let git_dir = root.join(".git");
+    let mut refresh_queue = WatchRefreshQueue::default();
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("skelesearch watch: shutting down");
                 break;
+            }
+            Some(_) = done_rx.recv() => {
+                if refresh_queue.mark_refresh_finished() {
+                    let root2 = root.clone();
+                    let dir2 = dir.clone();
+                    let config2 = config.clone();
+                    let provider_name2 = provider_name.clone();
+                    let done_tx2 = done_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = run_watch_index_pass(&root2, &dir2, &config2, &provider_name2, WatchPassKind::Refresh).await;
+                        let _ = done_tx2.send(());
+                    });
+                }
             }
             Some(event_result) = async_rx.recv() => {
                 match event_result {
@@ -737,41 +790,22 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
                         if relevant_count == 0 {
                             continue;
                         }
-                        tracing::info!(changed_files = relevant_count, "file changes detected, re-indexing");
-                        match provider_from_name(&provider_name) {
-                            Ok(provider) => {
-                                let dim = provider.dim();
-                                let backend = open_backend(&dir)?;
-                                let manifest = open_manifest(&dir)?;
-                                if let Err(e) = backend.initialize(dim).await {
-                                    eprintln!("skelesearch watch: re-index backend init failed: {e}");
-                                } else {
-                                    let indexer = Indexer::new(backend, manifest, provider)
-                                        .with_excludes(config.index.exclude.clone())
-                                        .with_include_extensions(config.index.include_extensions.clone());
-                                    let indexer = if config.index.summarize {
-                                        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-                                            indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
-                                        } else {
-                                            tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
-                                            indexer
-                                        }
-                                    } else {
-                                        indexer
-                                    };
-                                    match indexer.index_path(&root).await {
-                                        Ok(r) => eprintln!(
-                                            "skelesearch watch: re-indexed {} file(s), {} chunk(s)",
-                                            r.indexed_files, r.total_chunks
-                                        ),
-                                        Err(e) => eprintln!("skelesearch watch: re-index failed: {e}"),
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("skelesearch watch: provider unavailable ({e}), skipping re-index");
-                            }
+                        if !refresh_queue.on_change_detected() {
+                            tracing::debug!(changed_files = relevant_count, "file changes detected during active re-index; queued one follow-up pass");
+                            continue;
                         }
+
+                        refresh_queue.mark_refresh_triggered();
+                        tracing::info!(changed_files = relevant_count, "file changes detected, re-indexing");
+                        let root2 = root.clone();
+                        let dir2 = dir.clone();
+                        let config2 = config.clone();
+                        let provider_name2 = provider_name.clone();
+                        let done_tx2 = done_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = run_watch_index_pass(&root2, &dir2, &config2, &provider_name2, WatchPassKind::Refresh).await;
+                            let _ = done_tx2.send(());
+                        });
                     }
                     Err(errs) => {
                         for e in errs {
@@ -788,10 +822,127 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WatchPassKind {
+    Initial,
+    Refresh,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct WatchRefreshQueue {
+    refresh_in_flight: bool,
+    followup_queued: bool,
+}
+
+impl WatchRefreshQueue {
+    fn on_change_detected(&mut self) -> bool {
+        if self.refresh_in_flight {
+            self.followup_queued = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn mark_refresh_triggered(&mut self) {
+        self.refresh_in_flight = true;
+    }
+
+    fn mark_refresh_finished(&mut self) -> bool {
+        if self.followup_queued {
+            self.followup_queued = false;
+            self.refresh_in_flight = true;
+            true
+        } else {
+            self.refresh_in_flight = false;
+            false
+        }
+    }
+}
+
+async fn run_watch_index_pass(
+    root: &Path,
+    dir: &Path,
+    config: &Config,
+    provider_name: &str,
+    kind: WatchPassKind,
+) -> anyhow::Result<bool> {
+    let provider = match provider_from_name(provider_name) {
+        Ok(provider) => provider,
+        Err(e) => {
+            match kind {
+                WatchPassKind::Initial => {
+                    eprintln!(
+                        "skelesearch watch: provider unavailable ({e}), watching without initial index"
+                    );
+                }
+                WatchPassKind::Refresh => {
+                    eprintln!("skelesearch watch: provider unavailable ({e}), skipping re-index");
+                }
+            }
+            return Ok(false);
+        }
+    };
+
+    let _lock = acquire_lock(dir)?;
+    let dim = provider.dim();
+    let backend = open_backend(dir)?;
+    let manifest = open_manifest(dir)?;
+    if let Err(e) = backend.initialize(dim).await {
+        match kind {
+            WatchPassKind::Initial => eprintln!("skelesearch watch: backend init failed: {e}"),
+            WatchPassKind::Refresh => {
+                eprintln!("skelesearch watch: re-index backend init failed: {e}")
+            }
+        }
+        return Ok(false);
+    }
+
+    let indexer = Indexer::new(backend, manifest, provider)
+        .with_excludes(config.index.exclude.clone())
+        .with_include_extensions(config.index.include_extensions.clone())
+        .with_symbol_enrichment(config.index.symbol_enrichment)
+        .with_scope_prefix(config.index.scope_prefix);
+    let indexer = if config.index.summarize {
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            indexer.with_summary_provider(Box::new(crate::summary::OpenAISummaryProvider::new(key)))
+        } else {
+            tracing::warn!("summarize=true but OPENAI_API_KEY is not set, skipping summaries");
+            indexer
+        }
+    } else {
+        indexer
+    };
+
+    match indexer.index_path(root).await {
+        Ok(r) => {
+            match kind {
+                WatchPassKind::Initial => eprintln!(
+                    "skelesearch watch: indexed {} file(s) in {}",
+                    r.indexed_files,
+                    root.display()
+                ),
+                WatchPassKind::Refresh => eprintln!(
+                    "skelesearch watch: re-indexed {} file(s), {} chunk(s)",
+                    r.indexed_files, r.total_chunks
+                ),
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            match kind {
+                WatchPassKind::Initial => eprintln!("skelesearch watch: initial index failed: {e}"),
+                WatchPassKind::Refresh => eprintln!("skelesearch watch: re-index failed: {e}"),
+            }
+            Ok(false)
+        }
+    }
+}
+
 async fn run_gc(path: Option<PathBuf>) -> anyhow::Result<()> {
     let root = resolve_root(path)?;
     let dir = index_dir(&root);
-    if !dir.join("index.db").exists() {
+    if !active_backend_exists(&dir) {
         println!("No index found.");
         return Ok(());
     }
@@ -866,7 +1017,7 @@ impl skelesearch_core::EmbedProvider for NoopProvider {
 async fn run_symbol(name: String, kind: Option<String>) -> anyhow::Result<()> {
     let root = std::env::current_dir()?;
     let dir = index_dir(&root);
-    if !dir.join("index.db").exists() {
+    if !active_backend_exists(&dir) {
         anyhow::bail!("No index found in {}. Run `skelesearch index <path>` first.", dir.display());
     }
     let backend = open_backend(&dir)?;
@@ -887,7 +1038,7 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
     let root = resolve_root(None)?;
     let dir = index_dir(&root);
 
-    if !dir.join("index.db").exists() {
+    if !active_backend_exists(&dir) {
         anyhow::bail!("No index found. Run `skelesearch index <path>` first.");
     }
 
@@ -969,4 +1120,34 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
         println!("Mean MRR:    {:.3}", agg.mean_mrr);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{acquire_lock, index_dir, status_freshness_snapshot, FreshnessState, WatchRefreshQueue};
+
+    #[test]
+    fn watch_followup_refresh_coalesces_mid_run_edits() {
+        let mut queue = WatchRefreshQueue::default();
+        assert!(queue.on_change_detected());
+        queue.mark_refresh_triggered();
+        assert!(!queue.on_change_detected());
+        assert!(!queue.on_change_detected());
+        assert!(queue.mark_refresh_finished());
+        assert!(!queue.mark_refresh_finished());
+    }
+
+    #[test]
+    fn status_freshness_snapshot_reports_refreshing_only_while_lock_is_held() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = index_dir(temp.path());
+        std::fs::create_dir_all(&dir).expect("create index dir");
+
+        let idle = status_freshness_snapshot(&dir, temp.path());
+        assert_ne!(idle.state, FreshnessState::Refreshing);
+
+        let _lock = acquire_lock(&dir).expect("acquire indexing lock");
+        let refreshing = status_freshness_snapshot(&dir, temp.path());
+        assert_eq!(refreshing.state, FreshnessState::Refreshing);
+    }
 }
