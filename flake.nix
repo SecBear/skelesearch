@@ -28,6 +28,7 @@
           nativeBuildInputs = [
             pkgs.cmake
             pkgs.pkg-config
+            pkgs.protobuf # lance-encoding protos require protoc
           ];
           buildInputs = [
             pkgs.onnxruntime
@@ -80,12 +81,12 @@
         };
 
         devShells.default = pkgs.mkShell {
-          # clang provides a C++20-capable compiler needed for optional
-          # RocksDB builds during development; cmake/pkg-config mirror
+          # clang provides C++ runtime needed by lance; cmake/pkg-config mirror
           # the release nativeBuildInputs so `cargo build` works locally.
           nativeBuildInputs = [
             pkgs.cmake
             pkgs.pkg-config
+            pkgs.protobuf # lance-encoding protos require protoc
           ];
           buildInputs = [
             pkgs.rustc
@@ -95,7 +96,7 @@
             pkgs.clang
             # libc++ runtime/headers for Darwin links that pass -lc++
             pkgs.llvmPackages.libcxx
-            # bindgen needs libclang for RocksDB (cozorocks) builds
+            # bindgen needs libclang for C/C++ build scripts
             pkgs.llvmPackages.libclang.lib
             # Native TLS (reqwest -> openssl-sys)
             pkgs.openssl
@@ -116,7 +117,7 @@
           ORT_STRATEGY = "system";
           ORT_LIB_LOCATION = "${pkgs.lib.getLib pkgs.onnxruntime}/lib";
           ORT_PREFER_DYNAMIC_LINK = "1";
-          # Force clang for RocksDB C++ compilation (g++ may lack headers on NixOS)
+          # Force clang for C++ deps (lance, ort) on NixOS where g++ lacks system headers
           CXX = "clang++";
           CC = "clang";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
