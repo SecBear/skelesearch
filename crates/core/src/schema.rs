@@ -5,13 +5,13 @@ use crate::symbols::SymbolDef;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Public record types
 // ---------------------------------------------------------------------------
 
-pub const INDEX_DB_FILE: &str = "index.db";
+// Marker file for an active generation's backend directory.
+pub const INDEX_DB_FILE: &str = "backend.lock";
 pub const MANIFEST_DB_FILE: &str = "manifest.db";
 
 pub fn generation_db_paths(generation_dir: &Path) -> (PathBuf, PathBuf) {
@@ -64,7 +64,6 @@ pub struct EdgeRecord {
     pub edge_type: String,
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallEdge {
     pub caller_file: String,
@@ -116,7 +115,7 @@ pub struct IndexStats {
 #[derive(Debug, Clone)]
 pub struct RepoMapData {
     pub files: Vec<RepoMapFile>,
-    pub import_edges: Vec<(String, String)>,  // (from_file, to_file)
+    pub import_edges: Vec<(String, String)>, // (from_file, to_file)
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +123,7 @@ pub struct RepoMapFile {
     pub path: String,
     pub language: String,
     pub chunk_count: usize,
-    pub role: String,           // entry/core/utility/leaf/unknown
+    pub role: String, // entry/core/utility/leaf/unknown
     pub symbols: Vec<RepoMapSymbol>,
 }
 
@@ -170,7 +169,12 @@ pub trait StorageBackend: Send + Sync {
     /// `max_depth` hops.  Returns `(file_path, depth)` for each reachable file
     /// (excluding the start node).  Cycles are handled by the visited set.
     /// Pass `edge_types = None` to traverse all edge types (current behavior).
-    async fn traverse_imports(&self, file_path: &str, max_depth: usize, edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>>;
+    async fn traverse_imports(
+        &self,
+        file_path: &str,
+        max_depth: usize,
+        edge_types: Option<&[&str]>,
+    ) -> anyhow::Result<Vec<(String, usize)>>;
 
     /// Reverse BFS: find all files that (transitively) import `file_path`,
     /// up to `max_depth` hops. Returns files grouped by distance.
@@ -197,14 +201,18 @@ pub trait StorageBackend: Send + Sync {
 
     /// Fetch stored embedding vectors for specific chunks.
     /// Returns embeddings in the same order as `keys`. Missing chunks yield a zero vector.
-    async fn get_chunk_embeddings(&self, keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>>;
+    async fn get_chunk_embeddings(&self, keys: &[(String, usize)])
+        -> anyhow::Result<Vec<Vec<f32>>>;
 
     /// Compute PageRank over the file-level import graph and store results.
     async fn compute_pagerank(&self, edge_types: Option<&[&str]>) -> anyhow::Result<()>;
 
     /// Retrieve PageRank scores for the given file paths.
     /// Returns a HashMap; files not in the graph get score 0.0.
-    async fn get_file_ranks(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>>;
+    async fn get_file_ranks(
+        &self,
+        file_paths: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, f64>>;
 
     /// Compute file-level import-degree roles for all indexed symbols and store
     /// results in `symbol_roles`.  Files with no edges get conservative defaults.
@@ -214,13 +222,20 @@ pub trait StorageBackend: Send + Sync {
     /// Retrieve the role for each requested file path.
     /// Returns a map of `file_path → role`; files with no computed role are absent.
     /// Gracefully returns an empty map when `symbol_roles` does not exist yet.
-    async fn get_symbol_roles(&self, file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>>;
+    async fn get_symbol_roles(
+        &self,
+        file_paths: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>>;
     /// Upsert co-change pairs derived from git history.
     async fn upsert_cochange_edges(&self, pairs: &[CoChangePair]) -> anyhow::Result<()>;
     /// Return co-change neighbors of `file_path` with Jaccard similarity >= `min_score`.
     /// Returns `(neighbor_file_path, jaccard)` pairs sorted by jaccard descending.
     /// No-op on backends that have not indexed co-change data.
-    async fn get_cochange_neighbors(&self, _file_path: &str, _min_score: f64) -> anyhow::Result<Vec<(String, f64)>> {
+    async fn get_cochange_neighbors(
+        &self,
+        _file_path: &str,
+        _min_score: f64,
+    ) -> anyhow::Result<Vec<(String, f64)>> {
         Ok(vec![])
     }
 
@@ -275,7 +290,6 @@ pub trait StorageBackend: Send + Sync {
         Ok(vec![])
     }
 
-
     /// Single-query retrieval combining FTS + HNSW + graph walk + PageRank boost.
     /// Returns results with provenance (\"hybrid\", \"graph\").
     /// `graph_depth > 0` enables a single-hop graph walk in the Datalog query;
@@ -293,7 +307,13 @@ pub trait StorageBackend: Send + Sync {
         graph_min_score: f64,
         pagerank_factor: f64,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let _ = (graph_depth, fts_weight, graph_score_factor, graph_min_score, pagerank_factor);
+        let _ = (
+            graph_depth,
+            fts_weight,
+            graph_score_factor,
+            graph_min_score,
+            pagerank_factor,
+        );
         self.hybrid_search(query_vec, query_str, top_k).await
     }
 
@@ -310,8 +330,16 @@ pub trait StorageBackend: Send + Sync {
 
     async fn upsert_call_edges(&self, edges: &[CallEdge]) -> anyhow::Result<()>;
     async fn delete_call_edges_for_file(&self, file_path: &str) -> anyhow::Result<()>;
-    async fn get_callers(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>>;
-    async fn get_callees(&self, file_path: &str, symbol_name: &str) -> anyhow::Result<Vec<CallEdge>>;
+    async fn get_callers(
+        &self,
+        file_path: &str,
+        symbol_name: &str,
+    ) -> anyhow::Result<Vec<CallEdge>>;
+    async fn get_callees(
+        &self,
+        file_path: &str,
+        symbol_name: &str,
+    ) -> anyhow::Result<Vec<CallEdge>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,4 +372,3 @@ pub(crate) fn classify_symbol_role(in_degree: usize, out_degree: usize) -> &'sta
         "internal"
     }
 }
-

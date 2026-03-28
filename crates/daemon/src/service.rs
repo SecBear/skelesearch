@@ -14,10 +14,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use skelesearch_core::{
     generation_db_paths, git::changed_files_on_branch, try_acquire_indexing_lease,
-    write_file_atomic, Config, CompositeBackend, EmbedProvider,
-    FreshnessSnapshot as CoreFreshnessSnapshot, FreshnessState as CoreFreshnessState,
-    Indexer, ManifestStore, Searcher, SharedIndexingStatus, StorageBackend, INDEX_DB_FILE,
-    MANIFEST_DB_FILE,
+    write_file_atomic, CompositeBackend, Config, EmbedProvider,
+    FreshnessSnapshot as CoreFreshnessSnapshot, FreshnessState as CoreFreshnessState, Indexer,
+    ManifestStore, Searcher, SharedIndexingStatus, StorageBackend,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 use skelesearch_service::protocol::{
@@ -30,8 +29,7 @@ use skelesearch_service::{
     IndexCodebaseResponse, IndexFreshnessState, IndexStatusRequest, IndexStatusResponse,
     IndexingProgress, InfoResponse, ProjectKey, ProjectKeyError, ProjectTarget,
     RegisterClientRequest, RegisterClientResponse, SearchCodeRequest, SearchCodeResponse,
-    SearchResultRow, UnregisterClientRequest,
-    UnregisterClientResponse, DAEMON_PROTOCOL_VERSION,
+    SearchResultRow, UnregisterClientRequest, UnregisterClientResponse, DAEMON_PROTOCOL_VERSION,
 };
 use tokio::sync::{Mutex, RwLock};
 
@@ -131,7 +129,7 @@ impl DaemonState {
             return Ok(Arc::clone(project));
         }
 
-        let project = Arc::new(ProjectState::open(project_key.clone())?);
+        let project = Arc::new(ProjectState::open(project_key.clone()).await?);
         projects.insert(project_key, Arc::clone(&project));
         Ok(project)
     }
@@ -383,12 +381,11 @@ impl DaemonService {
             Err(response) => return response,
         };
 
-        self.ensure_index_current_on_startup(Arc::clone(&project)).await;
+        self.ensure_index_current_on_startup(Arc::clone(&project))
+            .await;
 
         let mut runtime = project.index_runtime_snapshot().await;
-        if runtime.indexed_files == 0
-            && runtime.total_chunks == 0
-            && runtime.last_indexed.is_none()
+        if runtime.indexed_files == 0 && runtime.total_chunks == 0 && runtime.last_indexed.is_none()
         {
             if let Ok(Some((indexed_files, total_chunks, last_indexed))) =
                 read_persisted_index_stats(&project).await
@@ -597,7 +594,12 @@ impl DaemonService {
         let stale_refresh_needed = total_chunks > 0 && freshness.state == CoreFreshnessState::Stale;
 
         let startup_plan = if initial_build_needed {
-            Some((provider_name_for_project(&project).await.unwrap_or_else(|_| "fastembed".to_string()), "startup_initial_build"))
+            Some((
+                provider_name_for_project(&project)
+                    .await
+                    .unwrap_or_else(|_| "fastembed".to_string()),
+                "startup_initial_build",
+            ))
         } else if stale_refresh_needed {
             match persisted_provider_name_for_project(&project).await {
                 Ok(Some(provider_name)) => Some((provider_name, "startup_stale_refresh")),
@@ -658,9 +660,7 @@ impl DaemonService {
         match provider_name.as_str() {
             "fastembed" | "voyage" | "openai" => {}
             unknown => {
-                anyhow::bail!(
-                    "unknown provider: '{unknown}'. Valid: fastembed, voyage, openai"
-                )
+                anyhow::bail!("unknown provider: '{unknown}'. Valid: fastembed, voyage, openai")
             }
         }
 
@@ -783,8 +783,7 @@ enum IndexStartOutcome {
 async fn read_persisted_index_stats(
     project: &ProjectState,
 ) -> anyhow::Result<Option<(usize, usize, Option<String>)>> {
-    let backend_path = project.active_backend_path().await;
-    let backend = Arc::new(CompositeBackend::open(backend_path.parent().ok_or_else(|| anyhow::anyhow!("backend path has no parent"))?).await?);
+    let backend = project.active_backend().await;
     match backend.stats().await {
         Ok(stats) => Ok(Some((
             stats.indexed_files,
@@ -826,16 +825,20 @@ fn protocol_freshness_state(state: CoreFreshnessState) -> IndexFreshnessState {
 
 async fn provider_name_for_project(project: &ProjectState) -> anyhow::Result<String> {
     let manifest_path = project.active_manifest_path().await;
-    let manifest = ManifestStore::open(manifest_path.as_path()).context("failed to open manifest")?;
+    let manifest =
+        ManifestStore::open(manifest_path.as_path()).context("failed to open manifest")?;
     Ok(manifest
         .get_meta("provider")
         .context("failed to read provider from manifest")?
         .unwrap_or_else(|| "fastembed".to_string()))
 }
 
-async fn persisted_provider_name_for_project(project: &ProjectState) -> anyhow::Result<Option<String>> {
+async fn persisted_provider_name_for_project(
+    project: &ProjectState,
+) -> anyhow::Result<Option<String>> {
     let manifest_path = project.active_manifest_path().await;
-    let manifest = ManifestStore::open(manifest_path.as_path()).context("failed to open manifest")?;
+    let manifest =
+        ManifestStore::open(manifest_path.as_path()).context("failed to open manifest")?;
     manifest
         .get_meta("provider")
         .context("failed to read provider from manifest")
@@ -854,8 +857,7 @@ async fn build_searcher_for_project(project: &ProjectState) -> anyhow::Result<Ar
         let mut guard = project.provider_identity.write().await;
         *guard = Some(provider_name.clone());
     }
-    let backend_path = project.active_backend_path().await;
-    let backend = Arc::new(CompositeBackend::open(backend_path.parent().ok_or_else(|| anyhow::anyhow!("backend path has no parent"))?).await?);
+    let backend = project.active_backend().await;
     let root = project.canonical_root.clone();
     let config = Config::load(&root).unwrap_or_default();
     let searcher = Searcher::new(backend, provider);
@@ -1007,7 +1009,7 @@ pub struct ProjectState {
 }
 
 impl ProjectState {
-    fn open(project_key: ProjectKey) -> anyhow::Result<Self> {
+    async fn open(project_key: ProjectKey) -> anyhow::Result<Self> {
         let canonical_root = PathBuf::from(&project_key.canonical_root);
         let storage_dir = storage_dir_for_root(&canonical_root);
         std::fs::create_dir_all(&storage_dir).with_context(|| {
@@ -1017,7 +1019,7 @@ impl ProjectState {
             )
         })?;
 
-        let active_generation = resolve_or_init_active_generation(&storage_dir)?;
+        let active_generation = resolve_or_init_active_generation(&storage_dir).await?;
 
         Ok(Self {
             project_key,
@@ -1043,7 +1045,20 @@ impl ProjectState {
     }
 
     pub async fn active_backend_path(&self) -> PathBuf {
-        self.active_generation.read().await.backend.index_db_path.clone()
+        self.active_generation
+            .read()
+            .await
+            .backend
+            .index_db_path
+            .clone()
+    }
+
+    pub async fn active_backend(&self) -> Arc<CompositeBackend> {
+        self.active_generation
+            .read()
+            .await
+            .composite_backend
+            .clone()
     }
 
     pub async fn active_manifest_path(&self) -> PathBuf {
@@ -1066,7 +1081,8 @@ impl ProjectState {
             staged.generation_dir.clone(),
             staged.backend_db_path.clone(),
             staged.manifest_db_path.clone(),
-        )?;
+        )
+        .await?;
         tracing::info!(
             project = %self.project_key,
             generation = %promoted.generation_id,
@@ -1180,26 +1196,32 @@ struct StagedGeneration {
     manifest_db_path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ActiveGeneration {
     generation_id: String,
     generation_dir: PathBuf,
     backend: Arc<BackendHandle>,
     manifest: Arc<ManifestHandle>,
+    composite_backend: Arc<CompositeBackend>,
 }
 
 impl ActiveGeneration {
-    fn open(
+    async fn open(
         generation_id: String,
         generation_dir: PathBuf,
         backend_db_path: PathBuf,
         manifest_db_path: PathBuf,
     ) -> anyhow::Result<Self> {
+        let backend_root = backend_db_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("backend path has no parent"))?
+            .to_path_buf();
         Ok(Self {
             generation_id,
             generation_dir,
             backend: Arc::new(BackendHandle::open(backend_db_path)?),
             manifest: Arc::new(ManifestHandle::open(manifest_db_path)?),
+            composite_backend: Arc::new(CompositeBackend::open(&backend_root).await?),
         })
     }
 }
@@ -1224,7 +1246,7 @@ fn new_generation_id() -> String {
     )
 }
 
-fn resolve_or_init_active_generation(storage_dir: &Path) -> anyhow::Result<ActiveGeneration> {
+async fn resolve_or_init_active_generation(storage_dir: &Path) -> anyhow::Result<ActiveGeneration> {
     std::fs::create_dir_all(generations_dir(storage_dir)).with_context(|| {
         format!(
             "create generation directory under '{}'",
@@ -1244,7 +1266,8 @@ fn resolve_or_init_active_generation(storage_dir: &Path) -> anyhow::Result<Activ
                     generation_dir,
                     backend_db_path,
                     manifest_db_path,
-                );
+                )
+                .await;
             }
             tracing::warn!(
                 pointer = generation_id,
@@ -1260,27 +1283,6 @@ fn resolve_or_init_active_generation(storage_dir: &Path) -> anyhow::Result<Activ
         .with_context(|| format!("create generation dir '{}'", generation_dir.display()))?;
 
     let (backend_db_path, manifest_db_path) = generation_db_paths(&generation_dir);
-    let legacy_backend = storage_dir.join(INDEX_DB_FILE);
-    let legacy_manifest = storage_dir.join(MANIFEST_DB_FILE);
-
-    if legacy_backend.exists() {
-        std::fs::rename(&legacy_backend, &backend_db_path).with_context(|| {
-            format!(
-                "migrate legacy backend '{}' to '{}'",
-                legacy_backend.display(),
-                backend_db_path.display()
-            )
-        })?;
-    }
-    if legacy_manifest.exists() {
-        std::fs::rename(&legacy_manifest, &manifest_db_path).with_context(|| {
-            format!(
-                "migrate legacy manifest '{}' to '{}'",
-                legacy_manifest.display(),
-                manifest_db_path.display()
-            )
-        })?;
-    }
 
     write_file_atomic(&pointer_path, generation_id.as_bytes()).with_context(|| {
         format!(
@@ -1289,7 +1291,13 @@ fn resolve_or_init_active_generation(storage_dir: &Path) -> anyhow::Result<Activ
         )
     })?;
 
-    ActiveGeneration::open(generation_id, generation_dir, backend_db_path, manifest_db_path)
+    ActiveGeneration::open(
+        generation_id,
+        generation_dir,
+        backend_db_path,
+        manifest_db_path,
+    )
+    .await
 }
 
 fn prepare_staged_generation(
@@ -1299,12 +1307,23 @@ fn prepare_staged_generation(
 ) -> anyhow::Result<StagedGeneration> {
     let generation_id = new_generation_id();
     let generation_dir = generation_dir_for_id(storage_dir, &generation_id);
-    std::fs::create_dir_all(&generation_dir)
-        .with_context(|| format!("create staged generation dir '{}'", generation_dir.display()))?;
+    std::fs::create_dir_all(&generation_dir).with_context(|| {
+        format!(
+            "create staged generation dir '{}'",
+            generation_dir.display()
+        )
+    })?;
     let (backend_db_path, manifest_db_path) = generation_db_paths(&generation_dir);
 
-    copy_sqlite_family(source_backend_path, &backend_db_path)?;
-    copy_sqlite_family(source_manifest_path, &manifest_db_path)?;
+    let source_backend_dir = source_backend_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "backend marker path '{}' has no parent directory",
+            source_backend_path.display()
+        )
+    })?;
+
+    copy_backend_dir(source_backend_dir, &generation_dir)?;
+    copy_manifest_family(source_manifest_path, &manifest_db_path)?;
 
     Ok(StagedGeneration {
         generation_id,
@@ -1322,20 +1341,91 @@ fn cleanup_generation_dir(path: &Path) {
     }
 }
 
-fn copy_sqlite_family(source: &Path, destination: &Path) -> anyhow::Result<()> {
+fn copy_backend_dir(source_dir: &Path, destination_dir: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(source_dir)
+        .with_context(|| format!("read backend directory '{}'", source_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in '{}'", source_dir.display()))?;
+        let source_path = entry.path();
+        let destination_path = destination_dir.join(entry.file_name());
+        let file_type = entry.file_type().with_context(|| {
+            format!(
+                "read file type for backend entry '{}'",
+                source_path.display()
+            )
+        })?;
+
+        if should_skip_backend_entry(&source_path) {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            copy_file(source_path.as_path(), destination_path.as_path())?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(source_dir: &Path, destination_dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(destination_dir)
+        .with_context(|| format!("create directory '{}'", destination_dir.display()))?;
+    for entry in std::fs::read_dir(source_dir)
+        .with_context(|| format!("read directory '{}'", source_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in '{}'", source_dir.display()))?;
+        let source_path = entry.path();
+        let destination_path = destination_dir.join(entry.file_name());
+        let file_type = entry.file_type().with_context(|| {
+            format!(
+                "read file type for directory entry '{}'",
+                source_path.display()
+            )
+        })?;
+
+        if should_skip_backend_entry(&source_path) {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            copy_file(source_path.as_path(), destination_path.as_path())?;
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_backend_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with(".lock"))
+        .unwrap_or(false)
+}
+
+fn copy_manifest_family(source: &Path, destination: &Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let src = PathBuf::from(format!("{}{}", source.display(), suffix));
         if !src.exists() {
             continue;
         }
         let dst = PathBuf::from(format!("{}{}", destination.display(), suffix));
-        std::fs::copy(&src, &dst).with_context(|| {
-            format!(
-                "copy sqlite artifact '{}' to '{}'",
-                src.display(),
-                dst.display()
-            )
-        })?;
+        copy_file(src.as_path(), dst.as_path())?;
+    }
+    Ok(())
+}
+
+fn copy_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    std::fs::copy(source, destination).with_context(|| {
+        format!(
+            "copy file '{}' to '{}'",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    if let Ok(metadata) = std::fs::metadata(source) {
+        let _ = std::fs::set_permissions(destination, metadata.permissions());
     }
     Ok(())
 }
@@ -1512,9 +1602,6 @@ mod tests {
     use super::*;
     use std::sync::{Mutex as StdMutex, OnceLock};
 
-    use async_trait::async_trait;
-
-
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| StdMutex::new(()))
@@ -1522,14 +1609,13 @@ mod tests {
 
     async fn create_populated_index(project: &ProjectState, provider_name: &'static str) {
         std::fs::create_dir_all(project.canonical_root.join("src")).expect("create src");
-        std::fs::write(project.canonical_root.join("src/lib.rs"), "pub fn hello() -> u32 { 1 }")
-            .expect("write source file");
+        std::fs::write(
+            project.canonical_root.join("src/lib.rs"),
+            "pub fn hello() -> u32 { 1 }",
+        )
+        .expect("write source file");
 
-        let bp = project.active_backend_path().await;
-        let backend = Arc::new(
-            CompositeBackend::open(bp.parent().unwrap()).await
-                .expect("open backend"),
-        );
+        let backend = project.active_backend().await;
         let manifest = Arc::new(
             ManifestStore::open(project.active_manifest_path().await.as_path())
                 .expect("open manifest"),
@@ -1576,6 +1662,41 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("timed out waiting for indexing state");
+    }
+
+    #[tokio::test]
+    async fn active_generation_initialization_ignores_root_level_legacy_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("repo");
+        let storage_dir = root.join(STORAGE_DIR_NAME);
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        std::fs::write(storage_dir.join("index.db"), "legacy backend")
+            .expect("write legacy backend");
+        std::fs::write(storage_dir.join("manifest.db"), "legacy manifest")
+            .expect("write legacy manifest");
+
+        let state = DaemonState::new();
+        let project = state
+            .resolve_or_open_project(ProjectLookup::from_root_path(&root))
+            .await
+            .expect("resolve project");
+
+        let active_generation_id = project.active_generation_id().await;
+        assert!(
+            storage_dir
+                .join(GENERATIONS_DIR)
+                .join(active_generation_id)
+                .exists(),
+            "daemon should initialize a fresh active generation"
+        );
+        assert!(
+            storage_dir.join("index.db").exists(),
+            "legacy root backend files should be left untouched"
+        );
+        assert!(
+            storage_dir.join("manifest.db").exists(),
+            "legacy root manifest files should be left untouched"
+        );
     }
 
     #[tokio::test]
@@ -1730,7 +1851,10 @@ mod tests {
         };
 
         assert_eq!(status.freshness_state, IndexFreshnessState::Refreshing);
-        assert!(status.indexing.is_some(), "expected startup refresh to schedule indexing");
+        assert!(
+            status.indexing.is_some(),
+            "expected startup refresh to schedule indexing"
+        );
     }
 
     #[tokio::test]
@@ -1764,7 +1888,10 @@ mod tests {
         };
 
         assert_eq!(status.freshness_state, IndexFreshnessState::Fresh);
-        assert!(status.indexing.is_none(), "fresh index should not schedule startup refresh");
+        assert!(
+            status.indexing.is_none(),
+            "fresh index should not schedule startup refresh"
+        );
     }
 
     #[tokio::test]
@@ -1828,7 +1955,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        let status = failed_status.expect("startup refresh should fail when provider initialization fails");
+        let status =
+            failed_status.expect("startup refresh should fail when provider initialization fails");
         assert_eq!(status.freshness_state, IndexFreshnessState::Stale);
         assert!(status.estimated_stale > 0);
         assert!(status.indexing.is_some());
@@ -1891,10 +2019,7 @@ mod tests {
 
         let before_generation = project.active_generation_id().await;
 
-        let bp = project.active_backend_path().await;
-        let backend = Arc::new(
-            CompositeBackend::open(bp.parent().unwrap()).await.expect("open backend for cached searcher"),
-        );
+        let backend = project.active_backend().await;
         let seeded_searcher = Searcher::new(
             backend,
             ArcProvider::new(TestProvider {
@@ -1937,7 +2062,10 @@ mod tests {
         let DaemonResponse::SearchCode(search) = search else {
             panic!("expected successful search while refresh is running");
         };
-        assert!(!search.results.is_empty(), "expected reads from last-good generation");
+        assert!(
+            !search.results.is_empty(),
+            "expected reads from last-good generation"
+        );
 
         let _done = wait_for_index_state(&service, &root, IndexingState::Done).await;
         let after_generation = project.active_generation_id().await;
@@ -2030,7 +2158,8 @@ mod tests {
 
         let active_manifest_path = project.active_manifest_path().await;
         let active_backend_path = project.active_backend_path().await;
-        let active_manifest = ManifestStore::open(active_manifest_path.as_path()).expect("open active manifest");
+        let active_manifest =
+            ManifestStore::open(active_manifest_path.as_path()).expect("open active manifest");
         active_manifest
             .upsert("src/lib.rs", 123, 26, "fixture-hash")
             .expect("seed file hash entry");
@@ -2045,7 +2174,8 @@ mod tests {
         )
         .expect("prepare staged generation");
 
-        let staged_manifest = ManifestStore::open(staged.manifest_db_path.as_path()).expect("open staged manifest");
+        let staged_manifest =
+            ManifestStore::open(staged.manifest_db_path.as_path()).expect("open staged manifest");
         assert!(
             staged_manifest
                 .mtime_size_unchanged("src/lib.rs", 123, 26)
@@ -2060,9 +2190,14 @@ mod tests {
             "staged manifest should retain embedding cache entries for stale refresh reuse"
         );
 
-        let staged_backend = CompositeBackend::open(staged.backend_db_path.parent().unwrap()).await.expect("open staged backend");
+        let staged_backend = CompositeBackend::open(staged.backend_db_path.parent().unwrap())
+            .await
+            .expect("open staged backend");
         assert_eq!(
-            staged_backend.list_indexed_paths().await.expect("staged backend paths"),
+            staged_backend
+                .list_indexed_paths()
+                .await
+                .expect("staged backend paths"),
             vec!["src/lib.rs".to_string()],
             "staged backend should start from the last-good indexed data"
         );
