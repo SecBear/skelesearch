@@ -38,7 +38,7 @@ use rmcp::{
 };
 use skelesearch_core::{
     classify_query, generation_db_paths, grep_codebase, is_indexing_active_elsewhere,
-    read_shared_indexing_status, try_acquire_indexing_lease, Config, CompositeBackend,
+    read_shared_indexing_status, try_acquire_indexing_lease, CompositeBackend, Config,
     EmbedProvider, FreshnessSnapshot, FreshnessState, GrepOptions, IndexResult, Indexer,
     LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher,
     SharedIndexingStatus, StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
@@ -553,6 +553,28 @@ impl SkeleSearchServer {
             }
         };
 
+        // Shortcut: if this is the default project and there is no active-generation
+        // pointer overriding the manifest path, return the initial backend directly.
+        // This avoids a second CompositeBackend::open on the same directory (which
+        // would fail with a Tantivy IndexWriter LockBusy error).
+        // When project_root was derived from current_dir() it may already be canonical
+        // (e.g. /private/var/... on macOS). Check existence via the path as-is.
+        let no_active_generation = !project_root.join(".skelesearch/active-generation").exists();
+        if no_active_generation {
+            if let Some(ref default_root) = self.default_project_root {
+                let canon_default =
+                    std::fs::canonicalize(default_root).unwrap_or_else(|_| default_root.clone());
+                if project_root == canon_default
+                    || std::fs::canonicalize(&project_root).map_or(false, |c| c == canon_default)
+                {
+                    return Ok((
+                        Arc::clone(&self.backend),
+                        self.manifest_path.as_ref().clone(),
+                    ));
+                }
+            }
+        }
+
         let (backend_path, manifest_path) =
             Self::resolve_index_paths_for_project_root(&project_root)?;
 
@@ -626,7 +648,10 @@ impl SkeleSearchServer {
             if !generation_id.is_empty() {
                 let generation_dir = storage_dir.join("generations").join(generation_id);
                 let (backend_path, manifest_path) = generation_db_paths(&generation_dir);
-                if backend_path.exists() && manifest_path.exists() {
+                // CompositeBackend uses lance/ + tantivy/ dirs, not index.db.
+                // Check for lance/ (the canonical "backend exists" signal).
+                let backend_dir = backend_path.parent().unwrap_or(&generation_dir);
+                if backend_dir.join("lance").exists() && manifest_path.exists() {
                     return Ok((backend_path, manifest_path));
                 }
             }
@@ -3455,8 +3480,7 @@ mod startup_tests {
                 .ok_or_else(|| anyhow::anyhow!("manifest path missing parent"))?,
         )?;
         let backend = Arc::new(
-            CompositeBackend::open(manifest_path.parent().expect("manifest parent"))
-                .await?,
+            CompositeBackend::open(manifest_path.parent().expect("manifest parent")).await?,
         );
         Ok(SkeleSearchServer::new(
             backend,
