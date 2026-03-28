@@ -20,6 +20,8 @@
         # crane v2: mkLib replaced the old crane.lib.${system} attribute
         craneLib = crane.mkLib pkgs;
         src = craneLib.cleanCargoSource ./.;
+        darwinRustRpathFlags = pkgs.lib.optionalString pkgs.stdenv.isDarwin
+          "-C link-arg=-Wl,-rpath,${pkgs.lib.getLib pkgs.onnxruntime}/lib";
 
         # cmake/pkg-config are needed by ort; onnxruntime satisfies ort-sys
         # without network downloads so Nix builds stay reproducible/offline.
@@ -36,6 +38,7 @@
           ORT_STRATEGY = "system";
           ORT_LIB_LOCATION = "${pkgs.lib.getLib pkgs.onnxruntime}/lib";
           ORT_PREFER_DYNAMIC_LINK = "1";
+          RUSTFLAGS = darwinRustRpathFlags;
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
             (pkgs.lib.getLib pkgs.onnxruntime)
           ];
@@ -117,6 +120,7 @@
           ORT_STRATEGY = "system";
           ORT_LIB_LOCATION = "${pkgs.lib.getLib pkgs.onnxruntime}/lib";
           ORT_PREFER_DYNAMIC_LINK = "1";
+          RUSTFLAGS = darwinRustRpathFlags;
           # Force clang for C++ deps (lance, ort) on NixOS where g++ lacks system headers
           CXX = "clang++";
           CC = "clang";
