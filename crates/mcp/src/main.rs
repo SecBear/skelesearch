@@ -78,8 +78,9 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     let backend = Arc::new(
-        skelesearch_core::CozoBackend::open(skelesearch_dir.join("index.db"))
-            .context("open CozoBackend")?,
+        skelesearch_core::CompositeBackend::open(&skelesearch_dir)
+            .await
+            .context("open CompositeBackend")?,
     );
     let manifest_path = skelesearch_dir.join("manifest.db");
 

@@ -6,14 +6,19 @@ license.workspace = true
 description = "Core library for skelesearch: schema, indexer, searcher, chunker, manifest"
 
 [features]
-default = ["storage-sqlite"]
-storage-sqlite = ["cozo/storage-sqlite"]
-storage-rocksdb = ["cozo/storage-rocksdb"]
+default = []
 watch = ["notify", "notify-debouncer-full"]
 
 [dependencies]
-cozo = { workspace = true }
 rusqlite = { workspace = true }
+# Composite backend
+lancedb = { workspace = true }
+tantivy = { workspace = true }
+petgraph = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-cast = { workspace = true }
+futures = { workspace = true }
 
 tree-sitter = { workspace = true }
 tree-sitter-tags = { workspace = true }

@@ -1,5 +1,5 @@
 use skelesearch_core::gc::collect_garbage;
-use skelesearch_core::{CozoBackend, ChunkRecord, FileRecord, ManifestStore, StorageBackend};
+use skelesearch_core::{CompositeBackend, ChunkRecord, FileRecord, ManifestStore, StorageBackend};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -7,7 +7,7 @@ async fn gc_removes_orphaned_chunks() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let idx = dir.path().join("idx");
     std::fs::create_dir_all(&idx)?;
-    let backend = Arc::new(CozoBackend::open(idx.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx).await?);
     let manifest = Arc::new(ManifestStore::open(idx.join("manifest.db"))?);
     backend.initialize(8).await?;
 
@@ -52,7 +52,7 @@ async fn gc_skips_existing_files() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let idx = dir.path().join("idx");
     std::fs::create_dir_all(&idx)?;
-    let backend = Arc::new(CozoBackend::open(idx.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx).await?);
     let manifest = Arc::new(ManifestStore::open(idx.join("manifest.db"))?);
     backend.initialize(8).await?;
 
@@ -83,7 +83,7 @@ async fn gc_empty_index_returns_zero() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let idx = dir.path().join("idx");
     std::fs::create_dir_all(&idx)?;
-    let backend = Arc::new(CozoBackend::open(idx.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx).await?);
     let manifest = Arc::new(ManifestStore::open(idx.join("manifest.db"))?);
     backend.initialize(8).await?;
 

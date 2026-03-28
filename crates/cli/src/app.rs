@@ -7,9 +7,9 @@ use fs2::FileExt;
 use notify::Watcher as _;
 use serde_json::json;
 use skelesearch_core::{
-    generation_db_paths, is_indexing_active_elsewhere, CozoBackend, Config, EmbedProvider,
+    generation_db_paths, is_indexing_active_elsewhere, CompositeBackend, Config, EmbedProvider,
     FreshnessSnapshot, FreshnessState, IndexStats, Indexer, ManifestStore, Searcher,
-    StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
+    StorageBackend, MANIFEST_DB_FILE,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 
@@ -65,19 +65,18 @@ fn active_index_paths(dir: &Path) -> (PathBuf, PathBuf) {
         let generation_id = pointer.trim();
         if !generation_id.is_empty() {
             let generation_dir = dir.join("generations").join(generation_id);
-            let (backend_path, manifest_path) = generation_db_paths(&generation_dir);
-            if backend_path.exists() && manifest_path.exists() {
-                return (backend_path, manifest_path);
+            let (_, manifest_path) = generation_db_paths(&generation_dir);
+            if generation_dir.join("lance").exists() && manifest_path.exists() {
+                return (generation_dir, manifest_path);
             }
         }
     }
-
-    (dir.join(INDEX_DB_FILE), dir.join(MANIFEST_DB_FILE))
+    (dir.to_path_buf(), dir.join(MANIFEST_DB_FILE))
 }
 
 fn active_backend_exists(dir: &Path) -> bool {
-    let (backend_path, _) = active_index_paths(dir);
-    backend_path.exists()
+    let (backend_dir, _) = active_index_paths(dir);
+    backend_dir.join("lance").exists()
 }
 
 /// Resolve the project root: explicit `path` argument or current directory.
@@ -89,11 +88,12 @@ fn resolve_root(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 }
 
 
-/// Open the CozoBackend at `dir/index.db`.
-fn open_backend(dir: &Path) -> anyhow::Result<Arc<CozoBackend>> {
-    let (db_path, _) = active_index_paths(dir);
-    let backend = CozoBackend::open(&db_path)
-        .with_context(|| format!("failed to open index at {}", db_path.display()))?;
+/// Open the CompositeBackend at `dir`.
+async fn open_backend(dir: &Path) -> anyhow::Result<Arc<CompositeBackend>> {
+    let (backend_dir, _) = active_index_paths(dir);
+    let backend = CompositeBackend::open(&backend_dir)
+        .await
+        .with_context(|| format!("failed to open index at {}", backend_dir.display()))?;
     Ok(Arc::new(backend))
 }
 
@@ -378,7 +378,7 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
         .with_context(|| format!("failed to create index dir: {}", dir.display()))?;
     let _lock = acquire_lock(&dir)?;
 
-    let backend = open_backend(&dir)?;
+    let backend = open_backend(&dir).await?;
     let manifest = open_manifest(&dir)?;
     let config = Config::load(&root)?;
 
@@ -448,7 +448,7 @@ async fn run_search(
 
     let provider = provider_from_name(&provider_name)?;
     let dim = provider.dim();
-    let backend = open_backend(&dir)?;
+    let backend = open_backend(&dir).await?;
     backend.initialize(dim).await?;
 
     let searcher = Searcher::new(backend, provider);
@@ -559,7 +559,7 @@ async fn run_context(file: PathBuf) -> anyhow::Result<()> {
 
     // Context lookup is read-only; we use a minimal no-op provider to satisfy
     // the Searcher generic without downloading a model.
-    let backend = open_backend(&dir)?;
+    let backend = open_backend(&dir).await?;
     // We need to call initialize so relations exist; borrow the stored dim
     // from the provider.  Since context never calls embed, dim doesn't matter.
     // Use a no-op shim — see NoopProvider below.
@@ -603,7 +603,7 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
     let dir = index_dir(&root);
 
     let stats = if active_backend_exists(&dir) {
-        let backend = open_backend(&dir)?;
+        let backend = open_backend(&dir).await?;
         // stats() queries `files` and `chunks` relations.  On an uninitialised
         // db those don't exist yet — return zeros rather than propagating the
         // error, since that situation is equivalent to an empty index.
@@ -886,7 +886,7 @@ async fn run_watch_index_pass(
 
     let _lock = acquire_lock(dir)?;
     let dim = provider.dim();
-    let backend = open_backend(dir)?;
+    let backend = open_backend(dir).await?;
     let manifest = open_manifest(dir)?;
     if let Err(e) = backend.initialize(dim).await {
         match kind {
@@ -947,7 +947,7 @@ async fn run_gc(path: Option<PathBuf>) -> anyhow::Result<()> {
         return Ok(());
     }
     let _lock = acquire_lock(&dir)?;
-    let backend = open_backend(&dir)?;
+    let backend = open_backend(&dir).await?;
     let manifest = open_manifest(&dir)?;
     let removed = skelesearch_core::gc::collect_garbage(&root, &backend, &manifest).await?;
     println!("Removed {removed} orphaned file(s) from index.");
@@ -1020,7 +1020,7 @@ async fn run_symbol(name: String, kind: Option<String>) -> anyhow::Result<()> {
     if !active_backend_exists(&dir) {
         anyhow::bail!("No index found in {}. Run `skelesearch index <path>` first.", dir.display());
     }
-    let backend = open_backend(&dir)?;
+    let backend = open_backend(&dir).await?;
     let results = backend.find_symbols(&name, kind.as_deref()).await?;
     if results.is_empty() {
         println!("No symbols found for {:?}", name);
@@ -1042,7 +1042,7 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
         anyhow::bail!("No index found. Run `skelesearch index <path>` first.");
     }
 
-    let backend = open_backend(&dir)?;
+    let backend = open_backend(&dir).await?;
     backend.initialize(dim).await?;
     let searcher = Searcher::new(backend, provider);
     let config = Config::load(&root).unwrap_or_default();

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use skelesearch_core::{
     generation_db_paths, git::changed_files_on_branch, try_acquire_indexing_lease,
-    write_file_atomic, Config, CozoBackend, EmbedProvider,
+    write_file_atomic, Config, CompositeBackend, EmbedProvider,
     FreshnessSnapshot as CoreFreshnessSnapshot, FreshnessState as CoreFreshnessState,
     Indexer, ManifestStore, Searcher, SharedIndexingStatus, StorageBackend, INDEX_DB_FILE,
     MANIFEST_DB_FILE,
@@ -52,7 +52,7 @@ struct ClientSession {
     last_seen: Instant,
 }
 
-type CachedSearcher = Searcher<CozoBackend, ArcProvider>;
+type CachedSearcher = Searcher<CompositeBackend, ArcProvider>;
 
 #[derive(Clone)]
 pub struct ArcProvider(pub Arc<dyn EmbedProvider + Send + Sync>);
@@ -784,7 +784,7 @@ async fn read_persisted_index_stats(
     project: &ProjectState,
 ) -> anyhow::Result<Option<(usize, usize, Option<String>)>> {
     let backend_path = project.active_backend_path().await;
-    let backend = Arc::new(CozoBackend::open(&backend_path)?);
+    let backend = Arc::new(CompositeBackend::open(backend_path.parent().ok_or_else(|| anyhow::anyhow!("backend path has no parent"))?).await?);
     match backend.stats().await {
         Ok(stats) => Ok(Some((
             stats.indexed_files,
@@ -855,7 +855,7 @@ async fn build_searcher_for_project(project: &ProjectState) -> anyhow::Result<Ar
         *guard = Some(provider_name.clone());
     }
     let backend_path = project.active_backend_path().await;
-    let backend = Arc::new(CozoBackend::open(&backend_path)?);
+    let backend = Arc::new(CompositeBackend::open(backend_path.parent().ok_or_else(|| anyhow::anyhow!("backend path has no parent"))?).await?);
     let root = project.canonical_root.clone();
     let config = Config::load(&root).unwrap_or_default();
     let searcher = Searcher::new(backend, provider);
@@ -924,7 +924,7 @@ async fn run_real_index(
             #[cfg(test)]
             if let Ok(dim_str) = std::env::var("SKELESEARCH_TEST_PROVIDER_DIM") {
                 if let Ok(dim) = dim_str.parse::<usize>() {
-                    let backend = Arc::new(CozoBackend::open(&backend_path)?);
+                    let backend = Arc::new(CompositeBackend::open(backend_path.parent().ok_or_else(|| anyhow::anyhow!("backend path has no parent"))?).await?);
                     let manifest = Arc::new(ManifestStore::open(&manifest_path)?);
                     let config = Config::load(&root).context("load .skelesearch.toml")?;
                     let indexer = Indexer::new(backend, manifest, TestProvider { name: "test", dim })
@@ -934,7 +934,7 @@ async fn run_real_index(
                     return indexer.index_path(&root).await;
                 }
             }
-            let backend = Arc::new(CozoBackend::open(&backend_path)?);
+            let backend = Arc::new(CompositeBackend::open(backend_path.parent().ok_or_else(|| anyhow::anyhow!("backend path has no parent"))?).await?);
             let manifest = Arc::new(ManifestStore::open(&manifest_path)?);
             let provider = build_arc_provider(&provider_name)?;
             let config = Config::load(&root).context("load .skelesearch.toml")?;
@@ -1525,8 +1525,9 @@ mod tests {
         std::fs::write(project.canonical_root.join("src/lib.rs"), "pub fn hello() -> u32 { 1 }")
             .expect("write source file");
 
+        let bp = project.active_backend_path().await;
         let backend = Arc::new(
-            CozoBackend::open(project.active_backend_path().await)
+            CompositeBackend::open(bp.parent().unwrap()).await
                 .expect("open backend"),
         );
         let manifest = Arc::new(
@@ -1890,8 +1891,9 @@ mod tests {
 
         let before_generation = project.active_generation_id().await;
 
+        let bp = project.active_backend_path().await;
         let backend = Arc::new(
-            CozoBackend::open(project.active_backend_path().await).expect("open backend for cached searcher"),
+            CompositeBackend::open(bp.parent().unwrap()).await.expect("open backend for cached searcher"),
         );
         let seeded_searcher = Searcher::new(
             backend,
@@ -2058,7 +2060,7 @@ mod tests {
             "staged manifest should retain embedding cache entries for stale refresh reuse"
         );
 
-        let staged_backend = CozoBackend::open(&staged.backend_db_path).expect("open staged backend");
+        let staged_backend = CompositeBackend::open(staged.backend_db_path.parent().unwrap()).await.expect("open staged backend");
         assert_eq!(
             staged_backend.list_indexed_paths().await.expect("staged backend paths"),
             vec!["src/lib.rs".to_string()],

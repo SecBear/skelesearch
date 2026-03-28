@@ -17,7 +17,7 @@ use std::{
 
 use async_trait::async_trait;
 use skelesearch_core::{
-    try_acquire_indexing_lease, CozoBackend, EmbedProvider, Indexer, ManifestStore,
+    try_acquire_indexing_lease, CompositeBackend, EmbedProvider, Indexer, ManifestStore,
     SharedIndexingStatus,
 };
 use skelesearch_mcp::{
@@ -195,10 +195,9 @@ async fn test_server() -> anyhow::Result<SkeleSearchServer> {
     let storage_dir = project_dir.path().join(".skelesearch");
     std::fs::create_dir_all(&storage_dir)?;
 
-    let backend_path = storage_dir.join("index.db");
     let manifest_path = storage_dir.join("manifest.db");
 
-    let backend = Arc::new(CozoBackend::open(&backend_path)?);
+    let backend = Arc::new(CompositeBackend::open(&storage_dir).await?);
     let provider = det_provider();
 
     {
@@ -220,10 +219,9 @@ async fn test_server_with_manifest_path() -> anyhow::Result<(SkeleSearchServer, 
     let storage_dir = project_dir.path().join(".skelesearch");
     std::fs::create_dir_all(&storage_dir)?;
 
-    let backend_path = storage_dir.join("index.db");
     let manifest_path = storage_dir.join("manifest.db");
 
-    let backend = Arc::new(CozoBackend::open(&backend_path)?);
+    let backend = Arc::new(CompositeBackend::open(&storage_dir).await?);
     let provider = det_provider();
 
     {
@@ -413,7 +411,7 @@ async fn index_codebase_returns_status_indexed_and_chunk_counts() -> anyhow::Res
     // Fresh server (not pre-indexed) so `indexed_files > 0` on first run.
     let backend_dir = TempDir::new()?;
     let manifest_dir = TempDir::new()?;
-    let backend = Arc::new(CozoBackend::open(backend_dir.path().join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(backend_dir.path()).await?);
     let manifest_path = manifest_dir.path().join("manifest.db");
     let server = SkeleSearchServer::new(backend, &manifest_path, det_provider());
     std::mem::forget(backend_dir);

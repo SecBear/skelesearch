@@ -4,7 +4,7 @@ use async_trait::async_trait;
 mod test_utils;
 use test_utils::{copy_dir_all, DeterministicTestProvider};
 use skelesearch_core::{
-    CozoBackend, EdgeRecord, EmbedProvider, FileContext, FileRecord, Indexer, ManifestStore,
+    CompositeBackend, EdgeRecord, EmbedProvider, FileContext, FileRecord, Indexer, ManifestStore,
     Searcher, StorageBackend,
 };
 use tempfile::TempDir;
@@ -17,9 +17,9 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn test_backend() -> anyhow::Result<Arc<CozoBackend>> {
+async fn test_backend() -> anyhow::Result<Arc<CompositeBackend>> {
     let dir = tempfile::tempdir()?;
-    let backend = CozoBackend::open(dir.path().join("index.db"))?;
+    let backend = CompositeBackend::open(dir.path()).await?;
     std::mem::forget(dir);
     Ok(Arc::new(backend))
 }
@@ -41,13 +41,13 @@ fn fixture_repo() -> anyhow::Result<TempDir> {
 
 /// Build an indexed backend + searcher ready for retrieval tests.
 async fn indexed_searcher() -> anyhow::Result<(
-    Arc<CozoBackend>,
-    Searcher<CozoBackend, DeterministicTestProvider>,
+    Arc<CompositeBackend>,
+    Searcher<CompositeBackend, DeterministicTestProvider>,
     TempDir,
     TempDir,
 )> {
     let fixture = fixture_repo()?;
-    let backend = test_backend()?;
+    let backend = test_backend().await?;
     let (manifest, manifest_dir) = test_manifest()?;
 
     // Index the fixture.
@@ -73,7 +73,7 @@ async fn match_quality_uses_documented_relative_thresholds() -> anyhow::Result<(
     // 0.8 >= 0.8 * 1.0  → high
     // 0.5 >= 0.5 * 1.0  → moderate
     // 0.49 < 0.5 * 1.0  → low
-    let labels = Searcher::<Arc<CozoBackend>, DeterministicTestProvider>::label_match_quality(
+    let labels = Searcher::<CompositeBackend, DeterministicTestProvider>::label_match_quality(
         &[1.0, 0.8, 0.5, 0.49],
     );
     assert_eq!(labels, vec!["high", "high", "moderate", "low"]);
@@ -82,7 +82,7 @@ async fn match_quality_uses_documented_relative_thresholds() -> anyhow::Result<(
 
 #[tokio::test]
 async fn match_quality_empty_slice_returns_empty() -> anyhow::Result<()> {
-    let labels = Searcher::<Arc<CozoBackend>, DeterministicTestProvider>::label_match_quality(&[]);
+    let labels = Searcher::<CompositeBackend, DeterministicTestProvider>::label_match_quality(&[]);
     assert!(labels.is_empty());
     Ok(())
 }
@@ -194,7 +194,7 @@ async fn two_hop_traversal_finds_transitive_imports() -> anyhow::Result<()> {
     // Setup: a.rs imports b.rs, b.rs imports c.rs
     // traverse_imports("a.rs", 2) should find both b.rs and c.rs
     let dir = tempfile::tempdir()?;
-    let backend = Arc::new(CozoBackend::open(dir.path().join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(dir.path()).await?);
     backend.initialize(8).await?;
 
     for name in ["a.rs", "b.rs", "c.rs"] {
@@ -221,7 +221,7 @@ async fn two_hop_traversal_finds_transitive_imports() -> anyhow::Result<()> {
 #[tokio::test]
 async fn traverse_handles_cycles() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let backend = Arc::new(CozoBackend::open(dir.path().join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(dir.path()).await?);
     backend.initialize(8).await?;
 
     for name in ["a.rs", "b.rs"] {
@@ -285,7 +285,7 @@ async fn concurrent_index_and_search_does_not_panic() -> anyhow::Result<()> {
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
 
     backend.initialize(8).await?;
@@ -352,7 +352,7 @@ async fn mmr_reranking_diversifies_results() -> anyhow::Result<()> {
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
 
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
     backend.initialize(4).await?;
 

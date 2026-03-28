@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use predicates::prelude::PredicateBooleanExt;
-use skelesearch_core::{CozoBackend, EmbedProvider, Indexer, ManifestStore, StorageBackend};
+use skelesearch_core::{CompositeBackend, EmbedProvider, Indexer, ManifestStore, StorageBackend};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -120,15 +120,14 @@ fn build_index_in<P: EmbedProvider + 'static>(
 ) {
     std::fs::create_dir_all(&index_dir).unwrap();
 
-    let backend = Arc::new(
-        CozoBackend::open(index_dir.join("index.db")).expect("open cozo backend"),
-    );
-    let manifest = Arc::new(
-        ManifestStore::open(index_dir.join("manifest.db")).expect("open manifest"),
-    );
-
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
+        let backend = Arc::new(
+            CompositeBackend::open(index_dir).await.expect("open composite backend"),
+        );
+        let manifest = Arc::new(
+            ManifestStore::open(index_dir.join("manifest.db")).expect("open manifest"),
+        );
         backend.initialize(dim).await.expect("initialize backend");
         let indexer = Indexer::new(backend, manifest, provider);
         indexer.index_path(repo_root).await.expect("index fixture");

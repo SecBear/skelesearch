@@ -12,7 +12,7 @@
 // (not yet written) would need to spawn a child process, kill it, and
 // reopen the store to verify cross-process durability.
 
-use skelesearch_core::{CozoBackend, Indexer, ManifestStore, StorageBackend};
+use skelesearch_core::{CompositeBackend, Indexer, ManifestStore, StorageBackend};
 use std::sync::Arc;
 
 struct ZeroProvider(usize);
@@ -66,7 +66,7 @@ async fn completed_files_not_reindexed_on_subsequent_run() -> anyhow::Result<()>
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
     backend.initialize(8).await?;
 

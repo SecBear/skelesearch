@@ -33,9 +33,9 @@ fn empty_source_returns_empty() {
 
 #[tokio::test]
 async fn symbols_round_trip_through_backend() -> anyhow::Result<()> {
-    use skelesearch_core::{CozoBackend, StorageBackend};
+    use skelesearch_core::{CompositeBackend, StorageBackend};
     let dir = tempfile::tempdir()?;
-    let backend = CozoBackend::open(dir.path().join("index.db"))?;
+    let backend = CompositeBackend::open(dir.path()).await?;
     backend.initialize(8).await?;
 
     backend
@@ -61,9 +61,9 @@ async fn symbols_round_trip_through_backend() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn find_symbols_kind_filter() -> anyhow::Result<()> {
-    use skelesearch_core::{CozoBackend, StorageBackend};
+    use skelesearch_core::{CompositeBackend, StorageBackend};
     let dir = tempfile::tempdir()?;
-    let backend = CozoBackend::open(dir.path().join("index.db"))?;
+    let backend = CompositeBackend::open(dir.path()).await?;
     backend.initialize(8).await?;
 
     backend

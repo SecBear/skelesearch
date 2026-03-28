@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-storage-rocksdb = ["skelesearch-core/storage-rocksdb"]
 local-reranker = ["dep:skelesearch-rerank-local"]
 coreml = ["local-reranker", "skelesearch-rerank-local/coreml"]
 cuda = ["local-reranker", "skelesearch-rerank-local/cuda"]

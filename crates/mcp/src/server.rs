@@ -38,10 +38,10 @@ use rmcp::{
 };
 use skelesearch_core::{
     classify_query, generation_db_paths, grep_codebase, is_indexing_active_elsewhere,
-    read_shared_indexing_status, try_acquire_indexing_lease, Config, CozoBackend, EmbedProvider,
-    FreshnessSnapshot, FreshnessState, GrepOptions, IndexResult, Indexer, LLMExpander,
-    ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher, SharedIndexingStatus,
-    StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
+    read_shared_indexing_status, try_acquire_indexing_lease, Config, CompositeBackend,
+    EmbedProvider, FreshnessSnapshot, FreshnessState, GrepOptions, IndexResult, Indexer,
+    LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher,
+    SharedIndexingStatus, StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 use skelesearch_service::{
@@ -165,11 +165,11 @@ impl Default for IndexProgress {
 /// and is therefore `!Sync`.  We avoid this by storing the manifest's file path
 /// and opening a fresh connection per index operation rather than sharing one.
 /// Type alias for the concrete searcher used by the MCP server.
-type CachedSearcher = Searcher<CozoBackend, ArcProvider>;
+type CachedSearcher = Searcher<CompositeBackend, ArcProvider>;
 
 #[derive(Clone)]
 pub struct SkeleSearchServer {
-    backend: Arc<CozoBackend>,
+    backend: Arc<CompositeBackend>,
     /// Path to the manifest SQLite database; opened fresh per index_codebase call.
     manifest_path: Arc<PathBuf>,
     /// Provider used for query embedding in `search_code`.  Wrapped in an
@@ -189,7 +189,7 @@ pub struct SkeleSearchServer {
     /// Cache of opened backends for non-cwd projects. Keyed by project root.
     /// The default backend (self.backend) handles the cwd project; this cache
     /// serves tools that specify an explicit `path` to a different project.
-    backend_cache: Arc<tokio::sync::RwLock<HashMap<PathBuf, (Arc<CozoBackend>, PathBuf)>>>,
+    backend_cache: Arc<tokio::sync::RwLock<HashMap<PathBuf, (Arc<CompositeBackend>, PathBuf)>>>,
     /// Guards against starting more than one file watcher per server lifetime.
     /// `on_initialized` is called on every client reconnect; this AtomicBool
     /// ensures the background watcher task is spawned only once.
@@ -326,7 +326,7 @@ impl SkeleSearchServer {
     /// `manifest_path` is the filesystem path to the manifest database (will be
     /// created if absent).  `provider` is used for search-time query embedding.
     pub fn new(
-        backend: Arc<CozoBackend>,
+        backend: Arc<CompositeBackend>,
         manifest_path: impl Into<PathBuf>,
         provider: impl EmbedProvider + Send + Sync + 'static,
     ) -> Self {
@@ -512,11 +512,11 @@ impl SkeleSearchServer {
 
     /// Resolve a backend for the given path. If `path` is None, returns the
     /// default (cwd) backend. Otherwise, finds the project root for the path,
-    /// opens a CozoBackend on first use, and caches it for the session.
+    /// opens a CompositeBackend on first use, and caches it for the session.
     async fn resolve_backend(
         &self,
         path: Option<&str>,
-    ) -> anyhow::Result<(Arc<CozoBackend>, PathBuf)> {
+    ) -> anyhow::Result<(Arc<CompositeBackend>, PathBuf)> {
         let target = match path {
             None => match self.default_project_root.as_ref() {
                 Some(root) => root.clone(),
@@ -566,7 +566,7 @@ impl SkeleSearchServer {
             }
         }
 
-        let backend = Arc::new(CozoBackend::open(&backend_path)?);
+        let backend = Arc::new(CompositeBackend::open(backend_path.parent().unwrap()).await?);
 
         tracing::info!(instance_id = %self.instance_id, project = %project_root.display(), manifest_path = %manifest_path.display(), "opened backend for new project");
 
@@ -914,7 +914,7 @@ impl SkeleSearchServer {
     /// it for future calls.
     async fn prepare_search_provider(
         &self,
-        backend: &Arc<CozoBackend>,
+        backend: &Arc<CompositeBackend>,
         manifest_path: &Path,
     ) -> anyhow::Result<ArcProvider> {
         let stats = match backend.stats().await {
@@ -3454,12 +3454,10 @@ mod startup_tests {
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("manifest path missing parent"))?,
         )?;
-        let backend = Arc::new(CozoBackend::open(
-            manifest_path
-                .parent()
-                .expect("manifest parent")
-                .join("index.db"),
-        )?);
+        let backend = Arc::new(
+            CompositeBackend::open(manifest_path.parent().expect("manifest parent"))
+                .await?,
+        );
         Ok(SkeleSearchServer::new(
             backend,
             manifest_path,
@@ -3467,7 +3465,7 @@ mod startup_tests {
         ))
     }
 
-    fn write_active_generation_fixture(
+    async fn write_active_generation_fixture(
         project_root: &std::path::Path,
         generation_id: &str,
         provider_name: &str,
@@ -3476,7 +3474,7 @@ mod startup_tests {
         let generation_dir = storage_dir.join("generations").join(generation_id);
         std::fs::create_dir_all(&generation_dir)?;
         let (backend_path, manifest_path) = generation_db_paths(&generation_dir);
-        let _backend = CozoBackend::open(&backend_path)?;
+        let _backend = CompositeBackend::open(backend_path.parent().unwrap()).await?;
         let manifest = ManifestStore::open(&manifest_path)?;
         manifest.set_meta("provider", provider_name)?;
         std::fs::write(storage_dir.join("active-generation"), generation_id)?;
@@ -3591,13 +3589,13 @@ mod startup_tests {
         let manifest_path = root.join(".skelesearch/manifest.db");
         let server = startup_test_server(&root, &manifest_path).await?;
 
-        let manifest_a = write_active_generation_fixture(&root, "gen-a", "openai")?;
+        let manifest_a = write_active_generation_fixture(&root, "gen-a", "openai").await?;
         let (_backend_a, resolved_a) = server
             .resolve_backend(Some(root.to_string_lossy().as_ref()))
             .await?;
         assert_eq!(resolved_a, manifest_a);
 
-        let manifest_b = write_active_generation_fixture(&root, "gen-b", "voyage")?;
+        let manifest_b = write_active_generation_fixture(&root, "gen-b", "voyage").await?;
         let (_backend_b, resolved_b) = server
             .resolve_backend(Some(root.to_string_lossy().as_ref()))
             .await?;
@@ -3628,7 +3626,7 @@ mod startup_tests {
 
         std::env::set_var("SKELESEARCH_DAEMON_SOCKET", &socket_path);
         let server = startup_test_server(&root, &manifest_path).await?;
-        let _active_manifest = write_active_generation_fixture(&root, "gen-a", "openai")?;
+        let _active_manifest = write_active_generation_fixture(&root, "gen-a", "openai").await?;
 
         trigger_watcher_refresh(&server, &root).await?;
 

@@ -24,14 +24,17 @@ homepage = "https://github.com/SecBear/skelesearch"
 repository = "https://github.com/SecBear/skelesearch"
 
 [workspace.dependencies]
-# Storage
-# Default: storage-sqlite (fast compile, persistent, full feature parity for dev)
-# Release: override in crate Cargo.toml with features = ["storage-rocksdb"]
-# or: cargo build --features skelesearch-core/storage-rocksdb
-cozo = { version = "0.7.6", default-features = false, features = [
-   "storage-sqlite",
-   "rayon",
-] }
+# Composite backend: LanceDB (vector + relational), Tantivy (BM25 FTS), petgraph (graph analytics)
+lancedb = "0.27"
+tantivy = "0.25"
+petgraph = { version = "0.8", features = ["serde-1"] }
+arrow-array = "57"
+arrow-schema = "57"
+arrow-cast = "57"
+futures = "0.3"
+
+# rusqlite is used by ManifestStore (flat SQLite manifest, not migrated).
+# CozoDB removed; the sqlite3-sys shim is no longer needed.
 rusqlite = { version = "0.38", features = ["bundled"] }
 
 # Tree-sitter
@@ -109,10 +112,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fs2 = "0.4"
 regex = "1"
 toml = "0.8"
-
-# Patch: redirect sqlite3-sys to a local shim that omits `links = "sqlite3"`.
-# This allows cozo (via sqlite→sqlite3-sys) and rusqlite (via libsqlite3-sys)
-# to coexist in the same binary — libsqlite3-sys (bundled) owns the native
-# library and satisfies the extern "C" declarations in the shim at link time.
-[patch.crates-io]
-sqlite3-sys = { path = "vendor/sqlite3-sys" }

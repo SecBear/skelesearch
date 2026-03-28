@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 mod test_utils;
 use test_utils::{copy_dir_all, DeterministicTestProvider};
 use skelesearch_core::{
-    CozoBackend, EmbedProvider, IndexResult, Indexer, ManifestStore, StorageBackend,
+    CompositeBackend, EmbedProvider, IndexResult, Indexer, ManifestStore, StorageBackend,
 };
 use tempfile::TempDir;
 
@@ -101,10 +101,10 @@ impl EmbedProvider for NamedCountingProvider {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create an in-memory-ish CozoBackend in a temp directory.
-fn test_backend() -> anyhow::Result<Arc<CozoBackend>> {
+/// Create an in-memory-ish CompositeBackend in a temp directory.
+async fn test_backend() -> anyhow::Result<Arc<CompositeBackend>> {
     let dir = tempfile::tempdir()?;
-    let backend = CozoBackend::open(dir.path().join("index.db"))?;
+    let backend = CompositeBackend::open(dir.path()).await?;
     // Leak the TempDir so it lives for the duration of the test.
     std::mem::forget(dir);
     Ok(Arc::new(backend))
@@ -166,7 +166,7 @@ fn embedding_cache_has_entry(db_path: &std::path::Path, content_hash: &str) -> a
 async fn indexer_skips_unchanged_files_reconciles_renames_and_removes_deleted_paths(
 ) -> anyhow::Result<()> {
     let fixture = fixture_repo()?;
-    let backend = test_backend()?;
+    let backend = test_backend().await?;
     let (manifest, _manifest_dir) = test_manifest()?;
     let provider = DeterministicTestProvider::new(8);
     let indexer = Indexer::new(backend.clone(), manifest.clone(), provider);
@@ -220,7 +220,7 @@ async fn indexer_batches_embeddings_instead_of_one_call_per_chunk() -> anyhow::R
     let fixture = fixture_repo()?;
     let (manifest, _manifest_dir) = test_manifest()?;
     let provider = CountingTestProvider::new(8);
-    let indexer = Indexer::new(test_backend()?, manifest, provider.clone());
+    let indexer = Indexer::new(test_backend().await?, manifest, provider.clone());
 
     indexer.index_path(fixture.path()).await?;
 
@@ -244,7 +244,7 @@ async fn indexer_batches_embeddings_instead_of_one_call_per_chunk() -> anyhow::R
 #[tokio::test]
 async fn indexer_updates_last_indexed_after_successful_index() -> anyhow::Result<()> {
     let fixture = fixture_repo()?;
-    let backend = test_backend()?;
+    let backend = test_backend().await?;
     let (manifest, _manifest_dir) = test_manifest()?;
     let provider = DeterministicTestProvider::new(8);
     let indexer = Indexer::new(backend.clone(), manifest, provider);
@@ -263,7 +263,7 @@ async fn indexer_updates_last_indexed_after_successful_index() -> anyhow::Result
 #[tokio::test]
 async fn indexer_second_pass_skips_unchanged_files() -> anyhow::Result<()> {
     let fixture = fixture_repo()?;
-    let backend = test_backend()?;
+    let backend = test_backend().await?;
     let (manifest, _manifest_dir) = test_manifest()?;
     let provider = CountingTestProvider::new(8);
     let indexer = Indexer::new(backend.clone(), manifest, provider.clone());
@@ -294,7 +294,7 @@ async fn stale_refresh_preserves_cache_hits() -> anyhow::Result<()> {
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
 
     backend.initialize(8).await?;
@@ -331,7 +331,7 @@ async fn provider_change_clears_embedding_cache_and_file_hashes() -> anyhow::Res
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
     let manifest_db = idx_dir.join("manifest.db");
 
@@ -371,7 +371,7 @@ async fn dimension_change_clears_embedding_cache_and_file_hashes() -> anyhow::Re
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
     let manifest_db = idx_dir.join("manifest.db");
 
@@ -405,7 +405,7 @@ async fn dimension_change_clears_embedding_cache_and_file_hashes() -> anyhow::Re
 #[tokio::test]
 async fn indexer_handles_empty_directory_gracefully() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let backend = test_backend()?;
+    let backend = test_backend().await?;
     let (manifest, _manifest_dir) = test_manifest()?;
     let provider = DeterministicTestProvider::new(8);
     let indexer = Indexer::new(backend.clone(), manifest, provider);
@@ -471,7 +471,7 @@ async fn indexer_processes_in_bounded_file_batches() -> anyhow::Result<()> {
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = std::sync::Arc::new(skelesearch_core::CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = std::sync::Arc::new(skelesearch_core::CompositeBackend::open(&idx_dir).await?);
     let manifest = std::sync::Arc::new(skelesearch_core::ManifestStore::open(idx_dir.join("manifest.db"))?);
     let provider = BatchTrackingProvider::new(8);
 
@@ -527,7 +527,7 @@ async fn embedding_count_mismatch_returns_error() -> anyhow::Result<()> {
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
 
     backend.initialize(8).await?;
@@ -560,7 +560,7 @@ async fn binary_files_are_skipped() -> anyhow::Result<()> {
 
     let idx_dir = dir.path().join("idx");
     std::fs::create_dir_all(&idx_dir)?;
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
 
     backend.initialize(8).await?;
@@ -613,7 +613,7 @@ async fn embedding_cache_reduces_provider_calls() -> anyhow::Result<()> {
     std::fs::create_dir_all(&idx_dir)?;
 
     // Shared backend and manifest (same manifest DB = same embedding_cache).
-    let backend = Arc::new(CozoBackend::open(idx_dir.join("index.db"))?);
+    let backend = Arc::new(CompositeBackend::open(&idx_dir).await?);
     let manifest = Arc::new(ManifestStore::open(idx_dir.join("manifest.db"))?);
 
     // --- Run 1: all files are new, all chunks need embedding ---
