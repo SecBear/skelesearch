@@ -21,6 +21,8 @@ schema and retrieval logic is small and tailored to code search.
 
 ## ADR-002: CozoDB over LanceDB / sqlite-vec
 
+**Status:** Superseded by ADR-011
+
 **Decision:** Use CozoDB as the embedded storage and search engine.
 
 **Why:** CozoDB is the only embedded database that provides HNSW vector search, BM25 full-text
@@ -171,3 +173,33 @@ explicit Cargo dependencies, not a bundle crate.
 **Why:** No dominant bundle crate exists in the Rust ecosystem (unlike Python's tree-sitter-languages).
 Individual crates compile faster (no unused grammars), have precise version pinning, and allow
 feature-flagging languages. Add grammars only for languages that have a LanguageConfig impl.
+
+---
+
+## ADR-011: Replace CozoDB with CompositeBackend (LanceDB + Tantivy + petgraph)
+
+**Date:** 2026-03-28
+**Status:** Accepted
+**Supersedes:** ADR-002 (CozoDB as storage layer)
+
+### Decision
+Replace `CozoBackend` (the sole `StorageBackend` implementation) with `CompositeBackend`, which routes through three purpose-built engines:
+- **LanceDB** — vector storage and relational tables (Apache Arrow, MVCC, DataFusion pre-filter)
+- **Tantivy** — BM25 full-text search with a `CodeAnalyzer` tokenizer that splits CamelCase and snake_case identifiers
+- **petgraph** — in-memory directed import graph for BFS traversal and deterministic PageRank
+
+### Context
+CozoDB blocked on four documented limitations (`docs/cozodb-limitations.md`):
+1. Exclusive SQLite WAL lock blocks concurrent reads during writes
+2. Fixed FTS tokenizer — no CamelCase/snake_case splitting
+3. No predicate pushdown on vector search (required over-fetching)
+4. Opaque Datalog recursive planner with unpredictable O(N²) degradation
+
+The `StorageBackend` trait already isolated all CozoDB code. The migration was a full swap of the sole concrete implementation.
+
+### Consequences
+- **Breaking:** On-disk format changed. Existing `index.db` files are not migrated. Users must re-index with `skelesearch index`.
+- **Removed:** `cozo` crate, `rusqlite` direct usage in core, `vendor/sqlite3-sys` shim, `storage-sqlite`/`storage-rocksdb` Cargo features
+- **Added:** `lancedb 0.27`, `tantivy 0.25`, `petgraph 0.8`, `arrow-array 57`, `arrow-schema 57`
+- The `ManifestStore` (SQLite-backed manifest, ADR-006) is NOT migrated and still uses `rusqlite`
+- `protoc` is now required to build (needed by `lance-encoding`)

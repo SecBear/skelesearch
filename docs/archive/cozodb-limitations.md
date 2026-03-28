@@ -1,3 +1,5 @@
+> **ARCHIVED (2026-03-28):** CozoDB replaced by CompositeBackend (ADR-011). See `docs/composite-backend.md`.
+
 # CozoDB Limitations & Workarounds
 
 **Purpose:** Document every CozoDB limitation encountered during skelesearch development.
