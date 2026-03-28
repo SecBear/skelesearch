@@ -22,7 +22,9 @@ swebench-repos/
 /agents/
 /skills/
 /docs/superpowers/
+/.omp/
 /.omp/*.log
+/rust_out
 .sisyphus/
 .brain/
 .fastembed_cache/
