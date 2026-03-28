@@ -48,8 +48,8 @@ The index lives in `.skelesearch/` at the project root. Add it to `.gitignore`.
    re-embedding unchanged chunks on subsequent runs. The **provider manifest**
    records which model was used at index time; search auto-detects it.
 
-3. **Storage** — CozoDB stores chunks, embeddings (HNSW index), full-text
-   (BM25), import graph edges, and symbol definitions.
+3. **Storage** — CompositeBackend stores chunks, embeddings (LanceDB HNSW index), full-text
+   (Tantivy BM25), import graph edges, and symbol definitions.
 
 4. **Search** — queries run through both HNSW vector search and BM25 full-text
    search. Results are fused via **Reciprocal Rank Fusion** (RRF), then
@@ -181,8 +181,8 @@ crates/
 ```
 
 Key design boundaries:
-- `StorageBackend` trait — all CozoDB access is behind this; migration to
-  LanceDB+Tantivy is a single-file change
+- `StorageBackend` trait — all storage access is behind this; swap LanceDB+Tantivy+petgraph
+  for any future backend without touching indexing logic
 - `EmbedProvider` trait — swap embedding models without touching indexing logic
 - `Reranker` trait — pluggable cross-encoder stage after RRF fusion
 - Manifest (SQLite) — change detection, crash recovery, embedding cache, provider record

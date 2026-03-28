@@ -1,7 +1,8 @@
 # Architecture Evolution: Progressive Materialization
 
-**Status:** Design direction. Not yet implemented.
-**Date:** 2026-03-22
+**Status:** Partially implemented. CompositeBackend is live on `main`. Three-tier
+materialization and query-time graph integration are future work.
+**Last updated:** 2026-03-28
 **Context:** Ablation study showed skelesearch's pipeline features (graph, expansion, reranker)
 add marginal value over bare hybrid retrieval. The architecture needs to evolve from
 "flat vector store with bolted-on features" to "progressively materialized knowledge graph."
@@ -10,10 +11,14 @@ add marginal value over bare hybrid retrieval. The architecture needs to evolve 
 
 ## Core Insight
 
-CozoDB already blurs the line between vector DB, graph DB, and relational store. We're
-treating it as a vector store with side tables. The competitive advantage isn't in the
-embedding model or reranker (commodity) — it's in structural analysis + Datalog-powered
-retrieval that combines vector similarity with graph traversal in a single query.
+The competitive advantage isn't in the embedding model or reranker (commodity) — it's in
+structural analysis + **graph-integrated retrieval** that combines vector similarity with
+import graph traversal in a single pipeline pass.
+
+Current state (CompositeBackend, live on `main`):
+- LanceDB: HNSW vector storage + relational tables via Apache Arrow
+- Tantivy: BM25 full-text search with a code-aware tokenizer (CamelCase/snake_case splitting)
+- petgraph: in-memory import graph for BFS traversal and PageRank
 
 ## Three-Tier Materialization
 
@@ -64,20 +69,17 @@ When a user returns and the repo has changed:
 This is Nix-style content addressing applied to individual files,
 not whole corpora.
 
-## Datalog-Powered Retrieval (The Real Differentiator)
+## Graph-Integrated Retrieval (The Real Differentiator)
 
 Nobody else does this. Current tools: embed query → ANN search → return top-k.
 
-With CozoDB, a single Datalog query can:
-1. Find chunks semantically similar to the query (HNSW)
-2. Walk the call graph outward 2 hops from matched symbols
+With CompositeBackend, the retrieval pipeline can:
+1. Find chunks semantically similar to the query (LanceDB HNSW)
+2. Walk the import graph outward via petgraph BFS
 3. Pull in type definitions those symbols reference
-4. Rank by fusion of vector similarity + graph distance + BM25
+4. Rank by fusion of vector similarity + graph distance + BM25 (RRF)
 
-In a standard vector DB + separate graph DB, that's three round trips
-and manual stitching. In CozoDB it's one query.
-
-### What We Do Now (Broken)
+### What We Do Now
 
 ```
 Query → embed → [HNSW + BM25 parallel] → RRF fusion → PageRank boost
@@ -90,49 +92,21 @@ about — it just dumps everything from imported files.
 
 ### What We Should Do
 
-```datalog
-# Single Datalog query: hybrid retrieval + graph walk + type resolution
-# CozoDB can do this natively.
+Tight graph-vector fusion: use the query embedding to score graph-expanded
+results instead of treating all expanded nodes equally. The BFS walk from
+high-scoring seed chunks produces candidates; a second-pass vector similarity
+against the query decides which graph nodes are actually relevant.
 
-vec_hits[fp, ci, score] :=
-    ~chunks:embedding{ fp, ci | query: $q_vec, k: 50, ef: 100,
-                       bind_distance: d, radius: 0.8 },
-    score = 1.0 / (60.0 + d)
+This stays in Rust (petgraph + LanceDB vector lookup), so it's one async
+pipeline, not three sequential round-trips.
 
-fts_hits[fp, ci, score] :=
-    ~chunks:text{ fp, ci | query: $q_str, k: 50,
-                  score_kind: 'tf_idf', bind_score: s },
-    score = 1.0 / (60.0 + 1.0 / (s + 0.001))
-
-# RRF fusion
-base[fp, ci, sum(score)] := vec_hits[fp, ci, score]
-base[fp, ci, sum(score)] := fts_hits[fp, ci, score]
-
-# Graph walk: importers/callers of top hits (1 hop)
-graph[fp, ci, parent_score * 0.5] :=
-    base[target_fp, _, parent_score],
-    parent_score > $threshold,
-    *code_edges[fp, _, target_fp, _, _],
-    *chunks[fp, ci, _, _, _, _, _, emb],
-    !is_null(emb)
-
-# Union base + graph hits
-?[fp, ci, content, score, why] :=
-    base[fp, ci, score],
-    *chunks[fp, ci, content, _, _, _, _, _],
-    why = 'hybrid'
-?[fp, ci, content, score, why] :=
-    graph[fp, ci, score],
-    *chunks[fp, ci, content, _, _, _, _, _],
-    why = 'graph',
-    not base[fp, ci, _]  # don't duplicate
-
-:order -score
-:limit $top_k
 ```
-
-This is one round-trip. The graph walk happens inside the query engine,
-not as a separate Rust function with N+1 queries.
+Query → embed
+      → [HNSW top-50 + BM25 top-50] → RRF fusion → seed set
+      → BFS(seeds, depth=2) → candidate expansion
+      → vector re-score(candidates, query) → graph_score * graph_weight + vec_score
+      → merge + rank → MMR → rerank
+```
 
 ## Precomputed Query Bundles
 
@@ -150,17 +124,18 @@ because nobody else has the structural metadata to identify the clusters.
    Retrieval queries prefer higher tiers.
 2. **Background worker** — after initial index, run Tier 2 analysis per file.
    Write upgraded chunks with tier=2.
-3. **Single Datalog retrieval query** — replace the current
-   hybrid_search → augment_with_graph → rerank pipeline with one query.
+3. **Query-time graph re-scoring** — replace `augment_with_graph`'s flat BFS
+   dump with a scored second-pass vector lookup over expanded candidates.
 4. **Change detection** — content-hash-based invalidation on re-index.
-5. **Tier 3 caching** — persist across sessions.
+5. **Tier 3 caching** — persist PageRank scores and cluster assignments
+   across sessions in LanceDB.
 6. **Query bundle detection** — log retrieval patterns, identify clusters,
-   pre-materialize.
+   pre-materialize in a `bundles` LanceDB table.
 
 ## What This Means for the Current Code
 
-- `searcher.rs` search pipeline should converge toward a single Datalog query
-  instead of sequential Rust phases
-- `augment_with_graph` should be absorbed into the retrieval query
-- `schema.rs` hybrid_search should compose vector + FTS + graph in Datalog
+- `searcher.rs` `augment_with_graph` should evolve to query-guided graph
+  traversal (score candidates by vector similarity, not just BFS depth)
+- `composite.rs` `traverse_importers` + `hnsw_neighbors` already compose
+  for graph-guided HNSW search — the wiring in `searcher.rs` needs to use it
 - The current architecture is a stepping stone, not the destination

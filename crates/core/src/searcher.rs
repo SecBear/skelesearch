@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use crate::{expander::QueryExpander, reranker::{RerankCandidate, Reranker}, ChunkRecord, EmbedProvider, SearchResult, SparseEmbedding, SparseEmbedProvider, StorageBackend};
+use crate::{
+    expander::QueryExpander,
+    reranker::{RerankCandidate, Reranker},
+    ChunkRecord, EmbedProvider, SearchResult, SparseEmbedProvider, SparseEmbedding, StorageBackend,
+};
 
 // ---------------------------------------------------------------------------
 // Public output types
@@ -39,19 +43,16 @@ pub struct FileContext {
 
 /// Common English stop words that don't help BM25 matching.
 const STOP_WORDS: &[&str] = &[
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "dare", "ought",
-    "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-    "as", "into", "through", "during", "before", "after", "above", "below",
-    "between", "out", "off", "over", "under", "again", "further", "then",
-    "once", "here", "there", "when", "where", "why", "how", "all", "each",
-    "every", "both", "few", "more", "most", "other", "some", "such", "no",
-    "not", "only", "own", "same", "so", "than", "too", "very", "just",
-    "because", "but", "and", "or", "if", "while", "what", "which", "who",
-    "whom", "this", "that", "these", "those", "i", "me", "my", "we", "our",
-    "you", "your", "he", "him", "his", "she", "her", "it", "its", "they",
-    "them", "their", "about",
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+    "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+    "as", "into", "through", "during", "before", "after", "above", "below", "between", "out",
+    "off", "over", "under", "again", "further", "then", "once", "here", "there", "when", "where",
+    "why", "how", "all", "each", "every", "both", "few", "more", "most", "other", "some", "such",
+    "no", "not", "only", "own", "same", "so", "than", "too", "very", "just", "because", "but",
+    "and", "or", "if", "while", "what", "which", "who", "whom", "this", "that", "these", "those",
+    "i", "me", "my", "we", "our", "you", "your", "he", "him", "his", "she", "her", "it", "its",
+    "they", "them", "their", "about",
 ];
 
 /// GitHub issue template boilerplate phrases that dilute embeddings.
@@ -109,26 +110,40 @@ pub fn preprocess_query(query: &str) -> String {
             in_fence = !in_fence;
             continue;
         }
-        if in_fence { continue; }
+        if in_fence {
+            continue;
+        }
 
         // Skip empty lines.
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
 
         // Skip markdown headers (### Steps, ## Environment, etc.).
-        if trimmed.starts_with('#') { continue; }
+        if trimmed.starts_with('#') {
+            continue;
+        }
 
         // Skip HTML comments.
-        if trimmed.starts_with("<!--") || trimmed.starts_with("-->") { continue; }
+        if trimmed.starts_with("<!--") || trimmed.starts_with("-->") {
+            continue;
+        }
 
         // Skip checkbox lines (issue templates).
-        if trimmed.starts_with("- [x]") || trimmed.starts_with("- [ ]") { continue; }
+        if trimmed.starts_with("- [x]") || trimmed.starts_with("- [ ]") {
+            continue;
+        }
 
         // Skip boilerplate phrases.
         let lower = trimmed.to_lowercase();
-        if BOILERPLATE_PREFIXES.iter().any(|p| lower.starts_with(p)) { continue; }
+        if BOILERPLATE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            continue;
+        }
 
         // Skip lines that are just URLs.
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") { continue; }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            continue;
+        }
 
         // Extract backtick-quoted symbols (high-confidence identifiers).
         let mut rest = trimmed;
@@ -149,7 +164,8 @@ pub fn preprocess_query(query: &str) -> String {
         // Extract file paths (e.g. src/auth.rs, foo/bar.py:42) as high-signal anchors.
         // Compiled per call — preprocess_query is not a hot path (once per search).
         {
-            let path_re = regex::Regex::new(r"[a-zA-Z_][a-zA-Z0-9_/.-]*\.[a-z]{1,4}(?::\d+)?").unwrap();
+            let path_re =
+                regex::Regex::new(r"[a-zA-Z_][a-zA-Z0-9_/.-]*\.[a-z]{1,4}(?::\d+)?").unwrap();
             for cap in path_re.find_iter(trimmed) {
                 let path = cap.as_str();
                 if path.contains('/') || path.contains('.') {
@@ -183,7 +199,9 @@ pub fn preprocess_query(query: &str) -> String {
     let mut total_words = 0usize;
     for line in &lines {
         let words = line.split_whitespace().count();
-        if total_words + words > 100 { break; }
+        if total_words + words > 100 {
+            break;
+        }
         result.push(line.to_string());
         total_words += words;
     }
@@ -206,8 +224,7 @@ pub fn preprocess_query(query: &str) -> String {
     result
 }
 
-
-/// Sanitize a query string for CozoDB's FTS mini-language.
+/// Sanitize a query string for Tantivy's FTS query parser.
 ///
 /// The FTS index uses `tokenizer: Simple, filters: [Lowercase, AlphaNumOnly]`,
 /// so indexed tokens are lowercase alphanumeric only.  The query string must
@@ -218,7 +235,13 @@ fn sanitize_fts_query(query: &str) -> String {
     // Replace non-alphanumeric, non-whitespace chars with space.
     let cleaned: String = query
         .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
 
     // Split into tokens, drop FTS reserved keywords and single-char noise.
@@ -242,10 +265,11 @@ fn split_camel_case(token: &str) -> Vec<String> {
     for i in 1..chars.len() {
         // Split on lowercase→uppercase boundary (camelCase) or a run of
         // uppercase followed by a lowercase (e.g. "HTTPClient" → "HTTP", "Client").
-        let split = chars[i].is_uppercase() && (
-            chars[i - 1].is_lowercase()
-            || (i + 1 < chars.len() && chars[i + 1].is_lowercase() && chars[i - 1].is_uppercase())
-        );
+        let split = chars[i].is_uppercase()
+            && (chars[i - 1].is_lowercase()
+                || (i + 1 < chars.len()
+                    && chars[i + 1].is_lowercase()
+                    && chars[i - 1].is_uppercase()));
         if split {
             let part: String = chars[start..i].iter().collect();
             if part.len() > 1 {
@@ -398,12 +422,12 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             graph_score_factor: 0.3,
             graph_min_score: 0.005,
             pagerank_factor: 0.1,
-            query_embed_cache: std::sync::Mutex::new(
-                lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
-            ),
-            candidate_cache: std::sync::Mutex::new(
-                lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()),
-            ),
+            query_embed_cache: std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(256).unwrap(),
+            )),
+            candidate_cache: std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )),
             sparse_provider: None,
             sparse_weight: 0.20,
             cochange_boost: None,
@@ -505,7 +529,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         max_tokens: Option<usize>,
     ) -> anyhow::Result<Vec<SearchResult>> {
         let (results, _timings) = self
-            .search_with_timings(query, top_k, include_graph, max_depth, diversity, max_tokens)
+            .search_with_timings(
+                query,
+                top_k,
+                include_graph,
+                max_depth,
+                diversity,
+                max_tokens,
+            )
             .await?;
         Ok(results)
     }
@@ -587,7 +618,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 let strong_anchors = preprocessed
                     .split_whitespace()
                     .filter(|w| {
-                        w.contains('/') || w.contains('.')
+                        w.contains('/')
+                            || w.contains('.')
                             || w.contains('_')
                             || (w.chars().any(|c| c.is_uppercase())
                                 && w.chars().any(|c| c.is_lowercase()))
@@ -613,10 +645,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
         // Filter expansion keywords that have no lexical overlap with the
         // original query — prevents semantic drift from LLM hallucination.
-        let query_terms: std::collections::HashSet<String> = query
-            .split_whitespace()
-            .map(|w| w.to_lowercase())
-            .collect();
+        let query_terms: std::collections::HashSet<String> =
+            query.split_whitespace().map(|w| w.to_lowercase()).collect();
         let raw_len = expanded_keywords_raw.len();
         let expanded_keywords: Vec<String> = expanded_keywords_raw
             .into_iter()
@@ -624,10 +654,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 // Keep keyword if any of its subwords overlap with query terms,
                 // or if it's a camelCase/snake_case identifier (likely a real code symbol).
                 let kw_lower = kw.to_lowercase();
-                let has_overlap = kw_lower.split_whitespace()
-                    .any(|part| query_terms.iter().any(|qt| {
-                        part.contains(qt.as_str()) || qt.contains(part)
-                    }));
+                let has_overlap = kw_lower.split_whitespace().any(|part| {
+                    query_terms
+                        .iter()
+                        .any(|qt| part.contains(qt.as_str()) || qt.contains(part))
+                });
                 let is_identifier = kw.contains('_') || kw.chars().any(|c| c.is_uppercase());
                 has_overlap || is_identifier
             })
@@ -643,7 +674,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Original query terms appear first and get natural BM25 term frequency.
         // Expansion keywords are appended once (lower weight than the original
         // query which may have terms repeated from expand_query()).
-        // NOTE: CozoDB FTS deduplicates repeated query tokens at index time, so
+        // NOTE: Tantivy FTS deduplicates repeated query tokens at index time, so
         // repeating a symbol in the query string does not increase its TF weight.
         // Symbols are already included by preprocess_query; for true per-term
         // boosting, run a separate symbol-index lookup and merge results.
@@ -664,7 +695,7 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             }
         }
 
-        // Sanitize before sending to CozoDB FTS — strip dots, hyphens, and
+        // Sanitize before sending to Tantivy FTS — strip dots, hyphens, and
         // other special characters that break the FTS query mini-language.
         let bm25_query = sanitize_fts_query(&bm25_query);
 
@@ -701,9 +732,14 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 let gd = if include_graph { max_depth } else { 0 };
                 self.backend
                     .unified_search(
-                        &query_vec, &bm25_query, top_k, gd,
-                        self.fts_weight, self.graph_score_factor,
-                        self.graph_min_score, self.pagerank_factor,
+                        &query_vec,
+                        &bm25_query,
+                        top_k,
+                        gd,
+                        self.fts_weight,
+                        self.graph_score_factor,
+                        self.graph_min_score,
+                        self.pagerank_factor,
                     )
                     .await?
             } else {
@@ -716,13 +752,21 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             // Log-dampened to prevent hub files from dominating all queries.
             if !self.use_unified_search && self.pagerank_boost {
                 let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
-                let ranks = self.backend.get_file_ranks(&file_paths).await.unwrap_or_default();
+                let ranks = self
+                    .backend
+                    .get_file_ranks(&file_paths)
+                    .await
+                    .unwrap_or_default();
                 if !ranks.is_empty() {
                     let median = {
                         let mut vals: Vec<f64> =
                             ranks.values().copied().filter(|v| *v > 0.0).collect();
                         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        if vals.is_empty() { 1.0 } else { vals[vals.len() / 2] }
+                        if vals.is_empty() {
+                            1.0
+                        } else {
+                            vals[vals.len() / 2]
+                        }
                     };
                     for hit in &mut hits {
                         if let Some(&pr) = ranks.get(&hit.file_path) {
@@ -738,7 +782,9 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             if !hits.is_empty() && !self.use_unified_search && include_graph && max_depth > 0 {
                 let graph_start = std::time::Instant::now();
                 let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
-                hits = self.augment_with_graph(hits, max_depth, best_score, &query_vec).await?;
+                hits = self
+                    .augment_with_graph(hits, max_depth, best_score, &query_vec)
+                    .await?;
                 timings.graph_ms = graph_start.elapsed().as_millis() as u64;
             }
 
@@ -752,9 +798,12 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     let sp_arc = Arc::clone(sp);
                     let qtext = normalized_query.clone();
                     let sparse_result = tokio::task::spawn_blocking(move || {
-                        sp_arc
-                            .embed_batch(&[qtext.as_str()])
-                            .map(|mut v| v.pop().unwrap_or(SparseEmbedding { indices: vec![], values: vec![] }))
+                        sp_arc.embed_batch(&[qtext.as_str()]).map(|mut v| {
+                            v.pop().unwrap_or(SparseEmbedding {
+                                indices: vec![],
+                                values: vec![],
+                            })
+                        })
                     })
                     .await;
                     match sparse_result {
@@ -767,25 +816,43 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                                     // candidates. Without this, documents found ONLY by
                                     // sparse search are silently dropped.
                                     let hybrid_keys: std::collections::HashSet<(String, usize)> =
-                                        hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
+                                        hits.iter()
+                                            .map(|h| (h.file_path.clone(), h.chunk_idx))
+                                            .collect();
                                     // Group sparse-only hits by file to minimise backend calls.
-                                    let mut sparse_only_by_file: std::collections::HashMap<String, Vec<usize>> =
-                                        std::collections::HashMap::new();
+                                    let mut sparse_only_by_file: std::collections::HashMap<
+                                        String,
+                                        Vec<usize>,
+                                    > = std::collections::HashMap::new();
                                     for (fp, ci, _) in &sparse_hits {
                                         if !hybrid_keys.contains(&(fp.clone(), *ci)) {
-                                            sparse_only_by_file.entry(fp.clone()).or_default().push(*ci);
+                                            sparse_only_by_file
+                                                .entry(fp.clone())
+                                                .or_default()
+                                                .push(*ci);
                                         }
                                     }
                                     if !sparse_only_by_file.is_empty() {
-                                        let fp_refs: Vec<&str> = sparse_only_by_file.keys().map(|s| s.as_str()).collect();
+                                        let fp_refs: Vec<&str> = sparse_only_by_file
+                                            .keys()
+                                            .map(|s| s.as_str())
+                                            .collect();
                                         match self.backend.get_chunks_for_files(&fp_refs).await {
                                             Ok(chunks) => {
-                                                let needed: std::collections::HashSet<(String, usize)> =
-                                                    sparse_only_by_file.iter()
-                                                        .flat_map(|(fp, idxs)| idxs.iter().map(|&ci| (fp.clone(), ci)))
-                                                        .collect();
+                                                let needed: std::collections::HashSet<(
+                                                    String,
+                                                    usize,
+                                                )> = sparse_only_by_file
+                                                    .iter()
+                                                    .flat_map(|(fp, idxs)| {
+                                                        idxs.iter().map(|&ci| (fp.clone(), ci))
+                                                    })
+                                                    .collect();
                                                 for chunk in chunks {
-                                                    if needed.contains(&(chunk.file_path.clone(), chunk.chunk_idx)) {
+                                                    if needed.contains(&(
+                                                        chunk.file_path.clone(),
+                                                        chunk.chunk_idx,
+                                                    )) {
                                                         hits.push(crate::SearchResult {
                                                             file_path: chunk.file_path,
                                                             chunk_idx: chunk.chunk_idx,
@@ -796,7 +863,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                                                             score: 0.0,
                                                             match_quality: String::new(),
                                                             why: "sparse".to_string(),
-                                                            materialization_tier: chunk.materialization_tier,
+                                                            materialization_tier: chunk
+                                                                .materialization_tier,
                                                         });
                                                     }
                                                 }
@@ -841,7 +909,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             // Falls back gracefully when the doc index is empty or unavailable.
             if self.dual_embedding && !hits.is_empty() {
                 let doc_fetch_k = hits.len().max(top_k * 2).max(50);
-                match self.backend.doc_vector_search(&query_vec, doc_fetch_k).await {
+                match self
+                    .backend
+                    .doc_vector_search(&query_vec, doc_fetch_k)
+                    .await
+                {
                     Ok(doc_hits) if !doc_hits.is_empty() => {
                         // Convert cosine distance to a score (higher = better) for
                         // rank-ordering by apply_sparse_rrf.  Cosine dist is in [0, 2];
@@ -937,7 +1009,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                 let candidates: Vec<RerankCandidate> = hits
                     .iter()
                     .enumerate()
-                    .map(|(i, h)| RerankCandidate { index: i, text: h.content.clone() })
+                    .map(|(i, h)| RerankCandidate {
+                        index: i,
+                        text: h.content.clone(),
+                    })
                     .collect();
                 let scores = reranker.rerank(query, candidates).await?;
                 timings.rerank_ms = rerank_start.elapsed().as_millis() as u64;
@@ -948,15 +1023,24 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (mut hit, rerank_score))| {
-                        let fusion_weight =
-                            if i < 3 { 0.25_f64 } else if i < 10 { 0.40 } else { 0.60 };
+                        let fusion_weight = if i < 3 {
+                            0.25_f64
+                        } else if i < 10 {
+                            0.40
+                        } else {
+                            0.60
+                        };
                         let rerank_weight = 1.0 - fusion_weight;
                         hit.score = hit.score * fusion_weight + rerank_score * rerank_weight;
                         hit
                     })
                     .collect();
                 // Re-sort by the blended score so final order reflects both signals.
-                blended.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                blended.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 blended
             } else {
                 hits
@@ -978,7 +1062,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
                     hit.score *= 0.15;
                 }
             } else if is_readme_or_meta(&hit.file_path) {
-                let penalty = if query_asks_about_docs(query) { 0.7 } else { 0.1 };
+                let penalty = if query_asks_about_docs(query) {
+                    0.7
+                } else {
+                    0.1
+                };
                 hit.score *= penalty;
             } else if is_doc_file(&hit.file_path) {
                 let penalty = if query_asks_about_docs(query) {
@@ -1004,13 +1092,17 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Skipped when symbol_roles has not been computed yet (empty map).
         {
             let file_paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
-            let roles = self.backend.get_symbol_roles(&file_paths).await.unwrap_or_default();
+            let roles = self
+                .backend
+                .get_symbol_roles(&file_paths)
+                .await
+                .unwrap_or_default();
             if !roles.is_empty() {
                 for hit in &mut hits {
                     let factor = match roles.get(&hit.file_path).map(|s| s.as_str()) {
-                        Some("core")  => 1.1,
+                        Some("core") => 1.1,
                         Some("entry") => 1.05,
-                        Some("dead")  => 0.5,
+                        Some("dead") => 0.5,
                         _ => 1.0,
                     };
                     if factor != 1.0 {
@@ -1020,7 +1112,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             }
         }
 
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Label quality using relative thresholds against the post-penalty
         // top score so labels reflect final ranking.
@@ -1081,7 +1177,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let chunks = chunks_res?;
         let imports = imports_res?;
         let imported_by = importers_res?;
-        Ok(FileContext { chunks, imports, imported_by })
+        Ok(FileContext {
+            chunks,
+            imports,
+            imported_by,
+        })
     }
 
     /// Assign quality labels to a slice of scores using relative thresholds:
@@ -1150,8 +1250,10 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         let present: std::collections::HashSet<String> =
             hits.iter().map(|h| h.file_path.clone()).collect();
 
-        let mut seen_chunks: std::collections::HashSet<(String, usize)> =
-            hits.iter().map(|h| (h.file_path.clone(), h.chunk_idx)).collect();
+        let mut seen_chunks: std::collections::HashSet<(String, usize)> = hits
+            .iter()
+            .map(|h| (h.file_path.clone(), h.chunk_idx))
+            .collect();
 
         // Capture seed chunks from the original hits before any augmentation.
         // Cap at 10 to limit HNSW graph traversal cost.
@@ -1163,11 +1265,22 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
 
         // Phase 1: Collect all graph-reachable files with their minimum depth.
         // Multiple seed files may reach the same target; keep the shortest path.
-        let mut depth_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut depth_map: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for file_path in &present {
-            let reachable = self.backend.traverse_imports(file_path, max_depth, None).await?;
+            let reachable = self
+                .backend
+                .traverse_imports(file_path, max_depth, None)
+                .await?;
             for (target, depth) in reachable {
-                depth_map.entry(target).and_modify(|d| { if depth < *d { *d = depth; } }).or_insert(depth);
+                depth_map
+                    .entry(target)
+                    .and_modify(|d| {
+                        if depth < *d {
+                            *d = depth;
+                        }
+                    })
+                    .or_insert(depth);
             }
         }
 
@@ -1175,12 +1288,20 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // Walks layer 0 of the HNSW graph using seed chunks from the original hits.
         // Cosine distance threshold 0.3: captures semantically close neighbors
         // while excluding weakly related chunks.
-        let mut hnsw_map: std::collections::HashMap<(String, usize), f64> = std::collections::HashMap::new();
+        let mut hnsw_map: std::collections::HashMap<(String, usize), f64> =
+            std::collections::HashMap::new();
         if !seed_chunks.is_empty() {
             let neighbors = self.backend.hnsw_neighbors(&seed_chunks, 0.3, 50).await?;
             for (fp, ci, dist) in neighbors {
                 // Keep closest distance (smallest dist = most similar) for each chunk.
-                hnsw_map.entry((fp, ci)).and_modify(|d| { if dist < *d { *d = dist; } }).or_insert(dist);
+                hnsw_map
+                    .entry((fp, ci))
+                    .and_modify(|d| {
+                        if dist < *d {
+                            *d = dist;
+                        }
+                    })
+                    .or_insert(dist);
             }
         }
 
@@ -1248,7 +1369,8 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
             .collect();
 
         // Group HNSW-only targets by file to minimise repeated backend calls.
-        let mut hnsw_by_file: std::collections::HashMap<&String, Vec<(usize, f64)>> = std::collections::HashMap::new();
+        let mut hnsw_by_file: std::collections::HashMap<&String, Vec<(usize, f64)>> =
+            std::collections::HashMap::new();
         for (fp, ci, dist) in hnsw_only {
             hnsw_by_file.entry(fp).or_default().push((ci, dist));
         }
@@ -1293,7 +1415,11 @@ impl<B: StorageBackend, P: EmbedProvider> Searcher<B, P> {
         // highest-relevance graph chunks survive.
         if hits.len() > pre_graph_count + 30 {
             let graph_part = &mut hits[pre_graph_count..];
-            graph_part.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            graph_part.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             hits.truncate(pre_graph_count + 30);
         }
 
@@ -1362,10 +1488,13 @@ pub(crate) async fn apply_cochange_boost<B: StorageBackend>(
             hit.score += b;
         }
     }
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits
 }
-
 
 // ---------------------------------------------------------------------------
 // Tier deduplication
@@ -1380,8 +1509,16 @@ pub(crate) async fn apply_cochange_boost<B: StorageBackend>(
 fn dedup_by_tier(results: Vec<SearchResult>) -> Vec<SearchResult> {
     // Fast path: if every result has the same tier (the common case when not
     // in a progressive upgrade window), skip the O(n²) overlap check entirely.
-    let max_tier = results.iter().map(|r| r.materialization_tier).max().unwrap_or(2);
-    let min_tier = results.iter().map(|r| r.materialization_tier).min().unwrap_or(2);
+    let max_tier = results
+        .iter()
+        .map(|r| r.materialization_tier)
+        .max()
+        .unwrap_or(2);
+    let min_tier = results
+        .iter()
+        .map(|r| r.materialization_tier)
+        .min()
+        .unwrap_or(2);
     if max_tier == min_tier {
         return results;
     }
@@ -1396,8 +1533,11 @@ fn dedup_by_tier(results: Vec<SearchResult>) -> Vec<SearchResult> {
     for (_, mut chunks) in by_file {
         // Sort by tier desc (higher tier wins), then score desc.
         chunks.sort_by(|a, b| {
-            b.materialization_tier.cmp(&a.materialization_tier)
-                .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+            b.materialization_tier.cmp(&a.materialization_tier).then(
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
         // Greedy accept: skip any chunk that overlaps with an already-accepted chunk.
         // Since we sorted by tier desc, lower-tier overlapping chunks are encountered
@@ -1415,10 +1555,13 @@ fn dedup_by_tier(results: Vec<SearchResult>) -> Vec<SearchResult> {
         output.extend(kept);
     }
 
-    output.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    output.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     output
 }
-
 
 // ---------------------------------------------------------------------------
 // MMR re-ranking
@@ -1458,7 +1601,9 @@ fn mmr_rerank(
             .max_by(|&i, &j| {
                 let score_i = mmr_score(i, &selected, query_vec, result_vecs, lambda);
                 let score_j = mmr_score(j, &selected, query_vec, result_vecs, lambda);
-                score_i.partial_cmp(&score_j).unwrap_or(std::cmp::Ordering::Equal)
+                score_i
+                    .partial_cmp(&score_j)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .expect("candidates is non-empty");
         candidates.retain(|&c| c != best);
@@ -1482,10 +1627,13 @@ fn mmr_score(
         .map(|&s| cosine_sim(&result_vecs[i], &result_vecs[s]))
         .fold(f32::NEG_INFINITY, f32::max);
     // When no items have been selected yet, redundancy is -inf; treat as 0.
-    let redundancy = if redundancy == f32::NEG_INFINITY { 0.0 } else { redundancy };
+    let redundancy = if redundancy == f32::NEG_INFINITY {
+        0.0
+    } else {
+        redundancy
+    };
     lambda * relevance - (1.0 - lambda) * redundancy
 }
-
 
 // ---------------------------------------------------------------------------
 // File-type detection (test, doc/prose)
@@ -1506,14 +1654,24 @@ fn is_test_file(path: &str) -> bool {
 
     // Directory-based patterns.
     const TEST_DIRS: &[&str] = &[
-        "/tests/", "/test/", "/__tests__/", "/spec/", "/specs/",
-        "/testing/", "/testutil/", "/test_utils/", "/testdata/",
+        "/tests/",
+        "/test/",
+        "/__tests__/",
+        "/spec/",
+        "/specs/",
+        "/testing/",
+        "/testutil/",
+        "/test_utils/",
+        "/testdata/",
     ];
     if TEST_DIRS.iter().any(|d| norm.contains(d)) {
         return true;
     }
     // Root-level test directories: strip leading '/' and check starts_with.
-    if TEST_DIRS.iter().any(|d| norm.starts_with(d.trim_start_matches('/'))) {
+    if TEST_DIRS
+        .iter()
+        .any(|d| norm.starts_with(d.trim_start_matches('/')))
+    {
         return true;
     }
 
@@ -1521,9 +1679,7 @@ fn is_test_file(path: &str) -> bool {
     let file_name = norm.rsplit('/').next().unwrap_or(&norm);
 
     // Exact file names that are test entry-points by convention.
-    const EXACT_NAMES: &[&str] = &[
-        "test.rs", "test.py", "test.go", "test.ts", "test.js",
-    ];
+    const EXACT_NAMES: &[&str] = &["test.rs", "test.py", "test.go", "test.ts", "test.js"];
     if EXACT_NAMES.contains(&file_name) {
         return true;
     }
@@ -1552,11 +1708,21 @@ fn is_readme_or_meta(path: &str) -> bool {
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
     matches!(
         filename,
-        "readme.md" | "readme.rst" | "readme.txt" | "readme"
-            | "changelog.md" | "changelog.rst" | "changes.md" | "changes.rst"
-            | "contributing.md" | "contributing.rst"
-            | "license" | "license.md" | "license.txt"
-            | "code_of_conduct.md" | "security.md"
+        "readme.md"
+            | "readme.rst"
+            | "readme.txt"
+            | "readme"
+            | "changelog.md"
+            | "changelog.rst"
+            | "changes.md"
+            | "changes.rst"
+            | "contributing.md"
+            | "contributing.rst"
+            | "license"
+            | "license.md"
+            | "license.txt"
+            | "code_of_conduct.md"
+            | "security.md"
     )
 }
 
@@ -1588,8 +1754,15 @@ fn is_doc_file(path: &str) -> bool {
     }
     matches!(
         file_name,
-        "readme" | "changelog" | "changes" | "history" | "news"
-            | "authors" | "contributors" | "license" | "licence"
+        "readme"
+            | "changelog"
+            | "changes"
+            | "history"
+            | "news"
+            | "authors"
+            | "contributors"
+            | "license"
+            | "licence"
     )
 }
 
@@ -1631,9 +1804,18 @@ fn is_barrel_file(path: &str) -> bool {
     let file_name = norm.rsplit('/').next().unwrap_or(&norm);
     matches!(
         file_name,
-        "index.ts" | "index.js" | "index.jsx" | "index.tsx" | "index.mjs" | "index.cjs"
-            | "mod.rs" | "__init__.py"
-            | "barrel.ts" | "barrel.js" | "exports.ts" | "exports.js"
+        "index.ts"
+            | "index.js"
+            | "index.jsx"
+            | "index.tsx"
+            | "index.mjs"
+            | "index.cjs"
+            | "mod.rs"
+            | "__init__.py"
+            | "barrel.ts"
+            | "barrel.js"
+            | "exports.ts"
+            | "exports.js"
     )
 }
 
@@ -1674,9 +1856,19 @@ fn query_asks_about_entry_point(query: &str) -> bool {
 fn query_asks_about_testing(query: &str) -> bool {
     let lower = query.to_lowercase();
     [
-        "test", "testing", "spec", "mock", "stub", "fixture",
-        "assert", "expect", "should", "coverage",
-        "integration test", "unit test", "e2e",
+        "test",
+        "testing",
+        "spec",
+        "mock",
+        "stub",
+        "fixture",
+        "assert",
+        "expect",
+        "should",
+        "coverage",
+        "integration test",
+        "unit test",
+        "e2e",
     ]
     .iter()
     .any(|term| lower.contains(term))
@@ -1710,7 +1902,11 @@ fn query_asks_about_docs(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_test_file, is_readme_or_meta, is_doc_file, is_docs_directory, is_barrel_file, sanitize_fts_query, expand_query, split_camel_case, preprocess_query, query_asks_about_testing};
+    use super::{
+        expand_query, is_barrel_file, is_doc_file, is_docs_directory, is_readme_or_meta,
+        is_test_file, preprocess_query, query_asks_about_testing, sanitize_fts_query,
+        split_camel_case,
+    };
 
     #[test]
     fn test_is_test_file_positive_dir_patterns() {
@@ -1807,7 +2003,7 @@ mod tests {
     #[test]
     fn sanitize_strips_dots_and_hyphens() {
         // LLM expansion produces "JSON.stringify" and "key-value" which
-        // break CozoDB FTS query parsing.
+        // break Tantivy FTS query parsing.
         assert_eq!(
             sanitize_fts_query("JSON.stringify key-value"),
             "JSON stringify key value"
@@ -1816,7 +2012,7 @@ mod tests {
 
     #[test]
     fn sanitize_removes_fts_reserved_keywords() {
-        // "AND", "OR", "NOT" are CozoDB FTS operators.
+        // "AND", "OR", "NOT" are Tantivy FTS operators.
         assert_eq!(
             sanitize_fts_query("hello AND world OR bye NOT gone"),
             "hello world bye gone"
@@ -1839,37 +2035,25 @@ mod tests {
     #[test]
     fn sanitize_handles_special_chars_from_code() {
         // Parens, brackets, asterisks, carets, slashes — all FTS syntax.
-        assert_eq!(
-            sanitize_fts_query("foo() => bar[0] + baz*"),
-            "foo bar baz"
-        );
+        assert_eq!(sanitize_fts_query("foo() => bar[0] + baz*"), "foo bar baz");
     }
 
     #[test]
     fn sanitize_collapses_whitespace() {
-        assert_eq!(
-            sanitize_fts_query("  hello   world  "),
-            "hello world"
-        );
+        assert_eq!(sanitize_fts_query("  hello   world  "), "hello world");
     }
 
     #[test]
     fn sanitize_drops_single_char_tokens() {
         // After stripping punctuation, leftover single chars are noise.
-        assert_eq!(
-            sanitize_fts_query("a + b = c"),
-            ""
-        );
+        assert_eq!(sanitize_fts_query("a + b = c"), "");
     }
 
     #[test]
     fn sanitize_near_with_slash() {
         // NEAR/3(...) is FTS syntax — slashes and parens stripped,
         // NEAR removed as reserved.
-        assert_eq!(
-            sanitize_fts_query("NEAR/3(hello world)"),
-            "hello world"
-        );
+        assert_eq!(sanitize_fts_query("NEAR/3(hello world)"), "hello world");
     }
 
     // --- expand_query tests ---
@@ -1910,17 +2094,26 @@ mod tests {
 
     #[test]
     fn split_camel_case_simple() {
-        assert_eq!(split_camel_case("superRefine"), vec!["superRefine", "super", "Refine"]);
+        assert_eq!(
+            split_camel_case("superRefine"),
+            vec!["superRefine", "super", "Refine"]
+        );
     }
 
     #[test]
     fn split_camel_case_pascal() {
-        assert_eq!(split_camel_case("AsyncClient"), vec!["AsyncClient", "Async", "Client"]);
+        assert_eq!(
+            split_camel_case("AsyncClient"),
+            vec!["AsyncClient", "Async", "Client"]
+        );
     }
 
     #[test]
     fn split_camel_case_acronym() {
-        assert_eq!(split_camel_case("HTTPClient"), vec!["HTTPClient", "HTTP", "Client"]);
+        assert_eq!(
+            split_camel_case("HTTPClient"),
+            vec!["HTTPClient", "HTTP", "Client"]
+        );
     }
 
     #[test]
@@ -2045,11 +2238,15 @@ mod tests {
     #[test]
     fn query_asks_about_testing_positive() {
         // Explicit test vocabulary triggers the gate.
-        assert!(query_asks_about_testing("how do I write unit tests for the parser"));
+        assert!(query_asks_about_testing(
+            "how do I write unit tests for the parser"
+        ));
         assert!(query_asks_about_testing("testing the authentication flow"));
         assert!(query_asks_about_testing("what mock should I use here"));
         assert!(query_asks_about_testing("stub the HTTP client"));
-        assert!(query_asks_about_testing("fixture setup for integration test"));
+        assert!(query_asks_about_testing(
+            "fixture setup for integration test"
+        ));
         assert!(query_asks_about_testing("assert error is returned"));
         assert!(query_asks_about_testing("expect the function to throw"));
         assert!(query_asks_about_testing("code coverage report"));
@@ -2076,7 +2273,6 @@ mod tests {
         assert!(query_asks_about_testing("latest test runner"));
     }
 
-
     #[test]
     fn preprocess_strips_boilerplate() {
         let query = "### Steps to reproduce\n\n- [x] I have searched existing issues\n\n`IterativeImputer` has no parameter `fill_value`\n\n### Expected behavior\n\nShould support fill_value.";
@@ -2101,17 +2297,16 @@ mod tests {
         assert!(result.contains("fill_value"));
     }
 
-
     // -----------------------------------------------------------------------
     // graph augmentation depth tests
     // -----------------------------------------------------------------------
 
-    use std::sync::Arc;
-    use async_trait::async_trait;
-    use crate::schema::{ChunkRecord, SearchResult, StorageBackend, IndexStats};
+    use super::Searcher;
+    use crate::schema::{ChunkRecord, IndexStats, SearchResult, StorageBackend};
     use crate::symbols::SymbolDef;
     use crate::EmbedProvider;
-    use super::Searcher;
+    use async_trait::async_trait;
+    use std::sync::Arc;
 
     // A minimal 4-dimensional embedding provider used only to satisfy the
     // generic bound on `Searcher<B, P>`.  `augment_with_graph` never calls
@@ -2120,7 +2315,9 @@ mod tests {
 
     #[async_trait]
     impl EmbedProvider for MockProvider {
-        fn dim(&self) -> usize { 4 }
+        fn dim(&self) -> usize {
+            4
+        }
         async fn embed_batch(&self, _texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![])
         }
@@ -2151,12 +2348,24 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for MockImportBackend {
-        async fn initialize(&self, _dim: usize) -> anyhow::Result<()> { Ok(()) }
-        async fn upsert_file(&self, _r: &crate::schema::FileRecord) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn initialize(&self, _dim: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn upsert_file(&self, _r: &crate::schema::FileRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> {
             match file_path {
@@ -2166,7 +2375,10 @@ mod tests {
             }
         }
 
-        async fn get_chunks_for_files(&self, file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> {
+        async fn get_chunks_for_files(
+            &self,
+            file_paths: &[&str],
+        ) -> anyhow::Result<Vec<ChunkRecord>> {
             let mut out = vec![];
             for &fp in file_paths {
                 match fp {
@@ -2178,10 +2390,18 @@ mod tests {
             Ok(out)
         }
 
-        async fn upsert_edges(&self, _e: &[crate::schema::EdgeRecord]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+        async fn upsert_edges(&self, _e: &[crate::schema::EdgeRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
 
         /// Simulate the import chain a.rs → b.rs → c.rs.
         /// Depth 1 from a.rs: only b.rs.  Depth 2: b.rs + c.rs.
@@ -2229,15 +2449,49 @@ mod tests {
             })
         }
 
-        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn find_symbols(&self, _name: &str, _kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> { Ok(vec![]) }
-        async fn get_chunk_embeddings(&self, _keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
-        async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
-        async fn get_file_ranks(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
-        async fn upsert_cochange_edges(&self, _pairs: &[crate::cochange::CoChangePair]) -> anyhow::Result<()> { Ok(()) }
-        async fn compute_symbol_roles(&self) -> anyhow::Result<()> { Ok(()) }
-        async fn get_symbol_roles(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> { Ok(Default::default()) }
+        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_symbols(
+            &self,
+            _name: &str,
+            _kind: Option<&str>,
+        ) -> anyhow::Result<Vec<SymbolDef>> {
+            Ok(vec![])
+        }
+        async fn get_chunk_embeddings(
+            &self,
+            _keys: &[(String, usize)],
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+        async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_file_ranks(
+            &self,
+            _file_paths: &[&str],
+        ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+            Ok(Default::default())
+        }
+        async fn upsert_cochange_edges(
+            &self,
+            _pairs: &[crate::cochange::CoChangePair],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn compute_symbol_roles(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_symbol_roles(
+            &self,
+            _file_paths: &[&str],
+        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+            Ok(Default::default())
+        }
 
         // Returns an empty neighbor set — this test targets import-graph depth,
         // not HNSW proximity expansion.
@@ -2250,14 +2504,38 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
-        async fn get_repo_map_data(&self) -> anyhow::Result<crate::schema::RepoMapData> {
-            Ok(crate::schema::RepoMapData { files: vec![], import_edges: vec![] })
+        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
+            Ok(0)
         }
-        async fn upsert_call_edges(&self, _edges: &[crate::schema::CallEdge]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_call_edges_for_file(&self, _file_path: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_callers(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
-        async fn get_callees(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
+        async fn get_repo_map_data(&self) -> anyhow::Result<crate::schema::RepoMapData> {
+            Ok(crate::schema::RepoMapData {
+                files: vec![],
+                import_edges: vec![],
+            })
+        }
+        async fn upsert_call_edges(
+            &self,
+            _edges: &[crate::schema::CallEdge],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_call_edges_for_file(&self, _file_path: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_callers(
+            &self,
+            _file_path: &str,
+            _symbol_name: &str,
+        ) -> anyhow::Result<Vec<crate::schema::CallEdge>> {
+            Ok(vec![])
+        }
+        async fn get_callees(
+            &self,
+            _file_path: &str,
+            _symbol_name: &str,
+        ) -> anyhow::Result<Vec<crate::schema::CallEdge>> {
+            Ok(vec![])
+        }
     }
 
     fn seed_hit(file_path: &str) -> SearchResult {
@@ -2299,22 +2577,40 @@ mod tests {
         assert!(
             hits_d2.len() > hits_d1.len(),
             "depth=2 should return more hits than depth=1: got d1={}, d2={}",
-            hits_d1.len(), hits_d2.len()
+            hits_d1.len(),
+            hits_d2.len()
         );
 
         // Verify c.rs appears only in the depth=2 result.
         let d1_files: Vec<&str> = hits_d1.iter().map(|h| h.file_path.as_str()).collect();
         let d2_files: Vec<&str> = hits_d2.iter().map(|h| h.file_path.as_str()).collect();
-        assert!(!d1_files.contains(&"c.rs"), "c.rs must not appear in depth=1: {:?}", d1_files);
-        assert!(d2_files.contains(&"c.rs"), "c.rs must appear in depth=2: {:?}", d2_files);
+        assert!(
+            !d1_files.contains(&"c.rs"),
+            "c.rs must not appear in depth=1: {:?}",
+            d1_files
+        );
+        assert!(
+            d2_files.contains(&"c.rs"),
+            "c.rs must appear in depth=2: {:?}",
+            d2_files
+        );
 
         // Verify hop-2 (c.rs) scores less than hop-1 (b.rs).
-        let score_b_d2 = hits_d2.iter().find(|h| h.file_path == "b.rs").map(|h| h.score).unwrap_or(0.0);
-        let score_c_d2 = hits_d2.iter().find(|h| h.file_path == "c.rs").map(|h| h.score).unwrap_or(0.0);
+        let score_b_d2 = hits_d2
+            .iter()
+            .find(|h| h.file_path == "b.rs")
+            .map(|h| h.score)
+            .unwrap_or(0.0);
+        let score_c_d2 = hits_d2
+            .iter()
+            .find(|h| h.file_path == "c.rs")
+            .map(|h| h.score)
+            .unwrap_or(0.0);
         assert!(
             score_b_d2 > score_c_d2,
             "hop-1 (b.rs, score={}) should score higher than hop-2 (c.rs, score={})",
-            score_b_d2, score_c_d2
+            score_b_d2,
+            score_c_d2
         );
     }
 
@@ -2326,7 +2622,9 @@ mod tests {
 
     impl MockCachingBackend {
         fn new() -> Self {
-            Self { hybrid_calls: AtomicUsize::new(0) }
+            Self {
+                hybrid_calls: AtomicUsize::new(0),
+            }
         }
 
         fn hybrid_calls(&self) -> usize {
@@ -2336,21 +2634,67 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for MockCachingBackend {
-        async fn initialize(&self, _dim: usize) -> anyhow::Result<()> { Ok(()) }
-        async fn upsert_file(&self, _r: &crate::schema::FileRecord) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_chunks_for_file(&self, _file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
-        async fn get_chunks_for_files(&self, _file_paths: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
-        async fn upsert_edges(&self, _e: &[crate::schema::EdgeRecord]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn traverse_imports(&self, _file_path: &str, _max_depth: usize, _edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
-        async fn traverse_importers(&self, _file_path: &str, _max_depth: usize, _edge_types: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
-        async fn hybrid_search(&self, _query_vec: &[f32], _query_str: &str, _top_k: usize) -> anyhow::Result<Vec<SearchResult>> {
+        async fn initialize(&self, _dim: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn upsert_file(&self, _r: &crate::schema::FileRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_chunks_for_file(&self, _file_path: &str) -> anyhow::Result<Vec<ChunkRecord>> {
+            Ok(vec![])
+        }
+        async fn get_chunks_for_files(
+            &self,
+            _file_paths: &[&str],
+        ) -> anyhow::Result<Vec<ChunkRecord>> {
+            Ok(vec![])
+        }
+        async fn upsert_edges(&self, _e: &[crate::schema::EdgeRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn traverse_imports(
+            &self,
+            _file_path: &str,
+            _max_depth: usize,
+            _edge_types: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            Ok(vec![])
+        }
+        async fn traverse_importers(
+            &self,
+            _file_path: &str,
+            _max_depth: usize,
+            _edge_types: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            Ok(vec![])
+        }
+        async fn hybrid_search(
+            &self,
+            _query_vec: &[f32],
+            _query_str: &str,
+            _top_k: usize,
+        ) -> anyhow::Result<Vec<SearchResult>> {
             self.hybrid_calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![SearchResult {
                 file_path: "src/lib.rs".to_string(),
@@ -2365,24 +2709,111 @@ mod tests {
                 materialization_tier: 2,
             }])
         }
-        async fn stats(&self) -> anyhow::Result<IndexStats> { Ok(IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None, watching: false, estimated_stale: 0 }) }
-        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn find_symbols(&self, _name: &str, _kind: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> { Ok(vec![]) }
-        async fn get_chunk_embeddings(&self, _keys: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![vec![1.0, 0.0, 0.0, 0.0]]) }
-        async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
-        async fn get_file_ranks(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
-        async fn upsert_cochange_edges(&self, _pairs: &[crate::cochange::CoChangePair]) -> anyhow::Result<()> { Ok(()) }
-        async fn compute_symbol_roles(&self) -> anyhow::Result<()> { Ok(()) }
-        async fn get_symbol_roles(&self, _file_paths: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> { Ok(Default::default()) }
-        async fn hnsw_neighbors(&self, _seeds: &[(String, usize)], _max_dist: f64, _limit: usize) -> anyhow::Result<Vec<(String, usize, f64)>> { Ok(vec![]) }
-        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
-        async fn get_repo_map_data(&self) -> anyhow::Result<crate::schema::RepoMapData> { Ok(crate::schema::RepoMapData { files: vec![], import_edges: vec![] }) }
-        async fn upsert_call_edges(&self, _edges: &[crate::schema::CallEdge]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_call_edges_for_file(&self, _file_path: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_callers(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
-        async fn get_callees(&self, _file_path: &str, _symbol_name: &str) -> anyhow::Result<Vec<crate::schema::CallEdge>> { Ok(vec![]) }
-        async fn unified_search(&self, _query_vec: &[f32], _query_str: &str, _top_k: usize, _graph_depth: usize, _fts_weight: f64, _graph_score_factor: f64, _graph_min_score: f64, _pagerank_factor: f64) -> anyhow::Result<Vec<SearchResult>> { Ok(vec![]) }
+        async fn stats(&self) -> anyhow::Result<IndexStats> {
+            Ok(IndexStats {
+                indexed_files: 0,
+                total_chunks: 0,
+                last_indexed: None,
+                watching: false,
+                estimated_stale: 0,
+            })
+        }
+        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_symbols(
+            &self,
+            _name: &str,
+            _kind: Option<&str>,
+        ) -> anyhow::Result<Vec<SymbolDef>> {
+            Ok(vec![])
+        }
+        async fn get_chunk_embeddings(
+            &self,
+            _keys: &[(String, usize)],
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0, 0.0, 0.0, 0.0]])
+        }
+        async fn compute_pagerank(&self, _edge_types: Option<&[&str]>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_file_ranks(
+            &self,
+            _file_paths: &[&str],
+        ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+            Ok(Default::default())
+        }
+        async fn upsert_cochange_edges(
+            &self,
+            _pairs: &[crate::cochange::CoChangePair],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn compute_symbol_roles(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_symbol_roles(
+            &self,
+            _file_paths: &[&str],
+        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+            Ok(Default::default())
+        }
+        async fn hnsw_neighbors(
+            &self,
+            _seeds: &[(String, usize)],
+            _max_dist: f64,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+            Ok(vec![])
+        }
+        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn get_repo_map_data(&self) -> anyhow::Result<crate::schema::RepoMapData> {
+            Ok(crate::schema::RepoMapData {
+                files: vec![],
+                import_edges: vec![],
+            })
+        }
+        async fn upsert_call_edges(
+            &self,
+            _edges: &[crate::schema::CallEdge],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_call_edges_for_file(&self, _file_path: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_callers(
+            &self,
+            _file_path: &str,
+            _symbol_name: &str,
+        ) -> anyhow::Result<Vec<crate::schema::CallEdge>> {
+            Ok(vec![])
+        }
+        async fn get_callees(
+            &self,
+            _file_path: &str,
+            _symbol_name: &str,
+        ) -> anyhow::Result<Vec<crate::schema::CallEdge>> {
+            Ok(vec![])
+        }
+        async fn unified_search(
+            &self,
+            _query_vec: &[f32],
+            _query_str: &str,
+            _top_k: usize,
+            _graph_depth: usize,
+            _fts_weight: f64,
+            _graph_score_factor: f64,
+            _graph_min_score: f64,
+            _pagerank_factor: f64,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
     }
 
     #[tokio::test]
@@ -2390,10 +2821,20 @@ mod tests {
         let backend = Arc::new(MockCachingBackend::new());
         let searcher = Searcher::new(backend.clone(), MockProvider);
 
-        let _ = searcher.search_with_timings("cached query", 5, false, 0, 0.0, None).await.unwrap();
-        let _ = searcher.search_with_timings("cached query", 5, false, 0, 0.0, None).await.unwrap();
+        let _ = searcher
+            .search_with_timings("cached query", 5, false, 0, 0.0, None)
+            .await
+            .unwrap();
+        let _ = searcher
+            .search_with_timings("cached query", 5, false, 0, 0.0, None)
+            .await
+            .unwrap();
 
-        assert_eq!(backend.hybrid_calls(), 1, "expected retrieval backend to run once for identical repeated query");
+        assert_eq!(
+            backend.hybrid_calls(),
+            1,
+            "expected retrieval backend to run once for identical repeated query"
+        );
     }
 
     #[tokio::test]
@@ -2401,10 +2842,20 @@ mod tests {
         let backend = Arc::new(MockCachingBackend::new());
         let searcher = Searcher::new(backend.clone(), MockProvider);
 
-        let _ = searcher.search_with_timings("cached query", 5, false, 0, 0.0, None).await.unwrap();
-        let _ = searcher.search_with_timings("cached query", 5, true, 2, 0.0, None).await.unwrap();
+        let _ = searcher
+            .search_with_timings("cached query", 5, false, 0, 0.0, None)
+            .await
+            .unwrap();
+        let _ = searcher
+            .search_with_timings("cached query", 5, true, 2, 0.0, None)
+            .await
+            .unwrap();
 
-        assert_eq!(backend.hybrid_calls(), 2, "expected different retrieval knobs to miss the candidate cache");
+        assert_eq!(
+            backend.hybrid_calls(),
+            2,
+            "expected different retrieval knobs to miss the candidate cache"
+        );
     }
 
     // --- preprocess_query extended tests ---
@@ -2433,7 +2884,10 @@ mod tests {
             "boilerplate section must be stripped"
         );
         // The meaningful prose should survive.
-        assert!(result.contains("system crashes"), "meaningful prose must be kept");
+        assert!(
+            result.contains("system crashes"),
+            "meaningful prose must be kept"
+        );
     }
 
     #[test]
@@ -2445,16 +2899,21 @@ mod tests {
             .join(" ");
         let query = format!("`MySymbol` and `AnotherSymbol` are critical. {long_prose}");
         let result = preprocess_query(&query);
-        assert!(result.contains("MySymbol"), "backtick symbol must survive prose truncation");
-        assert!(result.contains("AnotherSymbol"), "backtick symbol must survive prose truncation");
+        assert!(
+            result.contains("MySymbol"),
+            "backtick symbol must survive prose truncation"
+        );
+        assert!(
+            result.contains("AnotherSymbol"),
+            "backtick symbol must survive prose truncation"
+        );
     }
-
 
     // -----------------------------------------------------------------------
     // co-change boost tests
     // -----------------------------------------------------------------------
 
-    use crate::schema::{FileRecord, EdgeRecord, RepoMapData, CallEdge};
+    use crate::schema::{CallEdge, EdgeRecord, FileRecord, RepoMapData};
 
     /// Minimal backend with a fixed co-change neighbour table for testing.
     /// All other methods are no-ops; only `get_cochange_neighbors` is overridden.
@@ -2462,41 +2921,150 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for MockCochangeBackend {
-        async fn initialize(&self, _d: usize) -> anyhow::Result<()> { Ok(()) }
-        async fn upsert_file(&self, _r: &FileRecord) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_chunks_for_file(&self, _p: &str) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
-        async fn get_chunks_for_files(&self, _ps: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> { Ok(vec![]) }
-        async fn upsert_edges(&self, _e: &[EdgeRecord]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
-        async fn traverse_imports(&self, _p: &str, _d: usize, _t: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
-        async fn traverse_importers(&self, _p: &str, _d: usize, _t: Option<&[&str]>) -> anyhow::Result<Vec<(String, usize)>> { Ok(vec![]) }
-        async fn hybrid_search(&self, _v: &[f32], _q: &str, _k: usize) -> anyhow::Result<Vec<SearchResult>> { Ok(vec![]) }
-        async fn stats(&self) -> anyhow::Result<IndexStats> { Ok(IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None, watching: false, estimated_stale: 0 }) }
-        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn find_symbols(&self, _n: &str, _k: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> { Ok(vec![]) }
-        async fn get_chunk_embeddings(&self, _ks: &[(String, usize)]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
-        async fn compute_pagerank(&self, _t: Option<&[&str]>) -> anyhow::Result<()> { Ok(()) }
-        async fn get_file_ranks(&self, _fps: &[&str]) -> anyhow::Result<std::collections::HashMap<String, f64>> { Ok(Default::default()) }
-        async fn compute_symbol_roles(&self) -> anyhow::Result<()> { Ok(()) }
-        async fn get_symbol_roles(&self, _fps: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> { Ok(Default::default()) }
-        async fn upsert_cochange_edges(&self, _pairs: &[crate::cochange::CoChangePair]) -> anyhow::Result<()> { Ok(()) }
-        async fn hnsw_neighbors(&self, _s: &[(String, usize)], _d: f64, _l: usize) -> anyhow::Result<Vec<(String, usize, f64)>> { Ok(vec![]) }
-        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> { Ok(0) }
-        async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData> { Ok(RepoMapData { files: vec![], import_edges: vec![] }) }
-        async fn upsert_call_edges(&self, _e: &[CallEdge]) -> anyhow::Result<()> { Ok(()) }
-        async fn delete_call_edges_for_file(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_callers(&self, _fp: &str, _sn: &str) -> anyhow::Result<Vec<CallEdge>> { Ok(vec![]) }
-        async fn get_callees(&self, _fp: &str, _sn: &str) -> anyhow::Result<Vec<CallEdge>> { Ok(vec![]) }
+        async fn initialize(&self, _d: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn upsert_file(&self, _r: &FileRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_indexed_paths(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn upsert_chunks(&self, _c: &[ChunkRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_chunks_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_chunks_for_file(&self, _p: &str) -> anyhow::Result<Vec<ChunkRecord>> {
+            Ok(vec![])
+        }
+        async fn get_chunks_for_files(&self, _ps: &[&str]) -> anyhow::Result<Vec<ChunkRecord>> {
+            Ok(vec![])
+        }
+        async fn upsert_edges(&self, _e: &[EdgeRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_edges_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_importers(&self, _p: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn get_imports(&self, _p: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn traverse_imports(
+            &self,
+            _p: &str,
+            _d: usize,
+            _t: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            Ok(vec![])
+        }
+        async fn traverse_importers(
+            &self,
+            _p: &str,
+            _d: usize,
+            _t: Option<&[&str]>,
+        ) -> anyhow::Result<Vec<(String, usize)>> {
+            Ok(vec![])
+        }
+        async fn hybrid_search(
+            &self,
+            _v: &[f32],
+            _q: &str,
+            _k: usize,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+        async fn stats(&self) -> anyhow::Result<IndexStats> {
+            Ok(IndexStats {
+                indexed_files: 0,
+                total_chunks: 0,
+                last_indexed: None,
+                watching: false,
+                estimated_stale: 0,
+            })
+        }
+        async fn upsert_symbols(&self, _s: &[SymbolDef]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_symbols_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_symbols(&self, _n: &str, _k: Option<&str>) -> anyhow::Result<Vec<SymbolDef>> {
+            Ok(vec![])
+        }
+        async fn get_chunk_embeddings(
+            &self,
+            _ks: &[(String, usize)],
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+        async fn compute_pagerank(&self, _t: Option<&[&str]>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_file_ranks(
+            &self,
+            _fps: &[&str],
+        ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+            Ok(Default::default())
+        }
+        async fn compute_symbol_roles(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_symbol_roles(
+            &self,
+            _fps: &[&str],
+        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+            Ok(Default::default())
+        }
+        async fn upsert_cochange_edges(
+            &self,
+            _pairs: &[crate::cochange::CoChangePair],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn hnsw_neighbors(
+            &self,
+            _s: &[(String, usize)],
+            _d: f64,
+            _l: usize,
+        ) -> anyhow::Result<Vec<(String, usize, f64)>> {
+            Ok(vec![])
+        }
+        async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn get_repo_map_data(&self) -> anyhow::Result<RepoMapData> {
+            Ok(RepoMapData {
+                files: vec![],
+                import_edges: vec![],
+            })
+        }
+        async fn upsert_call_edges(&self, _e: &[CallEdge]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_call_edges_for_file(&self, _p: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_callers(&self, _fp: &str, _sn: &str) -> anyhow::Result<Vec<CallEdge>> {
+            Ok(vec![])
+        }
+        async fn get_callees(&self, _fp: &str, _sn: &str) -> anyhow::Result<Vec<CallEdge>> {
+            Ok(vec![])
+        }
 
         /// "a.rs" co-changes with "b.rs" at Jaccard 0.8.
-        async fn get_cochange_neighbors(&self, file_path: &str, _min_score: f64) -> anyhow::Result<Vec<(String, f64)>> {
+        async fn get_cochange_neighbors(
+            &self,
+            file_path: &str,
+            _min_score: f64,
+        ) -> anyhow::Result<Vec<(String, f64)>> {
             if file_path == "a.rs" {
                 Ok(vec![("b.rs".to_string(), 0.8)])
             } else {
@@ -2524,7 +3092,11 @@ mod tests {
     /// With a.rs at the top, b.rs should gain `0.1 * 0.8 = 0.08`.
     #[tokio::test]
     async fn cochange_boost_applies_jaccard_uplift() {
-        let hits = vec![make_sr("a.rs", 0.5), make_sr("b.rs", 0.3), make_sr("c.rs", 0.1)];
+        let hits = vec![
+            make_sr("a.rs", 0.5),
+            make_sr("b.rs", 0.3),
+            make_sr("c.rs", 0.1),
+        ];
         let backend = MockCochangeBackend;
         let result = super::apply_cochange_boost(&backend, hits, 0.1).await;
 
@@ -2532,14 +3104,21 @@ mod tests {
         let expected = 0.3 + 0.1 * 0.8;
         assert!(
             (b.score - expected).abs() < 1e-12,
-            "b.rs score should be {expected} but got {}", b.score
+            "b.rs score should be {expected} but got {}",
+            b.score
         );
         // c.rs has no co-change relation and must be unchanged.
         let c = result.iter().find(|h| h.file_path == "c.rs").unwrap();
-        assert!((c.score - 0.1).abs() < 1e-12, "c.rs score must be unchanged");
+        assert!(
+            (c.score - 0.1).abs() < 1e-12,
+            "c.rs score must be unchanged"
+        );
         // a.rs is the seed; it should NOT be boosted by its own co-change data.
         let a = result.iter().find(|h| h.file_path == "a.rs").unwrap();
-        assert!((a.score - 0.5).abs() < 1e-12, "a.rs (seed) score must be unchanged");
+        assert!(
+            (a.score - 0.5).abs() < 1e-12,
+            "a.rs (seed) score must be unchanged"
+        );
     }
 
     /// When cochange_boost is None the Searcher field is None, so apply_cochange_boost
@@ -2585,7 +3164,8 @@ mod tests {
         let result = super::apply_sparse_rrf(hits, &[], 0.3);
         let order: Vec<&str> = result.iter().map(|h| h.file_path.as_str()).collect();
         assert_eq!(
-            order, vec!["a.rs", "b.rs", "c.rs"],
+            order,
+            vec!["a.rs", "b.rs", "c.rs"],
             "empty sparse hits must preserve hybrid order"
         );
     }
@@ -2604,18 +3184,18 @@ mod tests {
         //   score_b = 0.5/(60+2) + 0.5/(60+1) = 0.5/62 + 0.5/61 ≈ 0.01626
         // b > a, so b should appear first after RRF.
         let hits = vec![
-            make_sparse_sr("a.rs", 0, 0.9),  // hybrid rank 1
-            make_sparse_sr("b.rs", 0, 0.5),  // hybrid rank 2
+            make_sparse_sr("a.rs", 0, 0.9), // hybrid rank 1
+            make_sparse_sr("b.rs", 0, 0.5), // hybrid rank 2
             make_sparse_sr("c.rs", 0, 0.4),
             make_sparse_sr("d.rs", 0, 0.3),
             make_sparse_sr("e.rs", 0, 0.2),
             make_sparse_sr("f.rs", 0, 0.15),
             make_sparse_sr("g.rs", 0, 0.1),
             make_sparse_sr("h.rs", 0, 0.05),
-            make_sparse_sr("i.rs", 0, 0.04),  // hybrid rank 9
+            make_sparse_sr("i.rs", 0, 0.04), // hybrid rank 9
         ];
         let sparse_hits = vec![
-            ("b.rs".to_string(), 0_usize, 1.0_f64),  // sparse rank 1
+            ("b.rs".to_string(), 0_usize, 1.0_f64), // sparse rank 1
             ("c.rs".to_string(), 0_usize, 0.9_f64),
             ("d.rs".to_string(), 0_usize, 0.8_f64),
             ("e.rs".to_string(), 0_usize, 0.7_f64),
@@ -2623,7 +3203,7 @@ mod tests {
             ("g.rs".to_string(), 0_usize, 0.5_f64),
             ("h.rs".to_string(), 0_usize, 0.4_f64),
             ("i.rs".to_string(), 0_usize, 0.3_f64),
-            ("a.rs".to_string(), 0_usize, 0.1_f64),  // sparse rank 9
+            ("a.rs".to_string(), 0_usize, 0.1_f64), // sparse rank 9
         ];
         let result = super::apply_sparse_rrf(hits, &sparse_hits, 0.5);
         let a_pos = result.iter().position(|h| h.file_path == "a.rs").unwrap();
@@ -2644,18 +3224,17 @@ mod tests {
             make_sparse_sr("z.rs", 0, 0.2),
         ];
         let sparse_hits = vec![
-            ("z.rs".to_string(), 0_usize, 1.0_f64),  // z ranks #1 in sparse
+            ("z.rs".to_string(), 0_usize, 1.0_f64), // z ranks #1 in sparse
             ("y.rs".to_string(), 0_usize, 0.9_f64),
-            ("x.rs".to_string(), 0_usize, 0.1_f64),  // x ranks #3 in sparse
+            ("x.rs".to_string(), 0_usize, 0.1_f64), // x ranks #3 in sparse
         ];
         // w_sparse=0 means sparse leg contributes nothing; hybrid order wins.
         let result = super::apply_sparse_rrf(hits, &sparse_hits, 0.0);
         let order: Vec<&str> = result.iter().map(|h| h.file_path.as_str()).collect();
         assert_eq!(
-            order, vec!["x.rs", "y.rs", "z.rs"],
+            order,
+            vec!["x.rs", "y.rs", "z.rs"],
             "w_sparse=0 must preserve hybrid order; got {order:?}"
         );
     }
-
-
 }

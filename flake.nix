@@ -21,21 +21,10 @@
         craneLib = crane.mkLib pkgs;
         src = craneLib.cleanCargoSource ./.;
 
-        # buildDepsOnly uses a dummy source tree containing Cargo manifests and
-        # synthetic crate sources. Keep the real sqlite3-sys shim in that dummy
-        # tree so the patched path dependency resolves during dependency builds.
-        dummySrc = pkgs.runCommand "skelesearch-dummy-src" { } ''
-          cp -r ${craneLib.mkDummySrc { inherit src; }} $out
-          chmod -R +w $out
-          rm -rf $out/vendor/sqlite3-sys
-          mkdir -p $out/vendor
-          cp -r ${src}/vendor/sqlite3-sys $out/vendor/sqlite3-sys
-        '';
-
-        # cmake/pkg-config are needed for RocksDB; onnxruntime satisfies ort-sys
+        # cmake/pkg-config are needed by ort; onnxruntime satisfies ort-sys
         # without network downloads so Nix builds stay reproducible/offline.
         commonArgs = {
-          inherit src dummySrc;
+          inherit src;
           nativeBuildInputs = [
             pkgs.cmake
             pkgs.pkg-config
@@ -56,13 +45,12 @@
       in
       {
         packages = {
-          # Release packages always compile against RocksDB for production
-          # durability; SQLite remains the dev-shell default.
+          # Nix packages build without storage feature flags — CompositeBackend is always on.
           skelesearch-cli = craneLib.buildPackage (
             commonArgs
             // {
               pname = "skelesearch-cli";
-              cargoExtraArgs = "-p skelesearch-cli --features skelesearch-core/storage-rocksdb";
+              cargoExtraArgs = "-p skelesearch-cli";
             }
           );
 
@@ -70,7 +58,7 @@
             commonArgs
             // {
               pname = "skelesearch-mcp";
-              cargoExtraArgs = "-p skelesearch-mcp --features storage-rocksdb";
+              cargoExtraArgs = "-p skelesearch-mcp";
             }
           );
 
@@ -78,7 +66,7 @@
             commonArgs
             // {
               pname = "skelesearch-daemon";
-              cargoExtraArgs = "-p skelesearch-daemon --features storage-rocksdb";
+              cargoExtraArgs = "-p skelesearch-daemon";
             }
           );
 
