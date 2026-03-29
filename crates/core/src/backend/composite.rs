@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use arrow_array::cast::{as_boolean_array, as_primitive_array, as_string_array};
 use arrow_array::types::{Float64Type, UInt32Type, UInt8Type};
 use arrow_array::{Array, RecordBatch, RecordBatchIterator};
@@ -65,6 +66,7 @@ impl SparseIndexState {
 pub struct CompositeBackend {
     #[allow(dead_code)]
     root: PathBuf,
+    writable: bool,
     lance: Arc<lancedb::Connection>,
     tantivy: TantivyIndex,
     edge_graph: Arc<RwLock<ImportGraph>>,
@@ -74,6 +76,14 @@ pub struct CompositeBackend {
 
 impl CompositeBackend {
     pub async fn open(dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_with_mode(dir, true).await
+    }
+
+    pub async fn open_read_only(dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_with_mode(dir, false).await
+    }
+
+    async fn open_with_mode(dir: impl AsRef<Path>, writable: bool) -> anyhow::Result<Self> {
         let root = dir.as_ref().to_path_buf();
 
         if root.join("index.db").exists() && !root.join("lance").exists() {
@@ -91,10 +101,15 @@ impl CompositeBackend {
                 .execute()
                 .await?,
         );
-        let tantivy = TantivyIndex::open_or_create(&root.join("tantivy"))?;
+        let tantivy = if writable {
+            TantivyIndex::open_or_create(&root.join("tantivy"))?
+        } else {
+            TantivyIndex::open_or_create_read_only(&root.join("tantivy"))?
+        };
 
         Ok(Self {
             root,
+            writable,
             lance,
             tantivy,
             edge_graph: Arc::new(RwLock::new(ImportGraph::new())),
@@ -105,6 +120,11 @@ impl CompositeBackend {
 
     fn dim(&self) -> usize {
         self.dim.load(Ordering::Relaxed)
+    }
+
+    fn ensure_writable(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.writable, "CompositeBackend is open read-only");
+        Ok(())
     }
 
     async fn reload_edge_graph(&self) -> anyhow::Result<()> {
@@ -245,6 +265,7 @@ impl StorageBackend for CompositeBackend {
         use lancedb::index::{scalar::BTreeIndexBuilder, Index};
         use lancedb::Error as LanceError;
 
+        self.ensure_writable()?;
         self.dim.store(dim, Ordering::Relaxed);
 
         let fixed: &[(&str, arrow_schema::Schema)] = &[
@@ -326,6 +347,7 @@ impl StorageBackend for CompositeBackend {
 
     async fn upsert_file(&self, record: &FileRecord) -> anyhow::Result<()> {
         use arrow_array::{Int64Array, StringArray, UInt64Array};
+        self.ensure_writable()?;
         let schema = Arc::new(super::schemas::files_schema());
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -348,6 +370,7 @@ impl StorageBackend for CompositeBackend {
     }
 
     async fn delete_file(&self, file_path: &str) -> anyhow::Result<()> {
+        self.ensure_writable()?;
         let tbl = self.lance.open_table("files").execute().await?;
         tbl.delete(&format!("file_path = '{}'", esc(file_path)))
             .await?;
@@ -379,6 +402,7 @@ impl StorageBackend for CompositeBackend {
         if chunks.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         let dim = self.dim();
         let batch = chunks_to_arrow(chunks, dim)?;
         let tbl = self.lance.open_table("chunks").execute().await?;
@@ -390,7 +414,12 @@ impl StorageBackend for CompositeBackend {
         }
 
         {
-            let mut writer = self.tantivy.writer.lock().unwrap();
+            let writer = self
+                .tantivy
+                .writer
+                .as_ref()
+                .context("tantivy writer unavailable: CompositeBackend is open read-only")?;
+            let mut writer = writer.lock().unwrap();
             let touched_files: std::collections::HashSet<&str> =
                 chunks.iter().map(|c| c.file_path.as_str()).collect();
             for fp in &touched_files {
@@ -415,10 +444,16 @@ impl StorageBackend for CompositeBackend {
     }
 
     async fn delete_chunks_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        self.ensure_writable()?;
         let tbl = self.lance.open_table("chunks").execute().await?;
         tbl.delete(&format!("file_path = '{}'", esc(file_path)))
             .await?;
-        let mut writer = self.tantivy.writer.lock().unwrap();
+        let writer = self
+            .tantivy
+            .writer
+            .as_ref()
+            .context("tantivy writer unavailable: CompositeBackend is open read-only")?;
+        let mut writer = writer.lock().unwrap();
         writer.delete_term(tantivy::Term::from_field_text(
             self.tantivy.f_file_path,
             file_path,
@@ -428,13 +463,19 @@ impl StorageBackend for CompositeBackend {
     }
 
     async fn delete_tier1_chunks_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        self.ensure_writable()?;
         let tbl = self.lance.open_table("chunks").execute().await?;
         tbl.delete(&format!(
             "file_path = '{}' AND materialization_tier = 1",
             esc(file_path)
         ))
         .await?;
-        let mut writer = self.tantivy.writer.lock().unwrap();
+        let writer = self
+            .tantivy
+            .writer
+            .as_ref()
+            .context("tantivy writer unavailable: CompositeBackend is open read-only")?;
+        let mut writer = writer.lock().unwrap();
         writer.delete_term(tantivy::Term::from_field_text(
             self.tantivy.f_file_path,
             file_path,
@@ -481,6 +522,7 @@ impl StorageBackend for CompositeBackend {
         if edges.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         use arrow_array::{StringArray, UInt32Array};
         let schema = Arc::new(super::schemas::code_edges_schema());
         let batch = RecordBatch::try_new(
@@ -515,6 +557,7 @@ impl StorageBackend for CompositeBackend {
     }
 
     async fn delete_edges_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        self.ensure_writable()?;
         let escaped = esc(file_path);
         let tbl = self.lance.open_table("code_edges").execute().await?;
         tbl.delete(&format!("from_file = '{escaped}' OR to_file = '{escaped}'"))
@@ -584,6 +627,7 @@ impl StorageBackend for CompositeBackend {
         if symbols.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         use arrow_array::{StringArray, UInt32Array};
         let schema = Arc::new(super::schemas::symbols_schema());
         let batch = RecordBatch::try_new(
@@ -617,6 +661,7 @@ impl StorageBackend for CompositeBackend {
     }
 
     async fn delete_symbols_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        self.ensure_writable()?;
         let tbl = self.lance.open_table("symbols").execute().await?;
         tbl.delete(&format!("file_path = '{}'", esc(file_path)))
             .await?;
@@ -923,6 +968,7 @@ impl StorageBackend for CompositeBackend {
     async fn compute_pagerank(&self, edge_types: Option<&[&str]>) -> anyhow::Result<()> {
         use arrow_array::{Float64Array, StringArray};
 
+        self.ensure_writable()?;
         let (filtered, file_paths) = {
             let graph = self.edge_graph.read().await;
             if graph.graph.node_count() == 0 {
@@ -1007,6 +1053,7 @@ impl StorageBackend for CompositeBackend {
 
     async fn compute_symbol_roles(&self) -> anyhow::Result<()> {
         use arrow_array::StringArray;
+        self.ensure_writable()?;
         let (file_paths, roles): (Vec<String>, Vec<String>) = {
             let graph = self.edge_graph.read().await;
             if graph.graph.node_count() == 0 {
@@ -1088,6 +1135,7 @@ impl StorageBackend for CompositeBackend {
         if pairs.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         use arrow_array::{Float64Array, StringArray, UInt64Array};
         let schema = Arc::new(super::schemas::cochange_edges_schema());
         let batch = RecordBatch::try_new(
@@ -1170,6 +1218,7 @@ impl StorageBackend for CompositeBackend {
         if n == 0 {
             return Ok(());
         }
+        self.ensure_writable()?;
         let schema = Arc::new(super::schemas::sparse_index_schema());
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1199,6 +1248,7 @@ impl StorageBackend for CompositeBackend {
     }
 
     async fn delete_sparse_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        self.ensure_writable()?;
         if let Ok(tbl) = self.lance.open_table("sparse_index").execute().await {
             tbl.delete(&format!("file_path = '{}'", esc(file_path)))
                 .await?;
@@ -1263,6 +1313,7 @@ impl StorageBackend for CompositeBackend {
 
     async fn deduplicate_chunks(&self) -> anyhow::Result<usize> {
         use twox_hash::XxHash64;
+        self.ensure_writable()?;
         let tbl = self.lance.open_table("chunks").execute().await?;
         let batches: Vec<RecordBatch> = tbl
             .query()
@@ -1421,6 +1472,7 @@ impl StorageBackend for CompositeBackend {
         if edges.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         use arrow_array::{BooleanArray, Float64Array, StringArray, UInt32Array};
         let schema = Arc::new(super::schemas::call_edges_schema());
         let batch = RecordBatch::try_new(
@@ -1470,6 +1522,7 @@ impl StorageBackend for CompositeBackend {
     }
 
     async fn delete_call_edges_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        self.ensure_writable()?;
         let tbl = self.lance.open_table("call_edges").execute().await?;
         tbl.delete(&format!("caller_file = '{}'", esc(file_path)))
             .await?;

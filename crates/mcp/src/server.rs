@@ -588,7 +588,9 @@ impl SkeleSearchServer {
             }
         }
 
-        let backend = Arc::new(CompositeBackend::open(backend_path.parent().unwrap()).await?);
+        let backend = Arc::new(
+            CompositeBackend::open_read_only(backend_path.parent().unwrap()).await?,
+        );
 
         tracing::info!(instance_id = %self.instance_id, project = %project_root.display(), manifest_path = %manifest_path.display(), "opened backend for new project");
 
@@ -1345,7 +1347,7 @@ impl SkeleSearchServer {
 
         // Resolve the correct backend for the target path. For cross-project
         // indexing, this opens/caches a backend in the target's .skelesearch/.
-        let (backend, manifest_path) = self.resolve_backend(Some(&index_path)).await?;
+        let (_backend, manifest_path) = self.resolve_backend(Some(&index_path)).await?;
         let storage_dir = Self::storage_dir_from_manifest_path(&manifest_path)?;
 
         // Best-effort stale-status cleanup + visibility for logs.
@@ -1436,8 +1438,11 @@ impl SkeleSearchServer {
 
         tokio::task::spawn(async move {
             let _lease = lease;
-            let backend2 = Arc::clone(&backend);
             let manifest_path2 = Arc::clone(&manifest_path);
+            let backend_dir = manifest_path2
+                .parent()
+                .expect("manifest path should have a parent")
+                .to_path_buf();
             let path2 = path.clone();
             let provider_name_for_closure = provider_name_owned;
 
@@ -1454,6 +1459,7 @@ impl SkeleSearchServer {
                     .build()
                     .map_err(|e| anyhow::anyhow!("runtime build: {e}"))?;
                 rt.block_on(async {
+                    let backend = Arc::new(CompositeBackend::open(&backend_dir).await?);
                     let provider = provider_from_name(&provider_name_for_closure)
                         .map(ArcProvider::new)
                         .with_context(|| {
@@ -1464,7 +1470,7 @@ impl SkeleSearchServer {
                         })?;
                     let manifest = Arc::new(ManifestStore::open(manifest_path2.as_path())?);
                     let config = Config::load(&path2).context("load .skelesearch.toml")?;
-                    let indexer = Indexer::new(backend2, manifest, provider.clone())
+                    let indexer = Indexer::new(backend, manifest, provider.clone())
                         .with_excludes(config.index.exclude.clone())
                         .with_include_extensions(config.index.include_extensions.clone())
                         .with_scope_prefix(config.index.scope_prefix);
@@ -1563,8 +1569,11 @@ impl SkeleSearchServer {
         path: &std::path::Path,
         provider: ArcProvider,
     ) -> anyhow::Result<IndexResult> {
-        let backend = Arc::clone(&self.backend);
         let manifest_path = Arc::clone(&self.manifest_path);
+        let backend_dir = manifest_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("manifest path has no parent"))?
+            .to_path_buf();
         let path = path.to_path_buf();
         let provider_for_closure = provider.clone();
 
@@ -1575,6 +1584,7 @@ impl SkeleSearchServer {
                 .build()
                 .map_err(|e| anyhow::anyhow!("runtime build: {e}"))?;
             rt.block_on(async {
+                let backend = Arc::new(CompositeBackend::open(&backend_dir).await?);
                 let manifest = Arc::new(ManifestStore::open(manifest_path.as_path())?);
                 let config = Config::load(&path).context("load .skelesearch.toml")?;
                 let indexer = Indexer::new(backend, manifest, provider_for_closure)
@@ -3477,7 +3487,8 @@ mod startup_tests {
                 .ok_or_else(|| anyhow::anyhow!("manifest path missing parent"))?,
         )?;
         let backend = Arc::new(
-            CompositeBackend::open(manifest_path.parent().expect("manifest parent")).await?,
+            CompositeBackend::open_read_only(manifest_path.parent().expect("manifest parent"))
+                .await?,
         );
         Ok(SkeleSearchServer::new(
             backend,
@@ -3626,6 +3637,37 @@ mod startup_tests {
                 .get_meta("provider")?
                 .as_deref(),
             Some("voyage")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_backend_allows_secondary_reader_on_active_generation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let manifest_path = root.join(".skelesearch/manifest.db");
+        let server = startup_test_server(&root, &manifest_path).await?;
+
+        let manifest = write_active_generation_fixture(&root, "gen-a", "openai").await?;
+        let generation_dir = manifest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("manifest missing generation dir"))?
+            .to_path_buf();
+        let _held_backend = CompositeBackend::open(&generation_dir).await?;
+
+        let resolved = server
+            .resolve_backend(Some(root.to_string_lossy().as_ref()))
+            .await;
+        assert!(
+            resolved.is_ok(),
+            "resolve_backend should not fail while a reader already holds the active generation: {}",
+            resolved
+                .as_ref()
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "ok".to_string())
         );
 
         Ok(())

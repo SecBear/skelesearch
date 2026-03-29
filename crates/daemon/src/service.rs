@@ -1223,7 +1223,7 @@ impl ActiveGeneration {
             generation_dir,
             backend: Arc::new(BackendHandle::open(backend_db_path)?),
             manifest: Arc::new(ManifestHandle::open(manifest_db_path)?),
-            composite_backend: Arc::new(CompositeBackend::open(&backend_root).await?),
+            composite_backend: Arc::new(CompositeBackend::open_read_only(&backend_root).await?),
         })
     }
 }
@@ -1617,7 +1617,16 @@ mod tests {
         )
         .expect("write source file");
 
-        let backend = project.active_backend().await;
+        let backend_path = project.active_backend_path().await;
+        let backend = Arc::new(
+            CompositeBackend::open(
+                backend_path
+                    .parent()
+                    .expect("active backend path should have a parent"),
+            )
+            .await
+            .expect("open writable active backend for test fixture"),
+        );
         let manifest = Arc::new(
             ManifestStore::open(project.active_manifest_path().await.as_path())
                 .expect("open manifest"),
@@ -2202,6 +2211,38 @@ mod tests {
                 .expect("staged backend paths"),
             vec!["src/lib.rs".to_string()],
             "staged backend should start from the last-good indexed data"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_generation_allows_secondary_reader_open() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let state = DaemonState::new();
+        let project = state
+            .resolve_or_open_project(ProjectLookup::from_root_path(&root))
+            .await
+            .expect("resolve project");
+        create_populated_index(&project, "fastembed").await;
+
+        let active_backend_dir = project
+            .active_backend_path()
+            .await
+            .parent()
+            .expect("active backend parent")
+            .to_path_buf();
+
+        let secondary = CompositeBackend::open_read_only(&active_backend_dir).await;
+        assert!(
+            secondary.is_ok(),
+            "secondary reader open should not hit a Tantivy writer lock: {}",
+            secondary
+                .as_ref()
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "ok".to_string())
         );
     }
 

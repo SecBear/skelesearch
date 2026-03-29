@@ -78,7 +78,7 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     let backend = Arc::new(
-        skelesearch_core::CompositeBackend::open(&skelesearch_dir)
+        skelesearch_core::CompositeBackend::open_read_only(&skelesearch_dir)
             .await
             .context("open CompositeBackend")?,
     );

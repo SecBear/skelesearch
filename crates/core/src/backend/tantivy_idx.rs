@@ -47,7 +47,7 @@ fn build_nl_analyzer() -> TextAnalyzer {
 pub struct TantivyIndex {
     pub index: Index,
     pub reader: IndexReader,
-    pub writer: Arc<Mutex<IndexWriter>>,
+    pub writer: Option<Arc<Mutex<IndexWriter>>>,
     pub schema: Schema,
     // Typed field handles for building documents without string lookups.
     pub f_file_path: Field,
@@ -65,6 +65,15 @@ impl TantivyIndex {
     /// subsequent open (idempotent — Tantivy allows re-registering with the
     /// same name).
     pub fn open_or_create(path: &Path) -> anyhow::Result<Self> {
+        Self::open_or_create_with_mode(path, true)
+    }
+
+    /// Open or create a Tantivy index without acquiring a writer lock.
+    pub fn open_or_create_read_only(path: &Path) -> anyhow::Result<Self> {
+        Self::open_or_create_with_mode(path, false)
+    }
+
+    fn open_or_create_with_mode(path: &Path, writable: bool) -> anyhow::Result<Self> {
         std::fs::create_dir_all(path)?;
 
         // Build schema.
@@ -118,13 +127,17 @@ impl TantivyIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
-        // 50 MB heap for the IndexWriter — adequate for batch indexing.
-        let writer = index.writer(50_000_000)?;
+        let writer = if writable {
+            // 50 MB heap for the IndexWriter — adequate for batch indexing.
+            Some(Arc::new(Mutex::new(index.writer(50_000_000)?)))
+        } else {
+            None
+        };
 
         Ok(Self {
             index,
             reader,
-            writer: Arc::new(Mutex::new(writer)),
+            writer,
             schema,
             f_file_path,
             f_chunk_idx,
