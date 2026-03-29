@@ -36,7 +36,7 @@ pub use gc::collect_garbage;
 pub use grep::{grep_codebase, GrepMatch, GrepOptions};
 pub use indexer::{FileContent, IndexResult, Indexer};
 pub use manifest::{content_hash, IncompleteBatch, ManifestStore};
-pub use provider::EmbedProvider;
+pub use provider::{preferred_index_provider_name, EmbedProvider};
 pub use schema::{
     generation_db_paths, CallEdge, ChunkRecord, EdgeRecord, FileRecord, IndexStats, RepoMapData,
     RepoMapFile, RepoMapSymbol, SearchResult, StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,

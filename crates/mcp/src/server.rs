@@ -38,10 +38,10 @@ use rmcp::{
 };
 use skelesearch_core::{
     classify_query, generation_db_paths, grep_codebase, is_indexing_active_elsewhere,
-    read_shared_indexing_status, try_acquire_indexing_lease, CompositeBackend, Config,
-    EmbedProvider, FreshnessSnapshot, FreshnessState, GrepOptions, IndexResult, Indexer,
-    LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker, Searcher,
-    SharedIndexingStatus, StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
+    preferred_index_provider_name, read_shared_indexing_status, try_acquire_indexing_lease,
+    CompositeBackend, Config, EmbedProvider, FreshnessSnapshot, FreshnessState, GrepOptions,
+    IndexResult, Indexer, LLMExpander, ManifestStore, QueryExpander, QueryStrategy, Reranker,
+    Searcher, SharedIndexingStatus, StorageBackend, INDEX_DB_FILE, MANIFEST_DB_FILE,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 use skelesearch_service::{
@@ -674,13 +674,7 @@ impl SkeleSearchServer {
     }
 
     fn startup_default_provider() -> &'static str {
-        if std::env::var("VOYAGE_API_KEY").map_or(false, |k| !k.is_empty()) {
-            "voyage"
-        } else if std::env::var("OPENAI_API_KEY").map_or(false, |k| !k.is_empty()) {
-            "openai"
-        } else {
-            "fastembed"
-        }
+        preferred_index_provider_name()
     }
 
     fn map_freshness_state(state: FreshnessState) -> IndexFreshnessState {
@@ -1317,7 +1311,10 @@ impl SkeleSearchServer {
         // Validate provider name without loading the model — provider_from_name
         // for fastembed loads a 450MB ONNX model synchronously and must not run
         // on the async thread (it would block on_initialized and rmcp's message loop).
-        let provider_name = input.provider.as_deref().unwrap_or("fastembed");
+        let provider_name = input
+            .provider
+            .as_deref()
+            .unwrap_or_else(|| preferred_index_provider_name());
         match provider_name {
             "fastembed" | "voyage" | "openai" => {}
             unknown => {
@@ -2688,9 +2685,9 @@ impl SkeleSearchServer {
         &self,
         Parameters(input): Parameters<IndexStatusInput>,
     ) -> Result<String, String> {
-        match self.index_status(input).await {
+        match self.proxy_index_status_via_daemon(input).await {
             Ok(out) => serde_json::to_string(&out).map_err(|e| e.to_string()),
-            Err(err) => Err(err.to_string()),
+            Err(err) => Err(self.daemon_proxy_error("index_status", err)),
         }
     }
 
@@ -3702,13 +3699,24 @@ mod startup_tests {
 
     #[tokio::test]
     async fn mcp_index_status_reports_local_watcher_state() -> anyhow::Result<()> {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = TempDir::new()?;
         let root = temp.path().join("repo");
         std::fs::create_dir_all(&root)?;
         let manifest_path = root.join(".skelesearch/manifest.db");
+        let socket_path = temp.path().join("daemon.sock");
+        let status = IndexStatusResponse {
+            watching: true,
+            ..fresh_status()
+        };
+        let index_requests = Arc::new(Mutex::new(Vec::new()));
+        let daemon =
+            spawn_startup_stub_daemon(&socket_path, status, Arc::clone(&index_requests)).await?;
+
+        std::env::set_var("SKELESEARCH_DAEMON_SOCKET", &socket_path);
         let server = startup_test_server(&root, &manifest_path).await?;
-        server.backend.initialize(8).await?;
-        server.watcher_started.store(true, Ordering::Release);
 
         let output = server
             .mcp_index_status(Parameters(IndexStatusInput { path: None }))
@@ -3717,6 +3725,8 @@ mod startup_tests {
         let status: serde_json::Value = serde_json::from_str(&output)?;
         assert_eq!(status["watching"], true);
 
+        std::env::remove_var("SKELESEARCH_DAEMON_SOCKET");
+        daemon.abort();
         Ok(())
     }
 }

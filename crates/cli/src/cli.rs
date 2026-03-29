@@ -19,9 +19,10 @@ pub enum Commands {
         /// Directory or file to index.
         path: std::path::PathBuf,
 
-        /// Embedding provider (default: fastembed).
-        #[arg(long, default_value = "fastembed")]
-        provider: String,
+        /// Embedding provider. Defaults to `voyage`/`openai` when their API
+        /// keys are set, otherwise the local `fastembed` provider.
+        #[arg(long)]
+        provider: Option<String>,
     },
 
     /// Search the index for a query.
@@ -46,9 +47,10 @@ pub enum Commands {
         #[arg(long, default_value_t = 0.0)]
         diversity: f32,
 
-        /// Embedding provider (must match the provider used during indexing).
-        #[arg(long, default_value = "fastembed")]
-        provider: String,
+        /// Embedding provider. Defaults to the indexed provider from the
+        /// manifest for the current project.
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Maximum token budget for results. Results are included greedily by
         /// score until the budget is exhausted. Approximate: 1 token ~ 4 chars.
@@ -90,9 +92,10 @@ pub enum Commands {
         /// Directory to watch.
         path: std::path::PathBuf,
 
-        /// Embedding provider (default: fastembed).
-        #[arg(long, default_value = "fastembed")]
-        provider: String,
+        /// Embedding provider. Defaults to `voyage`/`openai` when their API
+        /// keys are set, otherwise the local `fastembed` provider.
+        #[arg(long)]
+        provider: Option<String>,
     },
 
     /// Search files for a regex or literal pattern.
@@ -137,9 +140,10 @@ pub enum Commands {
         /// Path to eval set JSON file.
         eval_set: std::path::PathBuf,
 
-        /// Embedding provider (must match the provider used during indexing).
-        #[arg(long, default_value = "fastembed")]
-        provider: String,
+        /// Embedding provider. Defaults to the indexed provider from the
+        /// manifest for the current project.
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Output results as JSON.
         #[arg(long)]

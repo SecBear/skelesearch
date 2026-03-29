@@ -7,9 +7,9 @@ use fs2::FileExt;
 use notify::Watcher as _;
 use serde_json::json;
 use skelesearch_core::{
-    generation_db_paths, is_indexing_active_elsewhere, CompositeBackend, Config, EmbedProvider,
-    FreshnessSnapshot, FreshnessState, IndexStats, Indexer, ManifestStore, Searcher,
-    StorageBackend, MANIFEST_DB_FILE,
+    generation_db_paths, is_indexing_active_elsewhere, preferred_index_provider_name,
+    CompositeBackend, Config, EmbedProvider, FreshnessSnapshot, FreshnessState, IndexStats,
+    Indexer, ManifestStore, Searcher, StorageBackend, MANIFEST_DB_FILE,
 };
 use skelesearch_embed_fastembed::{provider_from_name, FastEmbedSparseProvider};
 
@@ -33,20 +33,61 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let _telemetry = skelesearch_telemetry::init_tracing("skelesearch", default_level);
 
     match cli.command {
-        Commands::Index { path, provider } => run_index(path, provider).await,
-        Commands::Search { query, top_k, graph, json, diversity, provider, max_tokens, branch, timings } => {
-            run_search(query, top_k as usize, graph, json, diversity, provider, max_tokens, branch, timings).await
+        Commands::Index { path, provider } => {
+            run_index(
+                path,
+                normalized_provider_override(provider).unwrap_or_else(default_index_provider),
+            )
+            .await
+        }
+        Commands::Search {
+            query,
+            top_k,
+            graph,
+            json,
+            diversity,
+            provider,
+            max_tokens,
+            branch,
+            timings,
+        } => {
+            run_search(
+                query,
+                top_k as usize,
+                graph,
+                json,
+                diversity,
+                provider,
+                max_tokens,
+                branch,
+                timings,
+            )
+            .await
         }
         Commands::Context { file } => run_context(file).await,
         Commands::Status { path, json } => run_status(path, json).await,
         Commands::Clear { path } => run_clear(path).await,
-        Commands::Watch { path, provider } => run_watch(path, provider).await,
-        Commands::Gc { path } => run_gc(path).await,
-        Commands::Grep { pattern, path, max_results, ignore_case, json } => {
-            run_grep(pattern, path, max_results, ignore_case, json).await
+        Commands::Watch { path, provider } => {
+            run_watch(
+                path,
+                normalized_provider_override(provider).unwrap_or_else(default_index_provider),
+            )
+            .await
         }
+        Commands::Gc { path } => run_gc(path).await,
+        Commands::Grep {
+            pattern,
+            path,
+            max_results,
+            ignore_case,
+            json,
+        } => run_grep(pattern, path, max_results, ignore_case, json).await,
         Commands::Symbol { name, kind } => run_symbol(name, kind).await,
-        Commands::Eval { eval_set, provider, json } => run_eval(eval_set, provider, json).await,
+        Commands::Eval {
+            eval_set,
+            provider,
+            json,
+        } => run_eval(eval_set, provider, json).await,
     }
 }
 
@@ -87,7 +128,6 @@ fn resolve_root(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     }
 }
 
-
 /// Open the CompositeBackend at `dir`.
 async fn open_backend(dir: &Path) -> anyhow::Result<Arc<CompositeBackend>> {
     let (backend_dir, _) = active_index_paths(dir);
@@ -103,6 +143,39 @@ fn open_manifest(dir: &Path) -> anyhow::Result<Arc<ManifestStore>> {
     let store = ManifestStore::open(&db_path)
         .with_context(|| format!("failed to open manifest at {}", db_path.display()))?;
     Ok(Arc::new(store))
+}
+
+fn normalized_provider_override(provider: Option<String>) -> Option<String> {
+    provider.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn default_index_provider() -> String {
+    preferred_index_provider_name().to_string()
+}
+
+fn resolve_search_provider_name(dir: &Path, provider: Option<String>) -> anyhow::Result<String> {
+    if let Some(provider) = normalized_provider_override(provider) {
+        return Ok(provider);
+    }
+
+    let manifest = open_manifest(dir)?;
+    if let Some(provider) = manifest
+        .get_meta("provider")
+        .context("failed to read provider from manifest")?
+    {
+        if !provider.trim().is_empty() {
+            return Ok(provider);
+        }
+    }
+
+    Ok(default_index_provider())
 }
 
 /// Acquire an exclusive lock on `.skelesearch/.skelesearch.lock`.
@@ -207,7 +280,9 @@ where
     // Unified Datalog retrieval: single round-trip FTS + HNSW + graph + PageRank.
     // Also applies any tuning parameters from the config.
     let searcher = match config.search.unified_search {
-        Some(true) => searcher.with_unified_search(true).with_search_tuning(&config),
+        Some(true) => searcher
+            .with_unified_search(true)
+            .with_search_tuning(&config),
         _ => searcher.with_search_tuning(&config),
     };
 
@@ -217,15 +292,21 @@ where
     let expansion_enabled = match config.search.expansion.enabled {
         Some(true) => true,
         Some(false) => false,
-        None => std::env::var("SKELESEARCH_EXPANSION").ok()
+        None => std::env::var("SKELESEARCH_EXPANSION")
+            .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
             .unwrap_or(false),
     };
     let searcher = if expansion_enabled {
-        match std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()) {
+        match std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+        {
             Some(key) => searcher.with_expander(Box::new(skelesearch_core::LLMExpander::new(key))),
             None => {
-                tracing::warn!("SKELESEARCH_EXPANSION set but OPENAI_API_KEY is missing; skipping expansion");
+                tracing::warn!(
+                    "SKELESEARCH_EXPANSION set but OPENAI_API_KEY is missing; skipping expansion"
+                );
                 searcher
             }
         }
@@ -304,19 +385,24 @@ where
         } else {
             let key_env = config.search.reranker.api_key_env.as_deref().unwrap_or(
                 match provider_name.as_str() {
-                    "jina"   => "JINA_API_KEY",
+                    "jina" => "JINA_API_KEY",
                     "cohere" => "COHERE_API_KEY",
                     "voyage" => "VOYAGE_API_KEY",
-                    _        => "RERANKER_API_KEY",
+                    _ => "RERANKER_API_KEY",
                 },
             );
             match std::env::var(key_env).ok().filter(|k| !k.is_empty()) {
                 Some(key) => match skelesearch_rerank_api::reranker_from_name(provider_name, key) {
-                    Ok(r)  => searcher.with_reranker(Box::new(r)),
-                    Err(e) => { tracing::warn!("reranker init failed: {e}"); searcher }
+                    Ok(r) => searcher.with_reranker(Box::new(r)),
+                    Err(e) => {
+                        tracing::warn!("reranker init failed: {e}");
+                        searcher
+                    }
                 },
                 None => {
-                    tracing::warn!("reranker configured as '{provider_name}' but {key_env} not set");
+                    tracing::warn!(
+                        "reranker configured as '{provider_name}' but {key_env} not set"
+                    );
                     searcher
                 }
             }
@@ -333,8 +419,14 @@ where
                     skelesearch_rerank_qwen3::Qwen3Reranker::from_hf()
                 };
                 return match result {
-                    Ok(r)  => { tracing::info!("Qwen3 reranker enabled"); searcher.with_reranker(Box::new(r)) }
-                    Err(e) => { tracing::warn!("Qwen3 reranker failed: {e}"); searcher }
+                    Ok(r) => {
+                        tracing::info!("Qwen3 reranker enabled");
+                        searcher.with_reranker(Box::new(r))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Qwen3 reranker failed: {e}");
+                        searcher
+                    }
                 };
             }
             #[cfg(not(feature = "qwen3"))]
@@ -344,12 +436,25 @@ where
             );
         }
         // No explicit config — auto-detect from env vars.
-        let auto = std::env::var("JINA_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("jina", k))
-            .or_else(|| std::env::var("COHERE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("cohere", k)))
-            .or_else(|| std::env::var("VOYAGE_API_KEY").ok().filter(|k| !k.is_empty()).map(|k| ("voyage", k)));
+        let auto = std::env::var("JINA_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(|k| ("jina", k))
+            .or_else(|| {
+                std::env::var("COHERE_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+                    .map(|k| ("cohere", k))
+            })
+            .or_else(|| {
+                std::env::var("VOYAGE_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+                    .map(|k| ("voyage", k))
+            });
         match auto {
             Some((name, key)) => match skelesearch_rerank_api::reranker_from_name(name, key) {
-                Ok(r)  => {
+                Ok(r) => {
                     tracing::info!(provider = name, "cloud reranker enabled");
                     searcher.with_reranker(Box::new(r))
                 }
@@ -416,8 +521,11 @@ async fn run_index(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
 
     println!(
         "indexed {} file(s), {} chunk(s) ({} removed, {} cache hits) in {:.1}s",
-        result.indexed_files, result.total_chunks, result.deleted_files,
-        result.cache_hits, elapsed.as_secs_f64()
+        result.indexed_files,
+        result.total_chunks,
+        result.deleted_files,
+        result.cache_hits,
+        elapsed.as_secs_f64()
     );
     Ok(())
 }
@@ -428,7 +536,7 @@ async fn run_search(
     graph: bool,
     json_output: bool,
     diversity: f32,
-    provider_name: String,
+    provider: Option<String>,
     max_tokens: Option<usize>,
     branch_scope: bool,
     show_timings: bool,
@@ -439,13 +547,17 @@ async fn run_search(
     // Short-circuit: no index at all.
     if !active_backend_exists(&dir) {
         if json_output {
-            eprintln!("{}", serde_json::json!({"error": "No index found. Run `skelesearch index <path>` first."}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": "No index found. Run `skelesearch index <path>` first."})
+            );
             std::process::exit(1);
         } else {
             anyhow::bail!("No index found. Run `skelesearch index <path>` first.");
         }
     }
 
+    let provider_name = resolve_search_provider_name(&dir, provider)?;
     let provider = provider_from_name(&provider_name)?;
     let dim = provider.dim();
     let backend = open_backend(&dir).await?;
@@ -464,7 +576,16 @@ async fn run_search(
     } else {
         0
     };
-    let (mut results, timings) = searcher.search_with_timings(&query, top_k, graph_enabled, graph_depth, diversity, max_tokens).await?;
+    let (mut results, timings) = searcher
+        .search_with_timings(
+            &query,
+            top_k,
+            graph_enabled,
+            graph_depth,
+            diversity,
+            max_tokens,
+        )
+        .await?;
     let elapsed = start.elapsed();
     tracing::info!(
         embed_ms = timings.embed_ms,
@@ -493,7 +614,11 @@ async fn run_search(
     if branch_scope {
         let changed = skelesearch_core::git::changed_files_on_branch(&root)?;
         if !changed.is_empty() {
-            results.retain(|r| changed.iter().any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path)));
+            results.retain(|r| {
+                changed
+                    .iter()
+                    .any(|c| r.file_path.ends_with(c.as_str()) || c.ends_with(&r.file_path))
+            });
         }
     }
 
@@ -531,7 +656,11 @@ async fn run_search(
             println!();
         }
         if !results.is_empty() {
-            println!("({} results in {:.0}ms)", results.len(), elapsed.as_secs_f64() * 1000.0);
+            println!(
+                "({} results in {:.0}ms)",
+                results.len(),
+                elapsed.as_secs_f64() * 1000.0
+            );
         }
     }
     Ok(())
@@ -615,7 +744,13 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
             estimated_stale: 0,
         })
     } else {
-        IndexStats { indexed_files: 0, total_chunks: 0, last_indexed: None::<DateTime<Utc>>, watching: false, estimated_stale: 0 }
+        IndexStats {
+            indexed_files: 0,
+            total_chunks: 0,
+            last_indexed: None::<DateTime<Utc>>,
+            watching: false,
+            estimated_stale: 0,
+        }
     };
 
     // Overlay the watching flag from the PID sentinel.
@@ -646,7 +781,10 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
         println!("total_chunks:   {}", stats.total_chunks);
         println!("last_indexed:   {last_indexed_str}");
         println!("estimated_stale: {}", freshness.estimated_stale);
-        println!("freshness_state: {}", freshness_state_label(freshness.state));
+        println!(
+            "freshness_state: {}",
+            freshness_state_label(freshness.state)
+        );
         println!(
             "freshness_checked_at: {}",
             freshness
@@ -656,10 +794,7 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
         );
         println!(
             "freshness_error: {}",
-            freshness
-                .freshness_error
-                .as_deref()
-                .unwrap_or("null")
+            freshness.freshness_error.as_deref().unwrap_or("null")
         );
         println!("watching:       {watching}");
         match freshness.state {
@@ -670,7 +805,9 @@ async fn run_status(path: Option<PathBuf>, json_output: bool) -> anyhow::Result<
                 );
             }
             FreshnessState::Refreshing => {
-                println!("hint: index refresh in progress; poll `skelesearch status` for completion.");
+                println!(
+                    "hint: index refresh in progress; poll `skelesearch status` for completion."
+                );
             }
             FreshnessState::Unknown => {
                 println!("hint: freshness could not be determined; inspect freshness_error.");
@@ -727,19 +864,22 @@ async fn run_watch(path: PathBuf, provider_name: String) -> anyhow::Result<()> {
     std::fs::write(pid_file(&dir), std::process::id().to_string())
         .context("failed to write watch PID file")?;
 
-    let _ = run_watch_index_pass(&root, &dir, &config, &provider_name, WatchPassKind::Initial).await?;
+    let _ =
+        run_watch_index_pass(&root, &dir, &config, &provider_name, WatchPassKind::Initial).await?;
 
-    eprintln!("skelesearch watch: watching {} (Ctrl-C to stop)", root.display());
+    eprintln!(
+        "skelesearch watch: watching {} (Ctrl-C to stop)",
+        root.display()
+    );
 
     // Set up file watcher with a 2-second debounce window.  Rapid edits (e.g.
     // a save-on-format cascade) are coalesced into a single re-index trigger.
     let (sync_tx, sync_rx) = std::sync::mpsc::channel();
-    let mut debouncer = notify_debouncer_full::new_debouncer(
-        std::time::Duration::from_secs(2),
-        None,
-        sync_tx,
-    )?;
-    debouncer.watcher().watch(&root, notify::RecursiveMode::Recursive)?;
+    let mut debouncer =
+        notify_debouncer_full::new_debouncer(std::time::Duration::from_secs(2), None, sync_tx)?;
+    debouncer
+        .watcher()
+        .watch(&root, notify::RecursiveMode::Recursive)?;
 
     // Bridge the sync mpsc channel to tokio so we can select! with ctrl_c.
     // The bridge thread owns `sync_rx` and forwards every batch until the
@@ -1013,12 +1153,14 @@ impl skelesearch_core::EmbedProvider for NoopProvider {
     }
 }
 
-
 async fn run_symbol(name: String, kind: Option<String>) -> anyhow::Result<()> {
     let root = std::env::current_dir()?;
     let dir = index_dir(&root);
     if !active_backend_exists(&dir) {
-        anyhow::bail!("No index found in {}. Run `skelesearch index <path>` first.", dir.display());
+        anyhow::bail!(
+            "No index found in {}. Run `skelesearch index <path>` first.",
+            dir.display()
+        );
     }
     let backend = open_backend(&dir).await?;
     let results = backend.find_symbols(&name, kind.as_deref()).await?;
@@ -1027,14 +1169,19 @@ async fn run_symbol(name: String, kind: Option<String>) -> anyhow::Result<()> {
         return Ok(());
     }
     for sym in &results {
-        println!("{} {} @ {}:{}-{}", sym.kind, sym.name, sym.file_path, sym.start_line, sym.end_line);
+        println!(
+            "{} {} @ {}:{}-{}",
+            sym.kind, sym.name, sym.file_path, sym.start_line, sym.end_line
+        );
     }
     Ok(())
 }
 
-async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bool) -> anyhow::Result<()> {
-    let provider = provider_from_name(&provider_name)?;
-    let dim = provider.dim();
+async fn run_eval(
+    eval_set_path: PathBuf,
+    provider: Option<String>,
+    json_output: bool,
+) -> anyhow::Result<()> {
     let root = resolve_root(None)?;
     let dir = index_dir(&root);
 
@@ -1042,17 +1189,24 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
         anyhow::bail!("No index found. Run `skelesearch index <path>` first.");
     }
 
+    let provider_name = resolve_search_provider_name(&dir, provider)?;
+    let provider = provider_from_name(&provider_name)?;
+    let dim = provider.dim();
     let backend = open_backend(&dir).await?;
     backend.initialize(dim).await?;
     let searcher = Searcher::new(backend, provider);
     let config = Config::load(&root).unwrap_or_default();
     let searcher = configure_searcher(searcher, &root);
     let eval_graph_enabled = config.search.graph.enabled == Some(true);
-    let eval_graph_depth: usize = if eval_graph_enabled { config.search.graph.max_depth.max(1) } else { 0 };
+    let eval_graph_depth: usize = if eval_graph_enabled {
+        config.search.graph.max_depth.max(1)
+    } else {
+        0
+    };
     let eval_data = std::fs::read_to_string(&eval_set_path)
         .with_context(|| format!("failed to read eval set: {}", eval_set_path.display()))?;
-    let cases: Vec<eval::EvalCase> = serde_json::from_str(&eval_data)
-        .context("failed to parse eval set JSON")?;
+    let cases: Vec<eval::EvalCase> =
+        serde_json::from_str(&eval_data).context("failed to parse eval set JSON")?;
 
     if cases.is_empty() {
         println!("Eval set is empty.");
@@ -1061,7 +1215,16 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
 
     let mut results = Vec::new();
     for case in &cases {
-        let hits = searcher.search(&case.query, 10, eval_graph_enabled, eval_graph_depth, 0.0, None).await?;
+        let hits = searcher
+            .search(
+                &case.query,
+                10,
+                eval_graph_enabled,
+                eval_graph_depth,
+                0.0,
+                None,
+            )
+            .await?;
         // Deduplicate file paths (multiple chunks from same file).
         let mut unique_files: Vec<String> = Vec::new();
         for h in &hits {
@@ -1083,7 +1246,11 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
         if !json_output {
             println!(
                 "Q: {} | R@5={:.2} R@10={:.2} P@5={:.2} MRR={:.2}",
-                metrics.query, metrics.recall_at_5, metrics.recall_at_10, metrics.precision_at_5, metrics.mrr
+                metrics.query,
+                metrics.recall_at_5,
+                metrics.recall_at_10,
+                metrics.precision_at_5,
+                metrics.mrr
             );
         }
         results.push(metrics);
@@ -1124,7 +1291,9 @@ async fn run_eval(eval_set_path: PathBuf, provider_name: String, json_output: bo
 
 #[cfg(test)]
 mod tests {
-    use super::{acquire_lock, index_dir, status_freshness_snapshot, FreshnessState, WatchRefreshQueue};
+    use super::{
+        acquire_lock, index_dir, status_freshness_snapshot, FreshnessState, WatchRefreshQueue,
+    };
 
     #[test]
     fn watch_followup_refresh_coalesces_mid_run_edits() {

@@ -13,8 +13,8 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::Utc;
 use skelesearch_core::{
-    generation_db_paths, git::changed_files_on_branch, try_acquire_indexing_lease,
-    write_file_atomic, CompositeBackend, Config, EmbedProvider,
+    generation_db_paths, git::changed_files_on_branch, preferred_index_provider_name,
+    try_acquire_indexing_lease, write_file_atomic, CompositeBackend, Config, EmbedProvider,
     FreshnessSnapshot as CoreFreshnessSnapshot, FreshnessState as CoreFreshnessState, Indexer,
     ManifestStore, Searcher, SharedIndexingStatus, StorageBackend,
 };
@@ -430,7 +430,9 @@ impl DaemonService {
             Ok(project) => project,
             Err(response) => return response,
         };
-        let provider_name = request.provider.unwrap_or_else(|| "fastembed".to_string());
+        let provider_name = request
+            .provider
+            .unwrap_or_else(|| preferred_index_provider_name().to_string());
         match self
             .start_indexing_run(Arc::clone(&project), provider_name, "daemon_rpc")
             .await
