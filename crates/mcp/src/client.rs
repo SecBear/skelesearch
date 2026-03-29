@@ -23,6 +23,7 @@ use tokio::{
 };
 
 const DAEMON_SOCKET_ENV: &str = "SKELESEARCH_DAEMON_SOCKET";
+const DAEMON_PROGRAM_ENV: &str = "SKELESEARCH_DAEMON_PROGRAM";
 const DEFAULT_SOCKET_SUBPATH: &str = ".cache/skelesearch/daemon.sock";
 
 pub(super) trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -677,6 +678,13 @@ fn absolutize(path: PathBuf) -> PathBuf {
 
 fn daemon_program_for_endpoint(endpoint: &DaemonEndpoint) -> anyhow::Result<PathBuf> {
     let _ = endpoint;
+    if let Ok(raw) = std::env::var(DAEMON_PROGRAM_ENV) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
     let current_exe = std::env::current_exe().context("resolve current executable path")?;
     let current_dir = current_exe
         .parent()
@@ -700,6 +708,8 @@ fn daemon_program_for_endpoint(endpoint: &DaemonEndpoint) -> anyhow::Result<Path
 mod tests {
     use super::*;
 
+    use std::sync::{Mutex, OnceLock};
+
     use skelesearch_service::protocol::{IndexFreshnessState, IndexingState};
     use skelesearch_service::{
         DaemonCapabilities, DaemonRequest, DaemonResponse, HandshakeResponse, IndexStatusResponse,
@@ -709,6 +719,11 @@ mod tests {
 
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[derive(Clone)]
     struct AutoStartConnector {
@@ -853,6 +868,19 @@ mod tests {
         assert_eq!(info.server_name, "auto-start-daemon");
         assert_eq!(connector.start_calls().await, 1);
         connector.join_server().await;
+    }
+
+    #[test]
+    fn daemon_program_prefers_env_override() {
+        let _guard = env_lock().lock().expect("env lock");
+        let program = "/tmp/custom-skelesearchd";
+        std::env::set_var(DAEMON_PROGRAM_ENV, program);
+
+        let resolved = daemon_program_for_endpoint(&DaemonEndpoint::unix("/tmp/daemon.sock"))
+            .expect("resolve daemon program");
+
+        std::env::remove_var(DAEMON_PROGRAM_ENV);
+        assert_eq!(resolved, PathBuf::from(program));
     }
 
     #[tokio::test]

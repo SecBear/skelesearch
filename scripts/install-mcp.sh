@@ -5,8 +5,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL_ROOT="${INSTALL_ROOT:-$HOME/.local}"
 BIN_DIR="$INSTALL_ROOT/bin"
+STATE_DIR="$INSTALL_ROOT/share/skelesearch"
+GCROOT_DIR="$STATE_DIR/nix"
 MCP_BIN_PATH="$BIN_DIR/skelesearch-mcp"
 DAEMON_BIN_PATH="$BIN_DIR/skelesearchd"
+MCP_ROOT_LINK="$GCROOT_DIR/skelesearch-mcp"
+DAEMON_ROOT_LINK="$GCROOT_DIR/skelesearch-daemon"
+ORT_ROOT_LINK="$GCROOT_DIR/onnxruntime-lib"
 GLOBAL_MCP_JSON="$HOME/.omp/agent/mcp.json"
 
 if ! command -v nix >/dev/null 2>&1; then
@@ -14,28 +19,37 @@ if ! command -v nix >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$BIN_DIR"
+mkdir -p "$BIN_DIR" "$GCROOT_DIR"
 
 NIX_FLAGS=(--extra-experimental-features 'nix-command flakes')
 
 echo "Building reproducible RocksDB packages via Nix flake outputs"
-MCP_OUT="$(nix "${NIX_FLAGS[@]}" build --no-link --print-out-paths "$ROOT#skelesearch-mcp")"
-DAEMON_OUT="$(nix "${NIX_FLAGS[@]}" build --no-link --print-out-paths "$ROOT#skelesearch-daemon")"
-ORT_OUT="$(nix "${NIX_FLAGS[@]}" build --no-link --print-out-paths "$ROOT#onnxruntime-lib")"
+nix "${NIX_FLAGS[@]}" build --out-link "$MCP_ROOT_LINK" "$ROOT#skelesearch-mcp" >/dev/null
+nix "${NIX_FLAGS[@]}" build --out-link "$DAEMON_ROOT_LINK" "$ROOT#skelesearch-daemon" >/dev/null
+nix "${NIX_FLAGS[@]}" build --out-link "$ORT_ROOT_LINK" "$ROOT#onnxruntime-lib" >/dev/null
+
+MCP_OUT="$MCP_ROOT_LINK"
+DAEMON_OUT="$DAEMON_ROOT_LINK"
+ORT_OUT="$ORT_ROOT_LINK"
 
 write_wrapper() {
   local target="$1"
   local exe="$2"
+  local extra_env="${3:-}"
   cat > "$target" <<EOF
 #!/usr/bin/env bash
 export DYLD_LIBRARY_PATH="$ORT_OUT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH="$ORT_OUT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+${extra_env}
 exec "$exe" "\$@"
 EOF
   chmod +x "$target"
 }
 
-write_wrapper "$MCP_BIN_PATH" "$MCP_OUT/bin/skelesearch-mcp"
+write_wrapper \
+  "$MCP_BIN_PATH" \
+  "$MCP_OUT/bin/skelesearch-mcp" \
+  "export SKELESEARCH_DAEMON_PROGRAM=\"$DAEMON_BIN_PATH\""
 write_wrapper "$DAEMON_BIN_PATH" "$DAEMON_OUT/bin/skelesearchd"
 
 if [[ ! -x "$MCP_BIN_PATH" || ! -x "$DAEMON_BIN_PATH" ]]; then
@@ -46,6 +60,7 @@ fi
 echo "Installed wrapper skelesearch-mcp -> $MCP_OUT/bin/skelesearch-mcp"
 echo "Installed wrapper skelesearchd   -> $DAEMON_OUT/bin/skelesearchd"
 echo "Wrapped ONNX Runtime library dir -> $ORT_OUT/lib"
+echo "Pinned GC roots under            -> $GCROOT_DIR"
 echo
 
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
