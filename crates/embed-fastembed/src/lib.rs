@@ -8,10 +8,17 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use fastembed::{
-    EmbeddingModel, InitOptionsUserDefined, Pooling, SparseInitOptions, SparseModel,
-    SparseTextEmbedding, TextEmbedding, TextInitOptions, TokenizerFiles, UserDefinedEmbeddingModel,
+    EmbeddingModel, ExecutionProviderDispatch, InitOptionsUserDefined, Pooling, SparseInitOptions,
+    SparseModel, SparseTextEmbedding, TextEmbedding, TextInitOptions, TokenizerFiles,
+    UserDefinedEmbeddingModel,
 };
-use skelesearch_core::{EmbedProvider, SparseEmbedding, SparseEmbedProvider};
+use skelesearch_core::{EmbedProvider, SparseEmbedProvider, SparseEmbedding};
+
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+use ort::ep::{
+    self,
+    coreml::{ComputeUnits, ModelFormat, SpecializationStrategy},
+};
 
 /// Configuration for constructing a [`FastEmbedProvider`].
 ///
@@ -41,6 +48,133 @@ impl Default for FastEmbedOptions {
             show_download_progress: true,
         }
     }
+}
+
+fn local_execution_backend_label() -> &'static str {
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    {
+        "coreml"
+    }
+
+    #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64")))]
+    {
+        "cpu"
+    }
+}
+
+fn sanitized_cache_component(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+fn coreml_model_cache_dir(provider_name: &str) -> std::path::PathBuf {
+    let leaf = sanitized_cache_component(provider_name);
+    match std::env::var("HOME") {
+        Ok(home) if !home.trim().is_empty() => std::path::PathBuf::from(home)
+            .join(".cache")
+            .join("skelesearch")
+            .join("coreml")
+            .join(leaf),
+        _ => std::env::temp_dir().join("skelesearch-coreml").join(leaf),
+    }
+}
+
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+fn default_execution_providers(provider_name: &str) -> Vec<ExecutionProviderDispatch> {
+    let cache_dir = coreml_model_cache_dir(provider_name);
+    if let Err(err) = std::fs::create_dir_all(&cache_dir) {
+        tracing::warn!(
+            path = %cache_dir.display(),
+            error = %err,
+            "failed to create CoreML model cache directory"
+        );
+    }
+
+    vec![ep::CoreML::default()
+        .with_compute_units(ComputeUnits::All)
+        .with_model_format(ModelFormat::MLProgram)
+        .with_specialization_strategy(SpecializationStrategy::FastPrediction)
+        .with_model_cache_dir(cache_dir.to_string_lossy().into_owned())
+        .build()
+        .error_on_failure()]
+}
+
+#[cfg(not(all(target_vendor = "apple", target_arch = "aarch64")))]
+fn default_execution_providers(_provider_name: &str) -> Vec<ExecutionProviderDispatch> {
+    Vec::new()
+}
+
+fn try_new_text_embedding(
+    provider_name: &str,
+    init_options: TextInitOptions,
+) -> anyhow::Result<TextEmbedding> {
+    let execution_providers = default_execution_providers(provider_name);
+    if !execution_providers.is_empty() {
+        match TextEmbedding::try_new(
+            init_options
+                .clone()
+                .with_execution_providers(execution_providers),
+        ) {
+            Ok(model) => {
+                tracing::info!(
+                    provider = provider_name,
+                    execution_backend = local_execution_backend_label(),
+                    "initialized fastembed model with accelerated execution provider"
+                );
+                return Ok(model);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    execution_backend = local_execution_backend_label(),
+                    error = %err,
+                    "accelerated fastembed initialization failed; falling back to default ONNX Runtime execution"
+                );
+            }
+        }
+    }
+
+    TextEmbedding::try_new(init_options)
+}
+
+fn try_new_user_defined_text_embedding(
+    provider_name: &str,
+    user_model: UserDefinedEmbeddingModel,
+    init_options: InitOptionsUserDefined,
+) -> anyhow::Result<TextEmbedding> {
+    let execution_providers = default_execution_providers(provider_name);
+    if !execution_providers.is_empty() {
+        match TextEmbedding::try_new_from_user_defined(
+            user_model.clone(),
+            init_options
+                .clone()
+                .with_execution_providers(execution_providers),
+        ) {
+            Ok(model) => {
+                tracing::info!(
+                    provider = provider_name,
+                    execution_backend = local_execution_backend_label(),
+                    "initialized fastembed user-defined model with accelerated execution provider"
+                );
+                return Ok(model);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    execution_backend = local_execution_backend_label(),
+                    error = %err,
+                    "accelerated fastembed user-defined initialization failed; falling back to default ONNX Runtime execution"
+                );
+            }
+        }
+    }
+
+    TextEmbedding::try_new_from_user_defined(user_model, init_options)
 }
 
 /// An [`EmbedProvider`] backed by [`fastembed::TextEmbedding`].
@@ -104,17 +238,23 @@ impl FastEmbedProvider {
             );
         }
 
-        let model_info = TextEmbedding::get_model_info(&opts.model)
-            .context("failed to retrieve model info")?;
+        let model_info =
+            TextEmbedding::get_model_info(&opts.model).context("failed to retrieve model info")?;
         let dim = model_info.dim;
+        let provider_name = if opts.quantized {
+            "fastembed-q"
+        } else {
+            "fastembed"
+        };
 
-        let te = TextEmbedding::try_new(
+        let te = try_new_text_embedding(
+            provider_name,
             TextInitOptions::new(opts.model)
                 .with_show_download_progress(opts.show_download_progress),
         )
         .context("failed to initialize TextEmbedding model")?;
 
-        let name = if opts.quantized { "fastembed-q" } else { "fastembed" }.to_owned();
+        let name = provider_name.to_owned();
         Ok(Self {
             model: std::sync::Arc::new(std::sync::Mutex::new(te)),
             dim,
@@ -209,24 +349,37 @@ impl FastEmbedProvider {
 
         let tokenizer_files = TokenizerFiles {
             tokenizer_file: std::fs::read(
-                model_repo.get("tokenizer.json").context("failed to download tokenizer.json")?,
-            ).context("failed to read tokenizer.json")?,
+                model_repo
+                    .get("tokenizer.json")
+                    .context("failed to download tokenizer.json")?,
+            )
+            .context("failed to read tokenizer.json")?,
             config_file: std::fs::read(
-                model_repo.get("config.json").context("failed to download config.json")?,
-            ).context("failed to read config.json")?,
+                model_repo
+                    .get("config.json")
+                    .context("failed to download config.json")?,
+            )
+            .context("failed to read config.json")?,
             special_tokens_map_file: std::fs::read(
-                model_repo.get("special_tokens_map.json").context("failed to download special_tokens_map.json")?,
-            ).context("failed to read special_tokens_map.json")?,
+                model_repo
+                    .get("special_tokens_map.json")
+                    .context("failed to download special_tokens_map.json")?,
+            )
+            .context("failed to read special_tokens_map.json")?,
             tokenizer_config_file: std::fs::read(
-                model_repo.get("tokenizer_config.json").context("failed to download tokenizer_config.json")?,
-            ).context("failed to read tokenizer_config.json")?,
+                model_repo
+                    .get("tokenizer_config.json")
+                    .context("failed to download tokenizer_config.json")?,
+            )
+            .context("failed to read tokenizer_config.json")?,
         };
 
         // GTE-ModernBERT uses CLS pooling: outputs.last_hidden_state[:, 0].
-        let user_model = UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files)
-            .with_pooling(Pooling::Cls);
+        let user_model =
+            UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files).with_pooling(Pooling::Cls);
 
-        let mut te = TextEmbedding::try_new_from_user_defined(
+        let mut te = try_new_user_defined_text_embedding(
+            provider_name,
             user_model,
             InitOptionsUserDefined::new().with_max_length(max_length),
         )
@@ -234,9 +387,15 @@ impl FastEmbedProvider {
 
         // Verify dimension.
         {
-            let probe = te.embed(vec!["dim probe".to_string()], None).context("dimension probe failed")?;
+            let probe = te
+                .embed(vec!["dim probe".to_string()], None)
+                .context("dimension probe failed")?;
             if let Some(first) = probe.first() {
-                anyhow::ensure!(first.len() == dim, "declared dim={dim} but model produced {}-dim vectors", first.len());
+                anyhow::ensure!(
+                    first.len() == dim,
+                    "declared dim={dim} but model produced {}-dim vectors",
+                    first.len()
+                );
             }
         }
 
@@ -308,10 +467,11 @@ impl FastEmbedProvider {
         // If the ONNX graph already includes pooling, double-pooling will silently
         // produce wrong embeddings — verify once with the canonical Python pipeline
         // if the output distribution looks off.
-        let user_model = UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files)
-            .with_pooling(Pooling::Mean);
+        let user_model =
+            UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files).with_pooling(Pooling::Mean);
 
-        let mut te = TextEmbedding::try_new_from_user_defined(
+        let mut te = try_new_user_defined_text_embedding(
+            provider_name,
             user_model,
             InitOptionsUserDefined::new().with_max_length(max_length),
         )
@@ -419,7 +579,9 @@ impl FastEmbedSparseProvider {
     pub fn bgem3() -> anyhow::Result<Self> {
         let model = SparseTextEmbedding::try_new(SparseInitOptions::new(SparseModel::BGEM3))
             .context("failed to initialize BGE-M3 sparse model")?;
-        Ok(Self { model: std::sync::Arc::new(std::sync::Mutex::new(model)) })
+        Ok(Self {
+            model: std::sync::Arc::new(std::sync::Mutex::new(model)),
+        })
     }
 }
 
@@ -464,10 +626,7 @@ impl SparseEmbedProvider for FastEmbedSparseProvider {
 /// 3. `~/.cache/fastembed` (stable cross-CWD fallback)
 ///
 /// The HF API endpoint can be overridden via `$HF_ENDPOINT`.
-fn pull_from_hf(
-    repo: &str,
-    show_progress: bool,
-) -> anyhow::Result<hf_hub::api::sync::ApiRepo> {
+fn pull_from_hf(repo: &str, show_progress: bool) -> anyhow::Result<hf_hub::api::sync::ApiRepo> {
     use std::path::PathBuf;
 
     let cache_dir = std::env::var("HF_HOME")
@@ -485,8 +644,8 @@ fn pull_from_hf(
                 })
         });
 
-    let endpoint = std::env::var("HF_ENDPOINT")
-        .unwrap_or_else(|_| "https://huggingface.co".to_string());
+    let endpoint =
+        std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
 
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache_dir)
@@ -497,7 +656,6 @@ fn pull_from_hf(
 
     Ok(api.model(repo.to_string()))
 }
-
 
 // ---------------------------------------------------------------------------
 // Provider factory
@@ -554,10 +712,24 @@ pub fn provider_from_name(name: &str) -> anyhow::Result<Box<dyn skelesearch_core
         #[cfg(feature = "voyage")]
         "voyage" => Ok(Box::new(skelesearch_embed_voyage::provider_voyage()?)),
         other => {
-            let mut supported = vec!["fastembed", "gte-modernbert", "fastembed-legacy", "jina", "fastembed-q", "fastembed-int8", "coderankembed"];
-            #[cfg(feature = "openai")] supported.push("openai");
-            #[cfg(feature = "voyage")] supported.push("voyage");
-            anyhow::bail!("unknown embedding provider: '{}'. Supported: {}", other, supported.join(", "))
+            let mut supported = vec![
+                "fastembed",
+                "gte-modernbert",
+                "fastembed-legacy",
+                "jina",
+                "fastembed-q",
+                "fastembed-int8",
+                "coderankembed",
+            ];
+            #[cfg(feature = "openai")]
+            supported.push("openai");
+            #[cfg(feature = "voyage")]
+            supported.push("voyage");
+            anyhow::bail!(
+                "unknown embedding provider: '{}'. Supported: {}",
+                other,
+                supported.join(", ")
+            )
         }
     }
 }

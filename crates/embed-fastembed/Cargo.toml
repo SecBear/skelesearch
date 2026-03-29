@@ -9,10 +9,8 @@ description = "fastembed-rs EmbedProvider for skelesearch (jina-v2-base-code def
 default = ["openai", "voyage"]
 openai = ["dep:skelesearch-embed-openai"]
 voyage = ["dep:skelesearch-embed-voyage"]
-# CoreML EP for Apple Silicon inference.
-# Requires ort/coreml to be activated. Until ort is a direct dep here,
-# this flag is a marker only — configure EPs via FastEmbedOptions.execution_providers.
-# TODO(PER-99): wire "ort/coreml" once ort is added as a direct workspace dep.
+# Reserved compatibility marker. Apple Silicon builds enable CoreML automatically
+# via a target-specific `ort` dependency; no extra crate feature is required.
 coreml = []
 # CUDA EP for NVIDIA GPU inference.
 # TODO(PER-107): wire "ort/cuda" once ort is added as a direct workspace dep.
@@ -33,3 +31,6 @@ skelesearch-embed-voyage = { path = "../embed-voyage", optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
+
+[target.'cfg(all(target_vendor = "apple", target_arch = "aarch64"))'.dependencies]
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "coreml"] }

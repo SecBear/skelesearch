@@ -5747,6 +5747,7 @@ dependencies = [
  "async-trait",
  "fastembed",
  "hf-hub",
+ "ort",
  "skelesearch-core",
  "skelesearch-embed-openai",
  "skelesearch-embed-voyage",
