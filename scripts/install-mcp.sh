@@ -23,7 +23,7 @@ mkdir -p "$BIN_DIR" "$GCROOT_DIR"
 
 NIX_FLAGS=(--extra-experimental-features 'nix-command flakes')
 
-echo "Building reproducible RocksDB packages via Nix flake outputs"
+echo "Building reproducible skelesearch packages via Nix flake outputs"
 nix "${NIX_FLAGS[@]}" build --out-link "$MCP_ROOT_LINK" "$ROOT#skelesearch-mcp" >/dev/null
 nix "${NIX_FLAGS[@]}" build --out-link "$DAEMON_ROOT_LINK" "$ROOT#skelesearch-daemon" >/dev/null
 nix "${NIX_FLAGS[@]}" build --out-link "$ORT_ROOT_LINK" "$ROOT#onnxruntime-lib" >/dev/null
